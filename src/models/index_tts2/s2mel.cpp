@@ -1001,19 +1001,6 @@ public:
         timing_start = Clock::now();
         ggml_backend_tensor_get(output_, out.data(), 0, out.size() * sizeof(float));
         debug::timing_log_scalar("index_tts2.s2mel.cfm.output_read_ms", engine::debug::elapsed_ms(timing_start, Clock::now()));
-        // TEMP FA-RDNA2: dump first-step velocity for Metal-vs-CPU comparison (delete before merge)
-        {
-            static int s_dump_n = 0;
-            const char * p = getenv("GGML_METAL_FA_VEL_DUMP");
-            if (p && p[0] && s_dump_n < 1) {
-                s_dump_n++;
-                FILE * f = fopen(p, "w");
-                if (f) {
-                    for (size_t i = 0; i < out.size(); ++i) fprintf(f, "%.6f\n", out[i]);
-                    fclose(f);
-                }
-            }
-        }
         return out;
     }
 

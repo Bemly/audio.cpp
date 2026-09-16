@@ -1226,17 +1226,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
-            // TEMP P0 shape-dump (delete before merge)
-            {
-                static int s_dump_n = 0;
-                const char * env = getenv("GGML_METAL_FA_SHAPE_DUMP");
-                if (env && env[0] && s_dump_n < 100000) {
-                    s_dump_n++;
-                    GGML_LOG_INFO("FA_SHAPE_DUMP place: dk=%lld kvtype=%s qnb0=%llu knb0=%llu mm=%d\n",
-                        (long long) op->src[1]->ne[0], ggml_type_name(op->src[1]->type),
-                        (unsigned long long) op->src[0]->nb[0], (unsigned long long) op->src[1]->nb[0], (int) has_simdgroup_mm);
-                }
-            }
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&
                 op->src[0]->ne[0] != 40 &&

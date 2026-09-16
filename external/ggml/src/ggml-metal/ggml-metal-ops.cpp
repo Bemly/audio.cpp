@@ -3561,25 +3561,6 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
-    // TEMP P0 shape-dump (delete before merge)
-    {
-        static int s_dump_n = 0;
-        const char * env = getenv("GGML_METAL_FA_SHAPE_DUMP");
-        if (env && env[0] && s_dump_n < 100000) {
-            s_dump_n++;
-            GGML_LOG_INFO("FA_SHAPE_DUMP encode: Q %s ne=[%lld,%lld,%lld,%lld] nb=[%llu,%llu] K %s ne=[%lld,%lld,%lld,%lld] nb=[%llu,%llu] V %s nb=[%llu,%llu] mask=%d sinks=%d\n",
-                ggml_type_name(op->src[0]->type),
-                (long long) op->src[0]->ne[0], (long long) op->src[0]->ne[1], (long long) op->src[0]->ne[2], (long long) op->src[0]->ne[3],
-                (unsigned long long) op->src[0]->nb[0], (unsigned long long) op->src[0]->nb[1],
-                ggml_type_name(op->src[1]->type),
-                (long long) op->src[1]->ne[0], (long long) op->src[1]->ne[1], (long long) op->src[1]->ne[2], (long long) op->src[1]->ne[3],
-                (unsigned long long) op->src[1]->nb[0], (unsigned long long) op->src[1]->nb[1],
-                ggml_type_name(op->src[2]->type),
-                (unsigned long long) op->src[2]->nb[0], (unsigned long long) op->src[2]->nb[1],
-                op->src[3] != NULL, op->src[4] != NULL);
-        }
-    }
-
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 

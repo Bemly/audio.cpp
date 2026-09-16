@@ -694,8 +694,7 @@ Gpt2LayerOutput gpt2_layer_cached_tail(
         q,
         modules::TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, updated_key),
         modules::TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, updated_value),
-        // TEMP FA-RDNA2 NaN hunt: drop the mask (wrong audio, valid mass test)
-        getenv("GGML_METAL_FA_NO_MASK") ? std::optional<core::TensorValue>{} : std::optional<core::TensorValue>{attention_mask});
+        std::optional<core::TensorValue>{attention_mask});
     context = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, context), input.shape);
     auto x = modules::AddModule{}.build(ctx, input, build_biased_gpt_projection(ctx, context, kModelDim, kModelDim, weights.attn_out));
     auto mlp_in = modules::LayerNormModule({kModelDim, 1.0e-5F, true, true}).build(ctx, x, weights.mlp_norm);
@@ -2639,17 +2638,6 @@ IndexTTS2GptGeneration IndexTTS2GptRuntime::generate_speech(const IndexTTS2GptGe
     }
     debug::trace_log_scalar("index_tts2.gpt.generated_code_count", static_cast<int64_t>(out.codes.size()));
     debug::trace_log_scalar("index_tts2.gpt.generated_stop_seen", stop_seen);
-    // TEMP FA-RDNA2: dump codes for Metal-vs-CPU comparison (delete before merge)
-    {
-        const char * p = getenv("GGML_METAL_FA_CODE_DUMP");
-        if (p && p[0]) {
-            FILE * f = fopen(p, "w");
-            if (f) {
-                for (size_t i = 0; i < out.codes.size(); ++i) fprintf(f, "%d\n", (int) out.codes[i]);
-                fclose(f);
-            }
-        }
-    }
     return out;
 }
 
