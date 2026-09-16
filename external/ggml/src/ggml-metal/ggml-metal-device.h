@@ -211,6 +211,22 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t dv,
         int32_t nwg);
 
+// RX6800 FA-RDNA2: self-written VALU kernels (gated by GGML_METAL_FA_AMD + shape guards)
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_amd_vec(
+        ggml_metal_library_t lib,
+        int32_t dk,
+        int32_t nbc,
+        bool    has_mask);
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(
+        ggml_metal_library_t lib,
+        int32_t dk,
+        bool    has_mask);
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_amd_reduce(
+        ggml_metal_library_t lib,
+        int32_t dk);
+
 // MTLResidencySet wrapper
 
 typedef void * ggml_metal_rset_t;

@@ -1589,6 +1589,66 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     GGML_UNUSED(op);
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_amd_vec(
+        ggml_metal_library_t lib,
+        int32_t dk,
+        int32_t nbc,
+        bool    has_mask) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_flash_attn_ext_amd_vec_dk%d_nbc%d", dk, nbc);
+    snprintf(name, 256, "%s_mask=%d", base, has_mask ? 1 : 0);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_bool(cv, has_mask, FC_FLASH_ATTN_EXT_AMD + 0);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(
+        ggml_metal_library_t lib,
+        int32_t dk,
+        bool    has_mask) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_flash_attn_ext_amd_tile_dk%d_nbc64", dk);
+    snprintf(name, 256, "%s_mask=%d", base, has_mask ? 1 : 0);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_bool(cv, has_mask, FC_FLASH_ATTN_EXT_AMD + 0);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_amd_reduce(
+        ggml_metal_library_t lib,
+        int32_t dk) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_flash_attn_ext_amd_reduce_dk%d", dk);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse) {
     char base[256];
     char name[256];

@@ -42,6 +42,15 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_blk(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_tmp(const struct ggml_tensor * op);
+size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const struct ggml_tensor * op);
+size_t ggml_metal_op_flash_attn_ext_extra_idx(const struct ggml_tensor * op);
+size_t ggml_metal_op_flash_attn_ext_extra_amd(const struct ggml_tensor * op);
+
+// FA-RDNA2: self-written AMD kernels, gated by env GGML_METAL_FA_AMD=1 + shape guards
+bool ggml_metal_op_flash_attn_ext_amd_supported(const struct ggml_tensor * op);
+
+// Quantized-KV gate: same env, K/V in {F16, Q8_0, Q4_0, Q4_1, IQ4_NL, Q5_0, Q5_1} (not both F16)
+bool ggml_metal_op_flash_attn_ext_amd_quant_supported(const struct ggml_tensor * op);
 
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);

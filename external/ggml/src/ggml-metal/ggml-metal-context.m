@@ -16,8 +16,9 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-// max number of MTLCommandBuffer used to submit a graph for processing
-#define GGML_METAL_MAX_COMMAND_BUFFERS 8
+// max number of extra MTLCommandBuffers used to submit a graph for processing
+// (the main thread owns one more on top of n_cb)
+#define GGML_METAL_MAX_COMMAND_BUFFERS 16
 
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
@@ -135,6 +136,18 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
     res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
+
+    // disable concurrency on discrete GPUs unless explicitly forced
+    {
+        const bool force_concurrency = getenv("GGML_METAL_CONCURRENCY_FORCE") != NULL;
+
+        if (!force_concurrency && props_dev && !props_dev->has_unified_memory) {
+            if (res->use_concurrency) {
+                GGML_LOG_WARN("%s: disabling concurrency on discrete GPU, set GGML_METAL_CONCURRENCY_FORCE=1 to override\n", __func__);
+            }
+            res->use_concurrency = false;
+        }
+    }
 
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
@@ -257,7 +270,9 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             if (status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
                 if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                    NSError * cb_err = [cmd_buf error];
+                    GGML_LOG_ERROR("%s: Metal CB error: status=%d domain=%s code=%ld desc=%s\n", __func__, (int) status,
+                        [[cb_err domain] UTF8String], (long) [cb_err code], [[cb_err localizedDescription] UTF8String]);
                 }
                 ctx->has_error = true;
                 return;
@@ -274,7 +289,9 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             if (status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
                 if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                    NSError * cb_err = [cmd_buf error];
+                    GGML_LOG_ERROR("%s: Metal CB error: status=%d domain=%s code=%ld desc=%s\n", __func__, (int) status,
+                        [[cb_err domain] UTF8String], (long) [cb_err code], [[cb_err localizedDescription] UTF8String]);
                 }
 
                 // release this and all remaining command buffers before returning
@@ -661,11 +678,35 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    // opt-in split override.
+    // GGML_METAL_N_CB counts ADDITIONAL async command buffers; the main
+    // thread owns one more on top, so the graph runs on n_cb + 1 buffers.
+    // Large graphs on discrete GPUs can exceed the GPU watchdog when too
+    // much work lands in one buffer (kIOGPUCommandBufferCallbackErrorTimeout);
+    // raising the split count keeps each buffer under the limit.
+    {
+        const char * env = getenv("GGML_METAL_N_CB");
+        if (env && env[0]) {
+            int req = atoi(env);
+            if (req < 1) {
+                req = 1;
+            }
+            if (req > GGML_METAL_MAX_COMMAND_BUFFERS) {
+                req = GGML_METAL_MAX_COMMAND_BUFFERS;
+            }
+            n_cb = req;
+        }
+    }
+
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 
+        GGML_LOG_INFO("%s: n_cb = %d (plus one main-thread command buffer)\n", __func__, ctx->n_cb);
+
         if (ctx->n_cb > 2) {
-            GGML_LOG_WARN("%s: n_cb = %d, using n_cb > 2 is not recommended and can degrade the performance in some cases\n", __func__, n_cb);
+            // the >2 caution comes from Apple-Silicon tuning; on discrete GPUs
+            // more splits are sometimes required to stay under the GPU watchdog
+            GGML_LOG_INFO("%s: n_cb > 2 adds submit overhead, only use as much as needed\n", __func__);
         }
     }
 

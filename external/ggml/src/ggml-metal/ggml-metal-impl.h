@@ -101,6 +101,7 @@
 #define FC_SUM_ROWS                    1400
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
+#define FC_FLASH_ATTN_EXT_AMD          1700
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -432,6 +433,59 @@ typedef struct {
 typedef struct {
     int32_t  nrows;
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
+
+// dequant prepass: one quantized KV side -> contiguous F16 scratch
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    int32_t  nblocks;
+} ggml_metal_kargs_flash_attn_ext_kv_f16;
+
+// RX6800 FA-RDNA2: self-written VALU kernels (decode vec + prefill tile share args)
+// Covers F16 KV, dk==dv in {64,128,256}, no sinks/bias/softcap (host-gated)
+typedef struct {
+    int32_t  ne01;        // nq
+    int32_t  ne02;        // n_head
+    int32_t  ne03;        // n_batch
+    uint64_t nb01;        // Q strides
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne11;        // n_kv
+    int32_t  ne_12_2;     // n_head_kv (K and V share shape)
+    int32_t  ne_12_3;
+    uint64_t nb11;        // K strides
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb21;        // V strides
+    uint64_t nb22;
+    uint64_t nb23;
+    int32_t  ne31;        // mask dims
+    int32_t  ne32;
+    int32_t  ne33;
+    uint64_t nb31;        // mask strides
+    uint64_t nb32;
+    uint64_t nb33;
+    int32_t  split;       // vec: kv split count
+    int32_t  chunk;       // vec: kv tokens per split (NBC-aligned)
+    float    scale;       // attention scale
+    uint64_t nbq_d;       // dst strides by role (dst is [DV,H,N,B], Q is [DK,N,H,B])
+    uint64_t nbh_d;       // nbq_d = dst nb[2], nbh_d = dst nb[1], nbb_d = dst nb[3]
+    uint64_t nbb_d;
+} ggml_metal_kargs_flash_attn_ext_amd;
+
+typedef struct {
+    int32_t  ne02;        // n_head
+    int32_t  ne03;        // n_batch
+    uint64_t nb02;        // dst strides (Q strides reused: valid only when nq == 1 && dk == dv,
+    uint64_t nb03;        // see hard guard at the reduce encode sites, do not reuse for nq > 1)
+    int32_t  split;
+} ggml_metal_kargs_flash_attn_ext_amd_reduce;
 
 typedef struct {
     int32_t  ne00;
