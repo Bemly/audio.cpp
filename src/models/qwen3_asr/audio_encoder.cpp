@@ -139,11 +139,24 @@ core::TensorValue audio_self_attention(
     auto q_heads = modules::TransposeModule({{0, 2, 1, 3}, q.shape.rank}).build(ctx, q);
     auto k_heads = modules::TransposeModule({{0, 2, 1, 3}, k.shape.rank}).build(ctx, k);
     auto v_heads = modules::TransposeModule({{0, 2, 1, 3}, v.shape.rank}).build(ctx, v);
+    // Metal joins the flash side when FA-RDNA2 is on (head_dim 64, F32
+    // Q/K/V prepass path); otherwise keep the explicit lowering.
+    const auto lowering = (ctx.backend_type == core::BackendType::Metal && core::metal_fa_rdna2_enabled())
+        ? modules::ScaledDotProductAttentionLowering::FlashPreserveViews
+        : modules::ScaledDotProductAttentionLowering::Explicit;
+    // Flash requires an F16 additive mask; the encoder builds F32.
+    const bool need_f16_mask =
+        lowering == modules::ScaledDotProductAttentionLowering::FlashPreserveViews &&
+        attention_mask.type != GGML_TYPE_F16;
+    const auto flash_mask = need_f16_mask
+        ? core::wrap_tensor(
+              ggml_cast(ctx.ggml, attention_mask.tensor, GGML_TYPE_F16), attention_mask.shape, GGML_TYPE_F16)
+        : attention_mask;
     auto context = modules::ScaledDotProductAttentionModule({
         dim,
-        modules::ScaledDotProductAttentionLowering::Explicit,
+        lowering,
         GGML_PREC_F32,
-    }).build(ctx, q_heads, k_heads, v_heads, attention_mask);
+    }).build(ctx, q_heads, k_heads, v_heads, flash_mask);
     context = core::ensure_backend_addressable_layout(ctx, context);
     context = core::reshape_tensor(ctx, context, core::TensorShape::from_dims({input.shape.dims[0], input.shape.dims[1], hidden_size}));
     return out_proj.build(ctx, context, {weights.out_weight, weights.out_bias});

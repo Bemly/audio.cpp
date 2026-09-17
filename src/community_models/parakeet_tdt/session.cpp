@@ -1,6 +1,7 @@
 #include "engine/community_models/parakeet_tdt/session.h"
 
 #include "engine/framework/audio/chunking.h"
+#include "engine/framework/core/backend.h"
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/runtime/options.h"
 #include "engine/framework/runtime/spec_backed_model.h"
@@ -94,9 +95,14 @@ std::unordered_map<std::string, std::string> normalize_request_options(
     return options;
 }
 
-bool use_flash_attention(const runtime::SessionOptions & options) {
-    const auto value =
-        runtime::find_option(options.options, {"parakeet_tdt.perf_mode"}).value_or("off");
+bool use_flash_attention(const runtime::SessionOptions & options, engine::core::BackendType backend_type) {
+    const auto it = options.options.find("parakeet_tdt.perf_mode");
+    // No explicit choice: default to flash where a kernel exists (FA-RDNA2
+    // covers the F16 head-128 encoder on Metal when switched on).
+    if (it == options.options.end()) {
+        return backend_type == engine::core::BackendType::Metal && engine::core::metal_fa_rdna2_enabled();
+    }
+    const auto & value = it->second;
     if (value == "off") {
         return false;
     }
@@ -236,7 +242,7 @@ ParakeetTDTSessionBase::ParakeetTDTSessionBase(
           "parakeet_tdt.matmul_weight_type",
           option_weight_type(options, "parakeet_tdt.weight_type", engine::assets::TensorStorageType::Native))),
       conv_weight_storage_type_(option_weight_type(options, "parakeet_tdt.conv_weight_type", engine::assets::TensorStorageType::Native)),
-      encoder_flash_attention_(use_flash_attention(options)),
+      encoder_flash_attention_(use_flash_attention(options, execution_context().backend_type())),
       frontend_(assets_) {
     if (task_.task != runtime::VoiceTaskKind::Asr) {
         throw std::runtime_error("Parakeet TDT only supports VoiceTaskKind::Asr");
