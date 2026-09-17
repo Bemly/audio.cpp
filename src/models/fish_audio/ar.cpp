@@ -136,12 +136,16 @@ modules::QwenDecoderActivationCastPolicy fish_activation_cast_policy(core::Backe
     policy.enabled = true;
     policy.type = GGML_TYPE_BF16;
     policy.after_input_norm = true;
-    policy.after_qkv_projection = true;
-    policy.after_qk_norm = true;
-    policy.after_rope = true;
-    policy.after_static_cache_update = true;
-    policy.after_attention = true;
-    policy.after_attention_output = true;
+    // Metal (FA-RDNA2): keep the attention path in F32/F16 so the flash op
+    // stays on the FA kernels. BF16 Q/K/V has no kernel on this card, so the
+    // attention-path casts are off on Metal; MLP/residual stages keep BF16.
+    const bool keep_attn_f32 = backend_type == core::BackendType::Metal;
+    policy.after_qkv_projection = !keep_attn_f32;
+    policy.after_qk_norm = !keep_attn_f32;
+    policy.after_rope = !keep_attn_f32;
+    policy.after_static_cache_update = !keep_attn_f32;
+    policy.after_attention = !keep_attn_f32;
+    policy.after_attention_output = !keep_attn_f32;
     policy.after_residual = true;
     policy.after_ffn_norm = true;
     policy.after_mlp_projection = true;
@@ -176,6 +180,10 @@ modules::QwenCausalDecoderConfig make_slow_decoder_config(
     out.logits_size = config.vocab_size;
     out.logits_mode = modules::QwenCausalDecoderLogitsMode::LastStep;
     out.lm_head_precision = GGML_PREC_F32;
+    if (backend_type == core::BackendType::Metal) {
+        // FA-RDNA2 takes F16 KV directly (Q stays F32, acc is F32 above).
+        out.static_cache_type = GGML_TYPE_F16;
+    }
     return out;
 }
 
@@ -204,6 +212,10 @@ modules::QwenCausalDecoderConfig make_fast_decoder_config(
     out.logits_size = config.vocab_size;
     out.logits_mode = modules::QwenCausalDecoderLogitsMode::LastStep;
     out.lm_head_precision = GGML_PREC_F32;
+    if (backend_type == core::BackendType::Metal) {
+        // FA-RDNA2 takes F16 KV directly (Q stays F32, acc is F32 above).
+        out.static_cache_type = GGML_TYPE_F16;
+    }
     return out;
 }
 
@@ -1119,8 +1131,9 @@ private:
             std::vector<core::TensorValue> cache_values;
             cache_keys.reserve(runtime_->weights().slow_layers.size());
             cache_values.reserve(runtime_->weights().slow_layers.size());
-            const ggml_type cache_type =
-                runtime_->backend_type() == core::BackendType::Vulkan ? GGML_TYPE_F32 : GGML_TYPE_BF16;
+            const ggml_type cache_type = runtime_->backend_type() == core::BackendType::Vulkan
+                ? GGML_TYPE_F32
+                : (runtime_->backend_type() == core::BackendType::Metal ? GGML_TYPE_F16 : GGML_TYPE_BF16);
             for (size_t layer = 0; layer < runtime_->weights().slow_layers.size(); ++layer) {
                 cache_keys.push_back(core::wrap_tensor(
                     ggml_new_tensor_4d(
@@ -1308,8 +1321,9 @@ private:
             std::vector<core::TensorValue> cache_values;
             cache_keys.reserve(weights.fast_layers.size());
             cache_values.reserve(weights.fast_layers.size());
-            const ggml_type cache_type =
-                runtime_->backend_type() == core::BackendType::Vulkan ? GGML_TYPE_F32 : GGML_TYPE_BF16;
+            const ggml_type cache_type = runtime_->backend_type() == core::BackendType::Vulkan
+                ? GGML_TYPE_F32
+                : (runtime_->backend_type() == core::BackendType::Metal ? GGML_TYPE_F16 : GGML_TYPE_BF16);
             for (size_t layer = 0; layer < weights.fast_layers.size(); ++layer) {
                 cache_keys.push_back(core::wrap_tensor(
                     ggml_new_tensor_4d(

@@ -28,6 +28,7 @@ namespace engine::models::dots_tts {
 namespace {
 
 namespace modules = engine::modules;
+namespace core = engine::core;
 
 constexpr size_t kWeightContextBytes = 128ull * 1024ull * 1024ull;
 constexpr size_t kSmallGraphContextBytes = 32ull * 1024ull * 1024ull;
@@ -89,10 +90,17 @@ modules::QwenDecoderStackConfig stack_config(const DotsLlmConfig & config) {
     return out;
 }
 
-modules::QwenCausalDecodeRuntimeConfig make_qwen_decode_runtime_config(const DotsLlmConfig & config) {
+modules::QwenCausalDecodeRuntimeConfig make_qwen_decode_runtime_config(
+    const DotsLlmConfig & config,
+    core::BackendType backend_type) {
     modules::QwenCausalDecodeRuntimeConfig out;
     out.trace_name = "dots_tts.llm";
     out.decoder.stack = stack_config(config);
+    if (backend_type == core::BackendType::Metal) {
+        // FA-RDNA2: Q stays F32, KV go F16 (direct kernel path), acc is F32.
+        out.decoder.stack.attention_precision = GGML_PREC_F32;
+        out.decoder.static_cache_type = GGML_TYPE_F16;
+    }
     out.decoder.logits_mode = modules::QwenCausalDecoderLogitsMode::AllSteps;
     out.prefill_graph_arena_bytes = kLargeGraphContextBytes;
     out.decode_graph_arena_bytes = kLargeGraphContextBytes;
@@ -352,7 +360,8 @@ struct DotsLlmComponent::Impl {
           embedding_runner(std::make_unique<EmbeddingRunner>(this->weights)),
           qwen_runtime(std::make_unique<modules::QwenCausalDecodeRuntime>(
               *this->weights->execution_context,
-              make_qwen_decode_runtime_config(this->weights->config),
+              make_qwen_decode_runtime_config(
+                  this->weights->config, this->weights->execution_context->backend_type()),
               make_qwen_decode_runtime_weights(*this->weights))),
           eos_runner(std::make_unique<EosRunner>(this->weights)) {}
 

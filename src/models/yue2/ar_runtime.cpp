@@ -162,7 +162,9 @@ engine::modules::QwenCausalDecodeRuntimeConfig make_runtime_config(
     out.decoder.stack.runtime.static_cache.set_rows_mode =
         engine::modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;
     if (backend_type == core::BackendType::Cuda || backend_type == core::BackendType::Hip ||
-        backend_type == core::BackendType::Vulkan) {
+        backend_type == core::BackendType::Vulkan || backend_type == core::BackendType::Metal) {
+        // Metal joins the F16 side: FA-RDNA2 reads F16 KV directly (Q stays
+        // F32, attention acc is F32).
         out.decoder.static_cache_type = GGML_TYPE_F16;
     }
     out.decoder.logits_size = logits_size > 0 ? logits_size : config.vocab_size;
