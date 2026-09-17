@@ -294,9 +294,9 @@ struct MiniMaxMusic3FlowTransformerRuntime::Impl {
             q = modules::TransposeModule({{0, 2, 1, 3}, q.shape.rank}).build(ctx, q);
             k = modules::TransposeModule({{0, 2, 1, 3}, k.shape.rank}).build(ctx, k);
             v = modules::TransposeModule({{0, 2, 1, 3}, v.shape.rank}).build(ctx, v);
-            // Metal joins the flash side (FA-RDNA2 covers head_dim 64).
+            // Metal joins the flash side when FA-RDNA2 is on (covers head_dim 64).
             const bool flash_ok = core::uses_ggml_cuda_or_hip_backend(execution.backend_type()) ||
-                execution.backend_type() == core::BackendType::Metal;
+                (execution.backend_type() == core::BackendType::Metal && core::metal_fa_rdna2_enabled());
             auto attn = modules::ScaledDotProductAttentionModule({
                 config.head_dim,
                 flash_ok

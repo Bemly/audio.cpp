@@ -50,6 +50,11 @@ BackendType backend_type(ggml_backend_t backend);
 bool is_host_backend(ggml_backend_t backend);
 bool uses_host_graph_plan(BackendType type);
 bool uses_host_graph_plan(ggml_backend_t backend);
+// FA-RDNA2 self-written Metal kernels available? Mirrors the ggml switch
+// GGML_METAL_FA_AMD=1 (default off). Model lowerings that select the flash
+// path on Metal must consult this so FA-off keeps the manual fallback
+// instead of emitting an op with no kernel.
+bool metal_fa_rdna2_enabled();
 bool requested_backend_uses_host_graph_plan(const BackendConfig & config);
 // Drop the CUDA/HIP context's cached (idle) pool memory back to the driver.
 // No-op on other backends. For use on allocation-failure paths before a retry.

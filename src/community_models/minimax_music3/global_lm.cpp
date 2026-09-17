@@ -145,8 +145,13 @@ modules::QwenCausalDecodeRuntimeConfig make_minimax_music3_global_lm_runtime_con
     out.decoder.stack.projection_precision = GGML_PREC_DEFAULT;
     out.decoder.stack.use_qk_norm = true;
     out.decoder.stack.activation_cast = activation_cast_policy(backend_type);
-    out.decoder.stack.runtime.attention.prefill_mode = modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
-    out.decoder.stack.runtime.attention.static_mode = modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+    // Metal without the FA-RDNA2 kernels has no flash kernel: fall back to
+    // the manual path instead of emitting an unsupported op.
+    const auto attn_mode = (backend_type == core::BackendType::Metal && !core::metal_fa_rdna2_enabled())
+        ? modules::QwenDecoderAttentionMode::ManualRepeat
+        : modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+    out.decoder.stack.runtime.attention.prefill_mode = attn_mode;
+    out.decoder.stack.runtime.attention.static_mode = attn_mode;
     out.decoder.stack.runtime.static_cache.update_mode = modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
     out.decoder.stack.runtime.static_cache.set_rows_mode =
         modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;

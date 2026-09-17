@@ -97,9 +97,10 @@ modules::QwenCausalDecodeRuntimeConfig make_qwen_decode_runtime_config(
     out.trace_name = "dots_tts.llm";
     out.decoder.stack = stack_config(config);
     if (backend_type == core::BackendType::Metal) {
-        // FA-RDNA2: Q stays F32, KV go F16 (direct kernel path), acc is F32.
+        // FA-RDNA2: Q stays F32, KV stay F32 (F32 prepass path), acc is F32.
+        // Note: F16 KV cache is NOT used here — this runtime's set-rows
+        // update path requires f32 cache tensors.
         out.decoder.stack.attention_precision = GGML_PREC_F32;
-        out.decoder.static_cache_type = GGML_TYPE_F16;
     }
     out.decoder.logits_mode = modules::QwenCausalDecoderLogitsMode::AllSteps;
     out.prefill_graph_arena_bytes = kLargeGraphContextBytes;

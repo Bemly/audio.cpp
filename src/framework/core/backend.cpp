@@ -300,6 +300,14 @@ bool uses_host_graph_plan(BackendType type) {
     return type == BackendType::Cpu;
 }
 
+bool metal_fa_rdna2_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_METAL_FA_AMD");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 bool uses_host_graph_plan(ggml_backend_t backend) {
     return is_host_backend(backend);
 }

@@ -172,8 +172,13 @@ modules::QwenCausalDecoderConfig make_slow_decoder_config(
     out.stack.qkv_layout = modules::QwenDecoderQKVLayout::PackedQKV;
     out.stack.use_qk_norm = config.attention_qk_norm;
     out.stack.activation_cast = fish_activation_cast_policy(backend_type);
-    out.stack.runtime.attention.prefill_mode = modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
-    out.stack.runtime.attention.static_mode = modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+    // Metal without the FA-RDNA2 kernels has no flash kernel: fall back to
+    // the manual path instead of emitting an unsupported op.
+    const auto attn_mode = (backend_type == core::BackendType::Metal && !core::metal_fa_rdna2_enabled())
+        ? modules::QwenDecoderAttentionMode::ManualRepeat
+        : modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+    out.stack.runtime.attention.prefill_mode = attn_mode;
+    out.stack.runtime.attention.static_mode = attn_mode;
     out.stack.runtime.static_cache.update_mode = modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
     out.stack.runtime.static_cache.set_rows_mode = modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;
     out.stack.runtime.mlp.mode = modules::QwenDecoderMLPMode::PackedGateUp;
@@ -204,8 +209,13 @@ modules::QwenCausalDecoderConfig make_fast_decoder_config(
     out.stack.qkv_layout = modules::QwenDecoderQKVLayout::PackedQKV;
     out.stack.use_qk_norm = config.attention_qk_norm;
     out.stack.activation_cast = fish_activation_cast_policy(backend_type);
-    out.stack.runtime.attention.prefill_mode = modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
-    out.stack.runtime.attention.static_mode = modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+    // Metal without the FA-RDNA2 kernels has no flash kernel: fall back to
+    // the manual path instead of emitting an unsupported op.
+    const auto attn_mode = (backend_type == core::BackendType::Metal && !core::metal_fa_rdna2_enabled())
+        ? modules::QwenDecoderAttentionMode::ManualRepeat
+        : modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+    out.stack.runtime.attention.prefill_mode = attn_mode;
+    out.stack.runtime.attention.static_mode = attn_mode;
     out.stack.runtime.static_cache.update_mode = modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
     out.stack.runtime.static_cache.set_rows_mode = modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;
     out.stack.runtime.mlp.mode = modules::QwenDecoderMLPMode::PackedGateUp;
@@ -1131,9 +1141,12 @@ private:
             std::vector<core::TensorValue> cache_values;
             cache_keys.reserve(runtime_->weights().slow_layers.size());
             cache_values.reserve(runtime_->weights().slow_layers.size());
-            const ggml_type cache_type = runtime_->backend_type() == core::BackendType::Vulkan
+            // TransformerKVCache below requires f32 handoff tensors; the static
+            // cache itself is F16 on Metal (FA-RDNA2 direct path).
+            const ggml_type cache_type = (runtime_->backend_type() == core::BackendType::Vulkan ||
+                    runtime_->backend_type() == core::BackendType::Metal)
                 ? GGML_TYPE_F32
-                : (runtime_->backend_type() == core::BackendType::Metal ? GGML_TYPE_F16 : GGML_TYPE_BF16);
+                : GGML_TYPE_BF16;
             for (size_t layer = 0; layer < runtime_->weights().slow_layers.size(); ++layer) {
                 cache_keys.push_back(core::wrap_tensor(
                     ggml_new_tensor_4d(
@@ -1321,9 +1334,12 @@ private:
             std::vector<core::TensorValue> cache_values;
             cache_keys.reserve(weights.fast_layers.size());
             cache_values.reserve(weights.fast_layers.size());
-            const ggml_type cache_type = runtime_->backend_type() == core::BackendType::Vulkan
+            // TransformerKVCache below requires f32 handoff tensors; the static
+            // cache itself is F16 on Metal (FA-RDNA2 direct path).
+            const ggml_type cache_type = (runtime_->backend_type() == core::BackendType::Vulkan ||
+                    runtime_->backend_type() == core::BackendType::Metal)
                 ? GGML_TYPE_F32
-                : (runtime_->backend_type() == core::BackendType::Metal ? GGML_TYPE_F16 : GGML_TYPE_BF16);
+                : GGML_TYPE_BF16;
             for (size_t layer = 0; layer < weights.fast_layers.size(); ++layer) {
                 cache_keys.push_back(core::wrap_tensor(
                     ggml_new_tensor_4d(

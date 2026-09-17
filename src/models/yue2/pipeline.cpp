@@ -144,6 +144,14 @@ public:
             core::vulkan_device_is_intel(execution.backend())) {
             allow_flash_attention = false;
         }
+        // Metal without the FA-RDNA2 kernels (GGML_METAL_FA_AMD=1) has no
+        // flash kernel: auto falls back to eager instead of emitting an
+        // unsupported op. Explicit flash/eager still win.
+        if (attention_preference == core::AttentionPreference::Auto && allow_flash_attention &&
+            core::backend_type(execution.backend()) == core::BackendType::Metal &&
+            !core::metal_fa_rdna2_enabled()) {
+            allow_flash_attention = false;
+        }
         engine::debug::trace_log_scalar("yue2.attention.allow_flash", allow_flash_attention);
     }
 

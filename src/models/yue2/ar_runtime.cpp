@@ -156,8 +156,13 @@ engine::modules::QwenCausalDecodeRuntimeConfig make_runtime_config(
     out.decoder.stack.rope_theta = config.rope_theta;
     out.decoder.stack.rope_type = GGML_ROPE_TYPE_NEOX;
     out.decoder.stack.use_qk_norm = true;
-    out.decoder.stack.runtime.attention.prefill_mode = engine::modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
-    out.decoder.stack.runtime.attention.static_mode = engine::modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+    // Metal without the FA-RDNA2 kernels has no flash kernel: fall back to
+    // the manual path instead of emitting an unsupported op.
+    const auto attn_mode = (backend_type == core::BackendType::Metal && !engine::core::metal_fa_rdna2_enabled())
+        ? engine::modules::QwenDecoderAttentionMode::ManualRepeat
+        : engine::modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+    out.decoder.stack.runtime.attention.prefill_mode = attn_mode;
+    out.decoder.stack.runtime.attention.static_mode = attn_mode;
     out.decoder.stack.runtime.static_cache.update_mode = engine::modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
     out.decoder.stack.runtime.static_cache.set_rows_mode =
         engine::modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;

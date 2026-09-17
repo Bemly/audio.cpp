@@ -341,13 +341,9 @@ core::TensorValue build_attention(
         {weights.require(prefix + "k_norm.weight"), std::nullopt});
     q = SplitRoPEModule({head_dim}).build(ctx, q, q_cos, q_sin);
     k = SplitRoPEModule({head_dim}).build(ctx, k, k_cos, k_sin);
-    // Metal joins the flash side (FA-RDNA2 covers head_dim 128 for the H3
-    // prompt encoder, the only in-tree user of this runtime). Other backends
-    // keep the previous ManualRepeat behavior.
     auto h = GroupedQueryAttentionModule({
         head_dim,
-        ctx.backend_type == core::BackendType::Metal ? GroupedQueryAttentionLowering::FlashGrouped
-                                                    : GroupedQueryAttentionLowering::ManualRepeat,
+        GroupedQueryAttentionLowering::ManualRepeat,
         config.stack.attention_precision,
         AttentionCausality::Causal,
     }).build(ctx, q, k, v);

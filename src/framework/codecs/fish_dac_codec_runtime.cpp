@@ -370,6 +370,26 @@ core::TensorValue attention_from_heads(
     q = core::wrap_tensor(ggml_cont(ctx.ggml, q.tensor), q.shape, q.type);
     k = core::wrap_tensor(ggml_cont(ctx.ggml, k.tensor), k.shape, k.type);
     v = core::wrap_tensor(ggml_cont(ctx.ggml, v.tensor), v.shape, v.type);
+    // Metal without the FA-RDNA2 kernels has no flash kernel (head_dim 64 is
+    // covered when GGML_METAL_FA_AMD=1): manual fallback instead of emitting
+    // an unsupported op.
+    if (ctx.backend_type == core::BackendType::Metal && !core::metal_fa_rdna2_enabled()) {
+        const modules::MatMulModule matmul;
+        auto scores = matmul.build(
+            ctx, q, modules::TransposeModule({{0, 1, 3, 2}, k.shape.rank}).build(ctx, k));
+        scores = core::ensure_backend_addressable_layout(ctx, scores);
+        auto attn = core::wrap_tensor(
+            ggml_soft_max_ext(
+                ctx.ggml,
+                scores.tensor,
+                attention_mask.tensor,
+                1.0F / std::sqrt(static_cast<float>(kCodecHeadDim)),
+                0.0F),
+            scores.shape,
+            GGML_TYPE_F32);
+        auto context = matmul.build(ctx, attn, v);
+        return modules::TransposeModule({{0, 2, 1, 3}, context.shape.rank}).build(ctx, context);
+    }
     auto * flash = ggml_flash_attn_ext(
         ctx.ggml,
         q.tensor,

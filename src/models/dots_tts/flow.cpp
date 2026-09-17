@@ -1,5 +1,7 @@
 #include "flow_impl.h"
 
+#include "engine/framework/core/backend.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -179,7 +181,8 @@ DotAttentionOutput dit_attention_with_cache(
     q = modules::TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, q);
     auto k_heads = modules::TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, attention_key);
     auto v_heads = modules::TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, attention_value);
-    const auto lowering = (ctx.backend_type == core::BackendType::Cuda || ctx.backend_type == core::BackendType::Metal)
+    const auto lowering = (ctx.backend_type == core::BackendType::Cuda ||
+            (ctx.backend_type == core::BackendType::Metal && core::metal_fa_rdna2_enabled()))
         ? modules::ScaledDotProductAttentionLowering::FlashPreserveViews
         : modules::ScaledDotProductAttentionLowering::Explicit;
     auto context = modules::ScaledDotProductAttentionModule({

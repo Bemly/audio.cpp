@@ -275,9 +275,11 @@ core::TensorValue attention_from_heads(
     const core::TensorValue & k_heads,
     const core::TensorValue & v_heads,
     int64_t dim) {
-    // Metal joins the flash side: FA-RDNA2 covers head_dim 64 (Q/K/V are F32
-    // Linear outputs, F32 prepass path).
-    if (ctx.backend_type == core::BackendType::Cuda || ctx.backend_type == core::BackendType::Metal) {
+    // Metal joins the flash side when the FA-RDNA2 kernels are switched on
+    // (GGML_METAL_FA_AMD=1): FA-RDNA2 covers head_dim 64 (Q/K/V are F32
+    // Linear outputs, F32 prepass path). FA-off keeps the manual fallback.
+    if (ctx.backend_type == core::BackendType::Cuda ||
+        (ctx.backend_type == core::BackendType::Metal && core::metal_fa_rdna2_enabled())) {
         return modules::ScaledDotProductAttentionModule({
             dim,
             modules::ScaledDotProductAttentionLowering::FlashPreserveViews,
