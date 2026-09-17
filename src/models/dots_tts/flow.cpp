@@ -179,7 +179,7 @@ DotAttentionOutput dit_attention_with_cache(
     q = modules::TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, q);
     auto k_heads = modules::TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, attention_key);
     auto v_heads = modules::TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, attention_value);
-    const auto lowering = ctx.backend_type == core::BackendType::Cuda
+    const auto lowering = (ctx.backend_type == core::BackendType::Cuda || ctx.backend_type == core::BackendType::Metal)
         ? modules::ScaledDotProductAttentionLowering::FlashPreserveViews
         : modules::ScaledDotProductAttentionLowering::Explicit;
     auto context = modules::ScaledDotProductAttentionModule({

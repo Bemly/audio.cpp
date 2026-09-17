@@ -275,7 +275,9 @@ core::TensorValue attention_from_heads(
     const core::TensorValue & k_heads,
     const core::TensorValue & v_heads,
     int64_t dim) {
-    if (ctx.backend_type == core::BackendType::Cuda) {
+    // Metal joins the flash side: FA-RDNA2 covers head_dim 64 (Q/K/V are F32
+    // Linear outputs, F32 prepass path).
+    if (ctx.backend_type == core::BackendType::Cuda || ctx.backend_type == core::BackendType::Metal) {
         return modules::ScaledDotProductAttentionModule({
             dim,
             modules::ScaledDotProductAttentionLowering::FlashPreserveViews,

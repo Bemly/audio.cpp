@@ -58,7 +58,9 @@ modules::QwenDecoderStackConfig make_depth_stack_config(
     out.attention_precision = GGML_PREC_F32;
     out.projection_precision = GGML_PREC_DEFAULT;
     out.use_qk_norm = false;
-    out.runtime.attention.prefill_mode = core::uses_ggml_cuda_or_hip_backend(backend_type)
+    // Metal joins the flash side (FA-RDNA2 covers head_dim 256).
+    out.runtime.attention.prefill_mode = (core::uses_ggml_cuda_or_hip_backend(backend_type) ||
+            backend_type == core::BackendType::Metal)
         ? modules::QwenDecoderAttentionMode::FlashGroupedViewKV
         : modules::QwenDecoderAttentionMode::ManualRepeat;
     return out;
