@@ -1108,9 +1108,22 @@ void test_options_schema() {
 }
 
 void test_option_name_mapping_from_production_spec() {
-    // The production catalog currently points at the legacy source-only specs.
-    const auto omnivoice_cli = engine::model_spec::cli_interface("omnivoice");
-    engine::test::require(!omnivoice_cli.has_value(), "legacy omnivoice spec should not expose CLI metadata");
+    // Reference option tables do not opt legacy loaders into v1 contracts.
+    for (const auto * family : {
+             "omnivoice", "qwen3_tts", "qwen3_asr", "chatterbox", "citrinet_asr",
+             "higgs_audio_tts", "index_tts2", "miocodec", "miotts", "moss_tts_local",
+             "moss_tts_nano", "pocket_tts", "stable_audio", "supertonic", "vibevoice",
+             "vibevoice_asr", "voxcpm2", "voxtral_realtime"}) {
+        const auto cli = engine::model_spec::cli_interface(family);
+        engine::test::require(!cli.has_value(), "legacy spec should not expose v1 CLI metadata");
+        const auto spec = engine::model_spec::load_spec(
+            std::filesystem::path(AUDIOCPP_SOURCE_DIR) / "model_specs" / (std::string(family) + ".json"));
+        engine::test::require(spec.find("schema_version") == nullptr, "reference options must not migrate the spec");
+        const auto * options = spec.find("options");
+        engine::test::require(options != nullptr, "reference options should be documented");
+        engine::model_spec::validate_spec(
+            json::parse(schema_v1_spec_with_options(json::stringify(*options))), family);
+    }
 
     const auto vibevoice_cli = engine::model_spec::cli_interface("vibevoice");
     engine::test::require(!vibevoice_cli.has_value(), "legacy vibevoice spec should not expose CLI metadata");
@@ -1390,6 +1403,24 @@ void test_task_vocabulary_is_consistent() {
         "the header's old example spelling should not silently resolve");
 }
 
+void test_vad_timestamp_capability() {
+    const auto root = make_temp_root();
+    auto spec = json::parse(schema_v1_spec_text("[]")).as_object();
+    spec["category"] = json::Value::make_string("audio_tools");
+    spec["tasks"] = json::parse(R"(["vad"])");
+    for (const bool segments : {false, true}) {
+        spec["capabilities"] = json::parse(segments ? R"({"vad":["speech_segments"]})" : R"({"vad":["chunk_planning"]})");
+        const auto path = write_text(root, "toy_model.json", json::stringify(json::Value::make_object(spec)));
+        (void)engine::model_spec::load_spec(path);
+        const engine::model_spec::ScopedSpecOverride spec_override(root);
+        const auto capabilities = engine::model_spec::advertised_capabilities("toy_model");
+        engine::test::require(capabilities.has_value(), "VAD capabilities should be projected");
+        engine::test::require_eq(capabilities->supports_timestamps, segments,
+                                "only speech_segments should enable VAD timestamps");
+    }
+    std::filesystem::remove_all(root);
+}
+
 // Every task name the shipped specs declare is one the engine can serve.
 //
 // The two that were not -- moss_voicegen declaring the ABI token "vdes" where
@@ -1449,6 +1480,7 @@ int main() {
         test_contract_spec_prefers_workspace_over_package_local_spec();
         test_loading_and_resource_bundle();
         test_task_vocabulary_is_consistent();
+        test_vad_timestamp_capability();
         test_shipped_model_specs_declare_known_tasks();
     } catch (const std::exception & error) {
         std::cerr << "model_spec_system_test failed: " << error.what() << "\n";

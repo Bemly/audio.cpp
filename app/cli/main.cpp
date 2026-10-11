@@ -12,6 +12,7 @@
 
 #include "engine/framework/audio/chunking.h"
 #include "engine/framework/audio/conversion.h"
+#include "engine/framework/core/load_progress.h"
 #include "engine/framework/debug/trace.h"
 #include "engine/framework/io/json.h"
 #include "engine/framework/runtime/registry.h"
@@ -53,7 +54,7 @@ void print_task_list_help() {
         << "audiocpp_cli --task <task> --family <family> --model <path> --backend <backend> [options]\n"
         << "  Global:\n"
         << "    --version  Print build version, commit, compiler, platform, and enabled backends\n"
-        << "    --task vad|asr|diar|sep|gen|tts|clon|vc|s2s|align|vdes|spk|svc|midi\n"
+        << "    --task vad|asr|diar|sep|gen|tts|clon|vc|s2s|align|vdes|spk|svc|midi|wake|cls\n"
         << "    --family <name>\n"
         << "    --model <path>\n"
         << "    --backend cpu|cuda|hip|rocm|vulkan|metal|best  (rocm is an alias for hip)\n"
@@ -67,6 +68,8 @@ void print_task_list_help() {
         << "    --weight <id>\n"
         << "    --log  Stream framework progress and timing logs to stdout\n"
         << "    --log-file <path>  Stream framework progress and timing logs to a file\n"
+        << "    --load-progress 0|1  with --log/--log-file, emit model-load progress keys\n"
+        << "                (runtime.load.phase, <store>.weights.upload_progress); default 0\n"
         << "    --metrics  Print compact wall time, audio duration, and RTF summary after offline generation\n"
         << "    --load-option key=value\n"
         << "    --session-option key=value\n"
@@ -144,6 +147,7 @@ void print_task_list_help() {
         << "  Outputs:\n"
         << "    --out <file>\n"
         << "    --out-dir <dir>  Write named multi-audio outputs or batch request outputs\n"
+        << "    --out-format pcm16|pcm24|float32  WAV sample format for --out/--out-dir audio, default pcm16\n"
         << "    --text-out <txt>\n"
         << "    --segments-out <json>\n"
         << "    --vad-chunks-out <json>  Write offline VAD-based chunk windows\n"
@@ -173,7 +177,9 @@ void print_task_list_help() {
         << "    vdes   voice design\n"
         << "    spk    speaker embedding/recognition\n"
         << "    svc    singing voice conversion\n"
-        << "    midi   audio-to-symbolic MIDI/event transcription\n";
+        << "    midi   audio-to-symbolic MIDI/event transcription\n"
+        << "    wake   wake-word detection\n"
+        << "    cls    audio classification\n";
 }
 
 void print_option_group(const char * title, const std::vector<engine::runtime::CliOptionInfo> & options) {
@@ -271,6 +277,8 @@ void print_model_common_options(const engine::runtime::ModelInspection & inspect
     }
     if (model_supports_task(inspection, engine::runtime::VoiceTaskKind::Asr) ||
         model_supports_task(inspection, engine::runtime::VoiceTaskKind::Vad) ||
+        model_supports_task(inspection, engine::runtime::VoiceTaskKind::WakeWord) ||
+        model_supports_task(inspection, engine::runtime::VoiceTaskKind::AudioClassification) ||
         model_supports_task(inspection, engine::runtime::VoiceTaskKind::Diarization) ||
         model_supports_task(inspection, engine::runtime::VoiceTaskKind::SourceSeparation) ||
         model_supports_task(inspection, engine::runtime::VoiceTaskKind::Midi) ||
@@ -542,6 +550,9 @@ void run_streaming(
     minitts::cli::PartialTextRenderer partial_renderer(stdout_is_terminal());
     const minitts::app::StreamEventSink sink =
         [&](const engine::runtime::StreamEvent & event) {
+            if (event.partial_text_snapshot.has_value()) {
+                std::cout << partial_renderer.render_snapshot(event.partial_text_snapshot->text) << std::flush;
+            }
             if (event.partial_text.has_value()) {
                 // Flushed so a live source's partials appear as they are produced rather than
                 // when the stdio buffer happens to fill.
@@ -560,7 +571,8 @@ void run_streaming(
                 out_dir,
                 std::nullopt,
                 std::nullopt,
-                std::nullopt);
+                std::nullopt,
+                outputs.wav_options);
             for (const auto & activity : event.voice_activity) {
                 std::cout << "event=";
                 switch (activity.kind) {
@@ -593,7 +605,8 @@ void run_streaming(
         outputs.output_dir,
         outputs.segments_base,
         outputs.turns_base,
-        outputs.words_base);
+        outputs.words_base,
+        outputs.wav_options);
     if (text_out.has_value()) {
         write_text_output(result, *text_out, "text_out");
     }
@@ -638,6 +651,15 @@ int audiocpp_cli_main(int argc, char ** argv) {
             has_arg(argc, argv, "--log") || log_file.has_value(),
             log_file,
         });
+        // Opt-in model-load progress reporting (runtime.load.phase,
+        // <store>.weights.upload_progress). Default off so the log for
+        // existing downstream pipelines is unchanged.
+        if (const auto load_progress = find_arg(argc, argv, "--load-progress")) {
+            if (*load_progress != "0" && *load_progress != "1") {
+                throw std::runtime_error("--load-progress expects 0 or 1");
+            }
+            engine::core::set_load_progress_enabled(*load_progress == "1");
+        }
         const bool metrics_requested = has_arg(argc, argv, "--metrics");
         if (has_arg(argc, argv, "--version")) {
             minitts::app::print_build_info(std::cout);
@@ -832,8 +854,13 @@ int audiocpp_cli_main(int argc, char ** argv) {
         omp_set_num_threads(threads);
 #endif
         session_options.options = collect_key_value_args(argc, argv, "--session-option");
+        // Parsed before the model loads so a bad value fails fast.
+        const auto wav_options = wav_write_options_from_cli(argc, argv);
         auto model = registry.load(load_request);
         auto session = model->create_task_session(task_spec, session_options);
+        // The weight stores uploaded during session construction: close the
+        // load-progress bracket opened by registry.load (see finish_model_load_trace).
+        engine::runtime::finish_model_load_trace();
         const auto voice_state_out = optional_path_arg(argc, argv, "--voice-state-out");
         const auto text_out = optional_path_arg(argc, argv, "--text-out");
         const auto words_out = optional_path_arg(argc, argv, "--words-out");
@@ -845,6 +872,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
             optional_path_arg(argc, argv, "--turns-out"),
             words_out,
             optional_path_arg(argc, argv, "--batch-manifest-out"),
+            wav_options,
         };
         const auto input_format = find_arg(argc, argv, "--input-format").value_or("s16le");
 
@@ -960,7 +988,8 @@ int audiocpp_cli_main(int argc, char ** argv) {
                 outputs.output_dir,
                 outputs.segments_base,
                 outputs.turns_base,
-                words_out);
+                words_out,
+                outputs.wav_options);
             if (vad_chunks_out.has_value()) {
                 write_vad_chunks_output(
                     result,

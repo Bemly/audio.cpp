@@ -1,6 +1,391 @@
 {
   "cases": [
     {
+      "id": "ced_classification",
+      "coverage": "CED classification, changing graph shapes, long audio pooling, top-k selection and repeat requests",
+      "family": "ced",
+      "model": "models/CED-GGUF/ced-tiny-f32.gguf",
+      "task": "cls",
+      "outputs": [],
+      "requests": [
+        {"id": "snapping", "audio": "resources/ced/finger_snapping.wav", "options": {"top_k": 527}},
+        {"id": "speech", "audio": "resources/wakeword/micro/speech.wav", "options": {"top_k": 527}},
+        {"id": "music", "audio": "resources/wakeword/micro/music.wav", "options": {"top_k": 527}},
+        {"id": "silence", "audio": "resources/wakeword/micro/silence.wav", "options": {"top_k": 527}},
+        {"id": "long", "audio": "resources/vibevoice_asr/four_speaker_short.wav", "options": {"top_k": 527}},
+        {"id": "repeat", "audio": "resources/ced/finger_snapping.wav", "options": {"top_k": 527}},
+        {"id": "top_one", "audio": "resources/ced/finger_snapping.wav", "options": {"top_k": 1}}
+      ]
+    },
+    {
+      "id": "micro_wake_word_requests",
+      "coverage": "MixedNet recorded wake phrases, speech, music, silence, threshold overrides and repeated-request reset",
+      "family": "micro_wake_word",
+      "model": "models/MicroWakeWord-GGUF/micro-wake-word-okay-nabu-f32.gguf",
+      "task": "wake",
+      "outputs": ["segments"],
+      "requests": [
+        {"id": "positive1", "audio": "resources/wakeword/micro/okay_nabu_1.wav"},
+        {"id": "positive2", "audio": "resources/wakeword/micro/okay_nabu_2.wav"},
+        {"id": "positive3", "audio": "resources/wakeword/micro/okay_nabu_3.wav"},
+        {"id": "speech", "audio": "resources/wakeword/micro/speech.wav"},
+        {"id": "music", "audio": "resources/wakeword/micro/music.wav"},
+        {"id": "silence", "audio": "resources/wakeword/micro/silence.wav"},
+        {"id": "threshold", "audio": "resources/wakeword/micro/speech.wav", "options": {"threshold": 0.01, "sliding_window_size": 1}},
+        {"id": "repeat_speech", "audio": "resources/wakeword/micro/speech.wav"},
+        {"id": "repeat_positive1", "audio": "resources/wakeword/micro/okay_nabu_1.wav"}
+      ]
+    },
+    {
+      "id": "micro_wake_word_streaming",
+      "coverage": "MixedNet streaming feature and recurrent-state continuity",
+      "family": "micro_wake_word",
+      "model": "models/MicroWakeWord-GGUF/micro-wake-word-okay-nabu-f32.gguf",
+      "task": "wake",
+      "mode": "streaming",
+      "outputs": ["segments"],
+      "requests": [
+        {"id": "positive", "audio": "resources/wakeword/micro/okay_nabu_1.wav"}
+      ]
+    },
+    {
+      "id": "sherpa_kws_requests",
+      "coverage": "Zipformer English and Chinese keyword detection, beam settings and repeated-request reset",
+      "family": "sherpa_kws",
+      "model": "models/Sherpa-KWS-GGUF/sherpa-kws-zipformer-zh-en-3m-f32.gguf",
+      "task": "wake",
+      "outputs": ["segments"],
+      "requests": [
+        {"id": "english", "audio": "resources/wakeword/sherpa/en_0.wav"},
+        {"id": "english2", "audio": "resources/wakeword/sherpa/en_1.wav"},
+        {"id": "chinese", "audio": "resources/wakeword/sherpa/zh_0.wav"},
+        {"id": "chinese1", "audio": "resources/wakeword/sherpa/zh_1.wav"},
+        {"id": "chinese2", "audio": "resources/wakeword/sherpa/zh_2.wav"},
+        {"id": "chinese3", "audio": "resources/wakeword/sherpa/zh_3.wav"},
+        {"id": "chinese4", "audio": "resources/wakeword/sherpa/zh_4.wav"},
+        {"id": "chinese5", "audio": "resources/wakeword/sherpa/zh_5.wav"},
+        {"id": "chinese6", "audio": "resources/wakeword/sherpa/zh_6.wav"},
+        {"id": "beam", "audio": "resources/wakeword/sherpa/en_0.wav", "options": {"max_active_paths": 8}},
+        {"id": "repeat_english", "audio": "resources/wakeword/sherpa/en_0.wav"}
+      ]
+    },
+    {
+      "id": "sherpa_kws_streaming",
+      "coverage": "Zipformer streaming detections and finalization",
+      "family": "sherpa_kws",
+      "model": "models/Sherpa-KWS-GGUF/sherpa-kws-zipformer-zh-en-3m-f32.gguf",
+      "task": "wake",
+      "mode": "streaming",
+      "outputs": ["segments"],
+      "requests": [
+        {"id": "english", "audio": "resources/wakeword/sherpa/en_0.wav"}
+      ]
+    },
+    {
+      "id": "hviske_v6_longform",
+      "coverage": "Danish longform, auto versus explicit silence splitting, fixed and unsplit modes, and repeated requests",
+      "family": "hviske_asr_v6",
+      "model": "models/Hviske-v6-GGUF/hviske-v6-bf16.gguf",
+      "task": "asr",
+      "outputs": ["text"],
+      "requests": [
+        {"id": "warmup", "audio": "resources/hviske_asr/danish_unified_00.wav"},
+        {"id": "longform", "audio": "resources/hviske_asr/da_solen_180s.wav"},
+        {"id": "auto_20", "audio": "resources/hviske_asr/da_solen_180s.wav", "options": {"audio_chunk_mode": "auto", "audio_chunk_duration_sec": 20}},
+        {"id": "fixed_28", "audio": "resources/hviske_asr/da_solen_180s.wav", "options": {"audio_chunk_mode": "fixed", "audio_chunk_duration_sec": 28}},
+        {"id": "none_short", "audio": "resources/hviske_asr/danish_unified_00.wav", "options": {"audio_chunk_mode": "none"}},
+        {"id": "silence_short", "audio": "resources/hviske_asr/danish_unified_00.wav", "options": {"audio_chunk_mode": "silence", "audio_chunk_duration_sec": 8}},
+        {"id": "auto_short_8", "audio": "resources/hviske_asr/danish_unified_00.wav", "options": {"audio_chunk_mode": "auto", "audio_chunk_duration_sec": 8}},
+        {"id": "silence_long", "audio": "resources/hviske_asr/da_solen_180s.wav", "options": {"audio_chunk_mode": "silence"}},
+        {"id": "repeat_default", "audio": "resources/hviske_asr/da_solen_180s.wav"},
+        {"id": "short_after_long", "audio": "resources/hviske_asr/danish_unified_00.wav"}
+      ]
+    },
+    {
+      "id": "hviske_v6_asr",
+      "coverage": "Danish ASR, formatting controls, greedy decoding, varying input length and repeated requests",
+      "family": "hviske_asr_v6",
+      "model": "models/Hviske-v6-GGUF/hviske-v6-bf16.gguf",
+      "task": "asr",
+      "outputs": ["text"],
+      "requests": [
+        {"id": "first", "audio": "resources/hviske_asr/danish_unified_00.wav"},
+        {"id": "different", "audio": "resources/hviske_asr/danish_unified_01.wav"},
+        {"id": "third", "audio": "resources/hviske_asr/danish_unified_02.wav"},
+        {"id": "formatted", "audio": "resources/hviske_asr/danish_unified_00.wav", "options": {"cased": true, "punctuated": true}},
+        {"id": "unformatted", "audio": "resources/hviske_asr/danish_unified_00.wav", "options": {"cased": false, "punctuated": false}},
+        {"id": "greedy", "audio": "resources/hviske_asr/danish_unified_00.wav", "options": {"num_beams": 1}},
+        {"id": "repeat_first", "audio": "resources/hviske_asr/danish_unified_00.wav"}
+      ]
+    },
+    {
+      "id": "mossformer2_separation",
+      "coverage": "MossFormer2 default windows, whole-file inference, changed window size and repeated requests",
+      "family": "mossformer2",
+      "model": "models/MossFormer2-GGUF/mossformer2-ss-16k-f32.gguf",
+      "task": "sep",
+      "mode": "offline",
+      "outputs": ["named_audio"],
+      "requests": [
+        {"id": "default", "audio": "assets/resources/sample_16k.wav"},
+        {"id": "whole", "audio": "assets/resources/sample_16k.wav", "options": {"audio_chunk_duration_sec": 0}},
+        {"id": "shorter", "audio": "assets/resources/sample_16k.wav", "options": {"audio_chunk_duration_sec": 1}},
+        {"id": "unnormalized", "audio": "assets/resources/sample_16k.wav", "options": {"normalize_output": false}},
+        {"id": "repeat_default", "audio": "assets/resources/sample_16k.wav"}
+      ]
+    },
+    {
+      "id": "tf_gridnet_separation",
+      "coverage": "TF-GridNet resampling, chunked speaker matching, whole-file inference, and repeated requests",
+      "family": "tf_gridnet",
+      "model": "models/TF-GridNet-GGUF/tf-gridnet-wsj0-2mix-f32.gguf",
+      "task": "sep",
+      "mode": "offline",
+      "outputs": ["named_audio"],
+      "requests": [
+        {"id": "chunked", "audio": "assets/resources/sample_16k.wav"},
+        {"id": "whole", "audio": "assets/resources/sample_16k.wav", "options": {"audio_chunk_duration_sec": 0}},
+        {"id": "repeat_chunked", "audio": "assets/resources/sample_16k.wav"}
+      ]
+    },
+    {
+      "id": "owsm_v4_streaming",
+      "coverage": "OWSM v4 committed long-form text deltas",
+      "family": "owsm",
+      "model": "models/OWSM-GGUF/owsm-v4-base-102m-f32.gguf",
+      "task": "asr",
+      "mode": "streaming",
+      "outputs": ["text"],
+      "requests": [
+        {"id": "longform", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav", "options": {"language": "eng"}}
+      ]
+    },
+    {
+      "id": "owsm_ctc_v4_streaming",
+      "coverage": "OWSM-CTC v4 committed long-form text deltas across overlapping windows",
+      "family": "owsm_ctc",
+      "model": "models/OWSM-CTC-GGUF/owsm-ctc-v4-1b-f32.gguf",
+      "task": "asr",
+      "mode": "streaming",
+      "outputs": ["text"],
+      "requests": [
+        {"id": "longform", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav", "options": {"language": "eng"}}
+      ]
+    },
+    {
+      "id": "owsm_ctc_v4_asr",
+      "coverage": "OWSM-CTC v4 transcription, translation, unknown-language input, and repeated requests",
+      "family": "owsm_ctc",
+      "model": "models/OWSM-CTC-GGUF/owsm-ctc-v4-1b-f32.gguf",
+      "task": "asr",
+      "outputs": ["text"],
+      "requests": [
+        {"id": "first", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "eng"}},
+        {"id": "different_audio", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0001.wav", "options": {"language": "eng"}},
+        {"id": "translation", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "eng", "target_language": "deu"}},
+        {"id": "auto_language", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "auto"}},
+        {"id": "repeat_first", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "eng"}}
+      ]
+    },
+    {
+      "id": "owsm_ctc_v4_longform",
+      "coverage": "OWSM-CTC v4 overlapping long-form windows and short request after long input",
+      "family": "owsm_ctc",
+      "model": "models/OWSM-CTC-GGUF/owsm-ctc-v4-1b-f32.gguf",
+      "task": "asr",
+      "outputs": ["text"],
+      "requests": [
+        {"id": "warmup", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "eng"}},
+        {"id": "longform", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav", "options": {"language": "eng"}},
+        {"id": "repeat_short", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "eng"}}
+      ]
+    },
+    {
+      "id": "owsm_v4_asr",
+      "coverage": "OWSM v4 transcription, timestamps, translation, language identification, beam search, and repeated requests",
+      "family": "owsm",
+      "model": "models/OWSM-GGUF/owsm-v4-base-102m-f32.gguf",
+      "task": "asr",
+      "outputs": ["text", "segments"],
+      "requests": [
+        {"id": "first", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "eng", "return_timestamps": true}},
+        {"id": "different_audio", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0001.wav", "options": {"language": "eng", "return_timestamps": true}},
+        {"id": "translation", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "eng", "target_language": "deu"}},
+        {"id": "auto_language", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "auto", "return_timestamps": true}},
+        {"id": "beam5", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "eng", "beam_size": 5, "return_timestamps": true}},
+        {"id": "repeat_first", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "eng", "return_timestamps": true}}
+      ]
+    },
+    {
+      "id": "owsm_v4_longform",
+      "coverage": "OWSM v4 long-form transcription with and without previous-text conditioning",
+      "family": "owsm",
+      "model": "models/OWSM-GGUF/owsm-v4-base-102m-f32.gguf",
+      "task": "asr",
+      "outputs": ["text", "segments"],
+      "requests": [
+        {"id": "warmup", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "eng"}},
+        {"id": "longform", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav", "options": {"language": "eng", "return_timestamps": true}},
+        {"id": "condition_previous", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav", "options": {"language": "eng", "return_timestamps": true, "condition_on_previous_text": true}},
+        {"id": "repeat_short", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"language": "eng"}}
+      ]
+    },
+    {
+      "id": "tone_color_vc_vc",
+      "coverage": "Tone Color VC reference conditioning, resampling, posterior sampling, and same-session voice changes",
+      "family": "tone_color_vc",
+      "model": "models/Tone-Color-VC-GGUF/tone-color-vc-f32.gguf",
+      "task": "vc",
+      "mode": "offline",
+      "outputs": ["audio"],
+      "requests": [
+        {"id": "reference_a", "audio": "assets/resources/sample_16k.wav", "voice_ref": "assets/resources/a.wav", "seed": 1234},
+        {"id": "reference_b", "audio": "assets/resources/sample_16k.wav", "voice_ref": "assets/resources/b.wav", "seed": 1234},
+        {"id": "reference_a_repeat", "audio": "assets/resources/sample_16k.wav", "voice_ref": "assets/resources/a.wav", "seed": 1234},
+        {"id": "no_noise", "audio": "assets/resources/a.wav", "voice_ref": "assets/resources/b.wav", "options": {"temperature": 0}, "seed": 1234}
+      ]
+    },
+    {
+      "id": "maya1_voice_design",
+      "coverage": "Maya1 voice-design TTS with inline emotion control",
+      "family": "maya1",
+      "model": "models/Maya1-GGUF/maya1-orig.gguf",
+      "task": "tts",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "voice_design",
+        "text": "Hello from Maya. <laugh> This is a short generation test.",
+        "options": {
+          "instruct": "A warm female voice in her 30s with an American accent and conversational pacing.",
+          "max_tokens": 84,
+          "min_tokens": 28,
+          "temperature": 0.4,
+          "top_p": 0.9,
+          "repetition_penalty": 1.1
+        },
+        "seed": 42
+      }]
+    },
+    {
+      "id": "auk_zero_shot_tts",
+      "coverage": "AuK zero-shot TTS with reference speaker audio",
+      "family": "auk",
+      "model": "models/AuK-Base-and-Flash-GGUF",
+      "task": "tts",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "zero_shot",
+        "text": "Say the following with the same voice: 'Ladies and gentlemen, it's an honor to have the opportunity to address such a distinguished audience'",
+        "voice_ref": "reference/AuK/assets/demo-input-audio/zero-shot-tts/ref.wav",
+        "options": {"duration_sec": 6.0},
+        "seed": 42
+      }]
+    },
+    {
+      "id": "auk_instruct_tts",
+      "coverage": "AuK instruction TTS without reference audio",
+      "family": "auk",
+      "model": "models/AuK-Base-and-Flash-GGUF",
+      "task": "tts",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "instruct",
+        "text": "Welcome home. How was work today?",
+        "options": {"instruct": "A calm woman speaking clear English at a natural pace.", "duration_sec": 3.0},
+        "seed": 42
+      }]
+    },
+    {
+      "id": "auk_speech_content_edit",
+      "coverage": "AuK speech content replacement",
+      "family": "auk",
+      "model": "models/AuK-Base-and-Flash-GGUF",
+      "task": "gen",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "replace_words",
+        "audio": "reference/AuK/assets/demo-input-audio/content-edit/content.wav",
+        "text": "Replace 'but accepting what we cannot have' with 'and living well with dreams unmet'.",
+        "options": {"duration_sec": 7.0},
+        "seed": 42
+      }]
+    },
+    {
+      "id": "auk_lyric_edit",
+      "coverage": "AuK lyric replacement in isolated vocals",
+      "family": "auk",
+      "model": "models/AuK-Base-and-Flash-GGUF",
+      "task": "gen",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "replace_lyrics",
+        "audio": "reference/AuK/assets/demo-input-audio/vocal-edit/vocaledit-en-1-input.wav",
+        "text": "Change \"rear view\" to \"like you\" in the vocal recording.",
+        "seed": 42
+      }]
+    },
+    {
+      "id": "auk_speech_enhancement",
+      "coverage": "AuK speech denoising and dereverberation",
+      "family": "auk",
+      "model": "models/AuK-Base-and-Flash-GGUF",
+      "task": "gen",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "enhance",
+        "audio": "reference/AuK/assets/demo-input-audio/se/se-zh-1-input.wav",
+        "text": "Preserve all speakers, remove noise and reverberation, and output clean speech of the same length.",
+        "seed": 42
+      }]
+    },
+    {
+      "id": "auk_flash_zero_shot_tts",
+      "coverage": "AuK-Flash fixed-schedule zero-shot TTS",
+      "family": "auk",
+      "model": "models/AuK-Base-and-Flash-GGUF",
+      "task": "tts",
+      "session_options": {"auk.variant": "flash"},
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "zero_shot",
+        "text": "Say the following with the same voice: 'Ladies and gentlemen, it's an honor to have the opportunity to address such a distinguished audience'",
+        "voice_ref": "reference/AuK/assets/demo-input-audio/zero-shot-tts/ref.wav",
+        "options": {"duration_sec": 6.0},
+        "seed": 42
+      }]
+    },
+    {
+      "id": "auk_flash_instruct_tts",
+      "coverage": "AuK-Flash fixed-schedule instruction TTS",
+      "family": "auk",
+      "model": "models/AuK-Base-and-Flash-GGUF",
+      "task": "tts",
+      "session_options": {"auk.variant": "flash"},
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "instruct",
+        "text": "Welcome home. How was work today?",
+        "options": {"instruct": "A calm woman speaking clear English at a natural pace.", "duration_sec": 3.0},
+        "seed": 42
+      }]
+    },
+    {
+      "id": "auk_flash_speech_content_edit",
+      "coverage": "AuK-Flash fixed-schedule speech content replacement",
+      "family": "auk",
+      "model": "models/AuK-Base-and-Flash-GGUF",
+      "task": "gen",
+      "session_options": {"auk.variant": "flash"},
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "replace_words",
+        "audio": "reference/AuK/assets/demo-input-audio/content-edit/content.wav",
+        "text": "Replace 'but accepting what we cannot have' with 'and living well with dreams unmet'.",
+        "options": {"duration_sec": 7.0},
+        "seed": 42
+      }]
+    },
+    {
       "id": "ace_step_turbo_text2music_long_chunk",
       "coverage": "ACE-Step turbo text2music, planner, DiT, long VAE decode chunking, then shorter request in the same session",
       "family": "ace_step",
@@ -470,6 +855,61 @@
       ]
     },
     {
+      "id": "qwen3_tts_custom_voice_streaming",
+      "coverage": "Qwen3 CustomVoice incremental codec decoding during AR generation and final partial audio flush",
+      "family": "qwen3_tts",
+      "model": "models/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf",
+      "task": "tts",
+      "mode": "streaming",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "custom_stream",
+        "text": "The lighthouse keeper records a detailed morning report about the tide, the lantern, and the ships crossing the horizon.",
+        "language": "English",
+        "speaker": "Ryan",
+        "seed": 1234,
+        "max_tokens": 256,
+        "options": {"stream_chunk_policy": "fixed"}
+      }]
+    },
+    {
+      "id": "qwen3_tts_base_voice_clone_streaming",
+      "coverage": "Qwen3 Base streaming with reference codec context and reference audio excluded from emitted chunks",
+      "family": "qwen3_tts",
+      "model": "models/Qwen3-TTS-12Hz-0.6B-Base-GGUF/qwen3-tts-12hz-0.6b-base-q8_0.gguf",
+      "task": "tts",
+      "mode": "streaming",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "clone_stream",
+        "text": "The lighthouse keeper records a detailed morning report about the tide, the lantern, and the ships crossing the horizon.",
+        "language": "English",
+        "voice_ref": "resources/a.wav",
+        "reference_text": "This little work was finished in the year eighteen o three, and intended for immediate publication.",
+        "seed": 1234,
+        "max_tokens": 256,
+        "options": {"stream_chunk_policy": "fixed"}
+      }]
+    },
+    {
+      "id": "qwen3_tts_voice_design_streaming",
+      "coverage": "Qwen3 VoiceDesign streaming instruction path with a smaller audio event size",
+      "family": "qwen3_tts",
+      "model": "models/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf",
+      "task": "vdes",
+      "mode": "streaming",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "design_stream",
+        "text": "This designed voice should sound cheerful and clear while keeping every word easy to recognize.",
+        "language": "English",
+        "instruct": "A cheerful young woman with a bright studio voice.",
+        "seed": 1234,
+        "max_tokens": 192,
+        "options": {"stream_frames_per_event": 4, "stream_chunk_policy": "fixed"}
+      }]
+    },
+    {
       "id": "qwen3_tts_custom_voice",
       "coverage": "Qwen3 TTS custom voice variant speaker selection path",
       "family": "qwen3_tts",
@@ -724,14 +1164,13 @@
     },
     {
       "id": "neutts_streaming_longform_chunks",
-      "coverage": "NeuTTS-2E streaming pull-events path, long-form chunking, named segment audio, and final merged audio",
+      "coverage": "NeuTTS-2E incremental AR-code streaming, codec context windows, long-form chunking, and final merged audio",
       "family": "neutts",
       "model": "models/NeuTTS-2E-GGUF/neutts-2e-orig.gguf",
       "task": "tts",
       "mode": "streaming",
       "outputs": [
-        "audio",
-        "named_audio"
+        "audio"
       ],
       "requests": [
         {
@@ -876,12 +1315,11 @@
     },
     {
       "id": "voxcpm2_streaming_voice_design",
-      "coverage": "VoxCPM2 streaming text-to-speech path with text-embedded voice design, MiniCPM streaming generation, diffusion feature generation, and AudioVAE chunk decode",
+      "coverage": "VoxCPM2 streaming voice design with growing AudioVAE windows and incremental audio emission",
       "family": "voxcpm2",
       "model": "models/VoxCPM2",
       "task": "tts",
       "mode": "streaming",
-      "chunk_size": 512,
       "outputs": [
         "audio"
       ],
@@ -895,6 +1333,30 @@
           "num_inference_steps": 10,
           "options": {
             "retry_badcase": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "voxcpm2_streaming_clone_fixed",
+      "coverage": "VoxCPM2 reference voice streaming with fixed AudioVAE windows and left-context trimming",
+      "family": "voxcpm2",
+      "model": "models/VoxCPM2",
+      "task": "tts",
+      "mode": "streaming",
+      "outputs": ["audio"],
+      "requests": [
+        {
+          "id": "streaming_clone_fixed",
+          "text": "This VoxCPM2 path test clones the reference speaker for a short review sentence.",
+          "voice_ref": "resources/sample.wav",
+          "seed": 1234,
+          "guidance_scale": 2.0,
+          "num_inference_steps": 10,
+          "options": {
+            "retry_badcase": false,
+            "stream_chunk_policy": "fixed",
+            "stream_frames_per_event": 4
           }
         }
       ]
@@ -968,6 +1430,33 @@
       ]
     },
     {
+      "id": "zipvoice_streaming_clone",
+      "coverage": "ZipVoice chunk-streaming voice-clone path with reference conditioning, named text chunks, and final merged audio",
+      "family": "zipvoice",
+      "model": "models/ZipVoice-Distill-GGUF/zipvoice-distill-orig.gguf",
+      "task": "clon",
+      "mode": "streaming",
+      "outputs": [
+        "audio",
+        "named_audio"
+      ],
+      "final_audio": "stream.wav",
+      "min_named_audio": 2,
+      "requests": [
+        {
+          "id": "streaming_clone",
+          "text": "This ZipVoice streaming path test checks that the CLI can emit multiple text chunks while preserving the reference voice and producing one merged final waveform.",
+          "voice_ref": "assets/resources/sample.wav",
+          "reference_text": "Some call me nature. Others call me Mother Nature. I've been here for over 4.5 billion years.",
+          "text_chunk_size": 64,
+          "text_chunk_mode": "word_budget",
+          "seed": 666,
+          "guidance_scale": 3.0,
+          "num_inference_steps": 8
+        }
+      ]
+    },
+    {
       "id": "higgs_audio_tts_voice_clone_chunked",
       "coverage": "Higgs Audio v3 voice clone path with framework text chunking, AR generation, and codec decode",
       "family": "higgs_audio_tts",
@@ -987,6 +1476,50 @@
           "temperature": 1.0,
           "top_p": 0.95,
           "top_k": 50
+        }
+      ]
+    },
+    {
+      "id": "higgs_audio_tts_voice_clone_streaming",
+      "coverage": "Higgs incremental delayed-codebook audio with growing chunks",
+      "family": "higgs_audio_tts",
+      "model": "models/higgs-audio-v3-tts-4b",
+      "task": "tts",
+      "mode": "streaming",
+      "outputs": [
+        "audio"
+      ],
+      "requests": [
+        {
+          "id": "grow",
+          "text": "A short warmup checks the cloned voice before the run.",
+          "voice_ref": "resources/sample.wav",
+          "reference_text": "This little work was finished in the year eighteen o three, and intended for immediate publication.",
+          "seed": 1234
+        }
+      ]
+    },
+    {
+      "id": "higgs_audio_tts_voice_clone_streaming_fixed",
+      "coverage": "Higgs incremental delayed-codebook audio with small fixed chunks",
+      "family": "higgs_audio_tts",
+      "model": "models/higgs-audio-v3-tts-4b",
+      "task": "tts",
+      "mode": "streaming",
+      "outputs": [
+        "audio"
+      ],
+      "requests": [
+        {
+          "id": "fixed",
+          "text": "The next sentence uses fixed audio chunks without changing the reference speaker.",
+          "voice_ref": "resources/sample.wav",
+          "reference_text": "This little work was finished in the year eighteen o three, and intended for immediate publication.",
+          "seed": 4321,
+          "options": {
+            "stream_chunk_policy": "fixed",
+            "stream_frames_per_event": "8"
+          }
         }
       ]
     },
@@ -1030,6 +1563,25 @@
           "seed": 1234
         }
       ]
+    },
+    {
+      "id": "fish_audio_s2_pro_streaming",
+      "coverage": "Fish Audio incremental AR code emission and stateful causal codec decoding",
+      "family": "fish_audio",
+      "model": "models/Fish-Audio-S2-Pro-GGUF/fish-audio-s2-pro-q8_0.gguf",
+      "task": "tts",
+      "mode": "streaming",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "reference_voice",
+        "text": "The studio engineer checked the short voice prompt, confirmed the take was clear, and started the final render.",
+        "voice_ref": "resources/sample.wav",
+        "reference_text": "Some call me nature. Others call me Mother Nature. I've been here for over 4.5 billion years. 22,500 times longer than you.",
+        "seed": 1234,
+        "temperature": 0.8,
+        "top_p": 0.8,
+        "repetition_penalty": 1.1
+      }]
     },
     {
       "id": "fish_audio_s2_pro_paths",
@@ -1221,6 +1773,181 @@
       ]
     },
     {
+      "id": "yue2_semantic_export",
+      "coverage": "YuE2 semantic token export artifact alongside audio",
+      "family": "yue2",
+      "model": "models/YuE2-3B-Q8_0-GGUF",
+      "task": "gen",
+      "mode": "offline",
+      "outputs": [
+        "audio",
+        "artifact"
+      ],
+      "requests": [
+        {
+          "id": "semantic_export",
+          "text": "[Verse]\nThe counter ticks and every frame is stored.\nA steady index writes the music down.\n[Chorus]\nKeep the tokens, read them back again.\nThe song can leave the runtime as a list.",
+          "seed": 20260914,
+          "num_inference_steps": 8,
+          "options": {
+            "cfg_scale": 1.01,
+            "style": "English, indie pop, bright guitar, soft drums, warm lead vocal",
+            "cot": "off",
+            "export_semantic": true,
+            "abc_min_tokens": 0,
+            "abc_max_tokens": 1,
+            "semantic_min_tokens": 192,
+            "semantic_max_tokens": 640
+          }
+        }
+      ]
+    },
+    {
+      "id": "yue2_stop_after_abc",
+      "coverage": "YuE2 stop_after=abc score-only route",
+      "family": "yue2",
+      "model": "models/YuE2-3B-Q8_0-GGUF",
+      "task": "gen",
+      "mode": "offline",
+      "outputs": [
+        "artifact"
+      ],
+      "requests": [
+        {
+          "id": "stop_after_abc",
+          "text": "[Verse]\nThe planner writes the bars before the sound.\nA staff of ink is all the run will keep.\n[Chorus]\nRead the score and stop before the song.\nLeave the rest of it for later on.",
+          "seed": 20260915,
+          "num_inference_steps": 8,
+          "options": {
+            "cfg_scale": 1.0,
+            "style": "English, piano pop, clear lead vocal, gentle bass, 92 BPM",
+            "cot": "full",
+            "stop_after": "abc",
+            "abc_min_tokens": 128,
+            "abc_max_tokens": 512
+          }
+        }
+      ]
+    },
+    {
+      "id": "yue2_stop_after_semantic",
+      "coverage": "YuE2 stop_after=semantic export-only route without NAR or VAE",
+      "family": "yue2",
+      "model": "models/YuE2-3B-Q8_0-GGUF",
+      "task": "gen",
+      "mode": "offline",
+      "outputs": [
+        "artifact"
+      ],
+      "requests": [
+        {
+          "id": "stop_after_semantic",
+          "text": "[Verse]\nThe tokens land in order on the page.\nNo decoder turns them into air.\n[Chorus]\nStop the run and keep the list of frames.\nRender it another day.",
+          "seed": 20260916,
+          "num_inference_steps": 8,
+          "options": {
+            "cfg_scale": 1.01,
+            "style": "English, indie pop, bright guitar, soft drums, warm lead vocal",
+            "cot": "off",
+            "stop_after": "semantic",
+            "abc_min_tokens": 0,
+            "abc_max_tokens": 1,
+            "semantic_min_tokens": 192,
+            "semantic_max_tokens": 640
+          }
+        }
+      ]
+    },
+    {
+      "id": "yue2_semantic_prefix_continue",
+      "coverage": "YuE2 continuation from a forced semantic prefix on the direct route",
+      "family": "yue2",
+      "model": "models/YuE2-3B-Q8_0-GGUF",
+      "task": "gen",
+      "mode": "offline",
+      "outputs": [
+        "audio"
+      ],
+      "requests": [
+        {
+          "id": "semantic_prefix_continue",
+          "text": "[Verse]\nA quiet harbor wakes up slow.\nThe lantern dims, the tide runs low.\nWe count the boats along the line.\nThe morning keeps its steady time.\n[Chorus]\nCarry on, carry on.\nHold the note until it is gone.",
+          "seed": 20260914,
+          "num_inference_steps": 8,
+          "options": {
+            "cfg_scale": 1.0,
+            "style": "English, folk pop, acoustic guitar, soft brushes, warm male vocal, relaxed tempo",
+            "cot": "off",
+            "semantic_prefix": [
+              12046,
+              8433,
+              16287,
+              11138,
+              6563,
+              22418,
+              9529,
+              23781,
+              7955,
+              1103,
+              6583,
+              4347,
+              17256,
+              9470,
+              4579,
+              28211
+            ],
+            "semantic_min_tokens": 192,
+            "semantic_max_tokens": 640
+          }
+        }
+      ]
+    },
+    {
+      "id": "yue2_semantic_prefix_exact",
+      "coverage": "YuE2 forced semantic prefix that fills the window: the AR stage is skipped and the given frames are exported as they came",
+      "family": "yue2",
+      "model": "models/YuE2-3B-Q8_0-GGUF",
+      "task": "gen",
+      "mode": "offline",
+      "outputs": [
+        "artifact"
+      ],
+      "requests": [
+        {
+          "id": "semantic_prefix_exact",
+          "text": "[Verse]\nA quiet harbor wakes up slow.\nThe lantern dims, the tide runs low.\n[Chorus]\nCarry on, carry on.\nHold the note until it is gone.",
+          "seed": 20260914,
+          "num_inference_steps": 8,
+          "options": {
+            "cfg_scale": 1.0,
+            "style": "English, folk pop, acoustic guitar, soft brushes, warm male vocal, relaxed tempo",
+            "cot": "off",
+            "stop_after": "semantic",
+            "semantic_prefix": [
+              12046,
+              8433,
+              16287,
+              11138,
+              6563,
+              22418,
+              9529,
+              23781,
+              7955,
+              1103,
+              6583,
+              4347,
+              17256,
+              9470,
+              4579,
+              28211
+            ],
+            "semantic_min_tokens": 16,
+            "semantic_max_tokens": 16
+          }
+        }
+      ]
+    },
+    {
       "id": "irodori_tts_500m_emoji_style_clone",
       "coverage": "Irodori-TTS 500M no-reference emoji/style requests and reference clone path in one session",
       "family": "irodori_tts",
@@ -1390,6 +2117,123 @@
           "options": {
             "caption": "\u6df1\u304f\u50b7\u3064\u304d\u3001\u4eca\u306b\u3082\u6ce3\u304d\u51fa\u3057\u305d\u3046\u306a\u69d8\u5b50\u3002\u58f0\u304c\u9707\u3048\u3066\u304a\u308a\u3001\u60b2\u75db\u306a\u30c8\u30fc\u30f3\u3067\u5f31\u3005\u3057\u304f\u8a71\u3059\u3002",
             "num_inference_steps": 24
+          }
+        }
+      ]
+    },
+    {
+      "id": "stable_audio_short_conditioning",
+      "coverage": "SAME encoder short-input prefix cropping, 128-latent boundary, multi-chunk stitching, and repeated-session reuse",
+      "family": "stable_audio",
+      "model": "models/stable-audio-3-small-music",
+      "task": "gen",
+      "mode": "offline",
+      "outputs": [
+        "audio"
+      ],
+      "requests": [
+        {
+          "text": "Replace only the masked sections with a tight snare fill and bright guitar swell.",
+          "audio": "resources/mel_roformer_test_10s.wav",
+          "seed": 42,
+          "num_inference_steps": 8,
+          "guidance_scale": 1,
+          "id": "short_stereo",
+          "options": {
+            "duration_sec": 10,
+            "duration_padding_sec": 0,
+            "audio_input_kind": "inpaint_audio",
+            "inpaint_mask_start_sec": "2.5,6.5",
+            "inpaint_mask_end_sec": "3.5,8.0"
+          }
+        },
+        {
+          "text": "Replace only the masked sections with a tight snare fill and bright guitar swell.",
+          "audio": "assets/resources/sample.wav",
+          "seed": 42,
+          "num_inference_steps": 8,
+          "guidance_scale": 1,
+          "id": "short_mono",
+          "options": {
+            "duration_sec": 10,
+            "duration_padding_sec": 0,
+            "audio_input_kind": "inpaint_audio",
+            "inpaint_mask_start_sec": "2.5,6.5",
+            "inpaint_mask_end_sec": "3.5,8.0"
+          }
+        },
+        {
+          "text": "Replace only the masked sections with a tight snare fill and bright guitar swell.",
+          "audio": "resources/mel_roformer_test_10s.wav",
+          "seed": 42,
+          "num_inference_steps": 8,
+          "guidance_scale": 1,
+          "id": "exact_chunk",
+          "options": {
+            "duration_sec": 11.888616780045352,
+            "duration_padding_sec": 0,
+            "audio_input_kind": "inpaint_audio",
+            "inpaint_mask_start_sec": "2.5,6.5",
+            "inpaint_mask_end_sec": "3.5,8.0"
+          }
+        },
+        {
+          "text": "Replace only the masked sections with a tight snare fill and bright guitar swell.",
+          "audio": "resources/mel_roformer_test_10s.wav",
+          "seed": 42,
+          "num_inference_steps": 8,
+          "guidance_scale": 1,
+          "id": "above_chunk",
+          "options": {
+            "duration_sec": 12,
+            "duration_padding_sec": 0,
+            "audio_input_kind": "inpaint_audio",
+            "inpaint_mask_start_sec": "2.5,6.5",
+            "inpaint_mask_end_sec": "3.5,8.0"
+          }
+        },
+        {
+          "text": "Replace only the masked sections with a tight snare fill and bright guitar swell.",
+          "audio": "resources/mel_roformer_test_10s.wav",
+          "seed": 42,
+          "num_inference_steps": 8,
+          "guidance_scale": 1,
+          "id": "short_init_audio",
+          "options": {
+            "duration_sec": 10,
+            "duration_padding_sec": 0,
+            "audio_input_kind": "init_audio",
+            "init_noise_level": 0.5
+          }
+        },
+        {
+          "text": "Replace only the masked sections with a tight snare fill and bright guitar swell.",
+          "audio": "resources/mel_roformer_test_10s.wav",
+          "seed": 42,
+          "num_inference_steps": 8,
+          "guidance_scale": 1,
+          "id": "normal_padding",
+          "options": {
+            "duration_sec": 10,
+            "duration_padding_sec": 6,
+            "audio_input_kind": "inpaint_audio",
+            "inpaint_mask_start_sec": "2.5,6.5",
+            "inpaint_mask_end_sec": "3.5,8.0"
+          }
+        },
+        {
+          "text": "Replace only the masked sections with a tight snare fill and bright guitar swell.",
+          "audio": "resources/mel_roformer_test_10s.wav",
+          "seed": 42,
+          "num_inference_steps": 8,
+          "guidance_scale": 1,
+          "id": "short_stereo_again",
+          "options": {
+            "duration_sec": 10,
+            "duration_padding_sec": 0,
+            "audio_input_kind": "inpaint_audio",
+            "inpaint_mask_start_sec": "2.5,6.5",
+            "inpaint_mask_end_sec": "3.5,8.0"
           }
         }
       ]
@@ -1880,6 +2724,24 @@
       ]
     },
     {
+      "id": "kokoro_streaming_text_chunks",
+      "coverage": "Kokoro text-chunk streaming and final merged audio",
+      "family": "kokoro_tts",
+      "model": "models/Kokoro-82M-GGUF/kokoro-82m-bf16.gguf",
+      "task": "tts",
+      "mode": "streaming",
+      "outputs": ["audio"],
+      "requests": [
+        {
+          "id": "first",
+          "text": "The station clock strikes nine as the first passengers arrive. A conductor checks the schedule and welcomes everyone aboard.",
+          "voice_id": "af_heart",
+          "text_chunk_size": 60,
+          "seed": 42
+        }
+      ]
+    },
+    {
       "id": "kokoro_near_cap_reuse",
       "coverage": "Kokoro long-short-long request sizes, frontend, predictor, decoder graph reuse",
       "family": "kokoro_tts",
@@ -2023,6 +2885,22 @@
           "max_tokens": 160
         }
       ]
+    },
+    {
+      "id": "moss_tts_nano_streaming",
+      "coverage": "MOSS-TTS-Nano incremental code frames and cached causal codec decoding",
+      "family": "moss_tts_nano",
+      "model": "models/MOSS-TTS-Nano-100M-GGUF/moss-tts-nano-100m-q8_0.gguf",
+      "task": "clon",
+      "mode": "streaming",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "reference_voice",
+        "text": "The studio lights clicked on before the first phrase began, and the cloned voice should stay steady through this medium length request.",
+        "voice_ref": "resources/a.wav",
+        "seed": 1234,
+        "max_tokens": 180
+      }]
     },
     {
       "id": "moss_tts_nano_voice_clone_long",
@@ -2217,6 +3095,23 @@
       ]
     },
     {
+      "id": "vibevoice_two_speaker_streaming",
+      "coverage": "VibeVoice native audio deltas across speaker turns",
+      "family": "vibevoice",
+      "model": "models/VibeVoice-1.5B-GGUF/vibevoice-1.5b-q8_0.gguf",
+      "task": "tts",
+      "mode": "streaming",
+      "outputs": ["audio"],
+      "requests": [{
+        "id": "two_speaker_dialogue",
+        "text": "Speaker 1: The field recorder captured a clean reference take.\nSpeaker 2: The operator confirmed that every timestamp matched the written production notes.",
+        "seed": 1234,
+        "num_inference_steps": 8,
+        "guidance_scale": 1.3,
+        "options": {"voice_samples": "reference/VibeVoiceCommunity/demo/voices/en-Alice_woman.wav,reference/VibeVoiceCommunity/demo/voices/en-Frank_man.wav"}
+      }]
+    },
+    {
       "id": "vibevoice_two_speaker_long",
       "coverage": "VibeVoice 1.5B longer two-speaker TTS path with reference voices",
       "family": "vibevoice",
@@ -2259,6 +3154,74 @@
           "max_tokens": 220,
           "do_sample": false
         }
+      ]
+    },
+    {
+      "id": "crisperwhisper_alignment",
+      "coverage": "Known transcript alignment with insertions, substitutions and repeated requests.",
+      "family": "crisperwhisper",
+      "model": "models/CrisperWhisper2.0-GGUF/crisperwhisper-2-large-bf16.gguf",
+      "task": "align",
+      "outputs": ["text", "words"],
+      "requests": [
+        {
+          "id": "insertions",
+          "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav",
+          "text": "Concord returned swiftly to its old place amidst the tents."
+        },
+        {
+          "id": "substitution",
+          "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav",
+          "text": "Concord went to its place amidst the tents."
+        },
+        {
+          "id": "insertions_repeat",
+          "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav",
+          "text": "Concord returned swiftly to its old place amidst the tents."
+        }
+      ]
+    },
+    {
+      "id": "crisperwhisper_modes_repeat",
+      "coverage": "Verbatim, intended and transcript-conditioned generation, then repeat the first request to check state isolation.",
+      "family": "crisperwhisper",
+      "model": "models/CrisperWhisper2.0-GGUF/crisperwhisper-2-large-bf16.gguf",
+      "task": "asr",
+      "outputs": ["text"],
+      "requests": [
+        {
+          "id": "verbatim_cold",
+          "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav"
+        },
+        {
+          "id": "intended",
+          "audio": "assets/resources/sample_16k.wav",
+          "options": {"transcription_mode": "intended"}
+        },
+        {
+          "id": "verbatimize",
+          "audio": "assets/resources/sample_16k.wav",
+          "text": "Some call me nature, others call me Mother Nature. I've been here for over 4.5 billion years, 22,500 times longer than you.",
+          "options": {"transcription_mode": "verbatimize"}
+        },
+        {
+          "id": "verbatim_repeat",
+          "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav"
+        }
+      ]
+    },
+    {
+      "id": "crisperwhisper_longform_repeat",
+      "coverage": "Long-form continuation with warmed repeats in one session.",
+      "family": "crisperwhisper",
+      "model": "models/CrisperWhisper2.0-GGUF/crisperwhisper-2-large-bf16.gguf",
+      "task": "asr",
+      "outputs": ["text"],
+      "requests": [
+        {"id": "cold", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav"},
+        {"id": "warm1", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav"},
+        {"id": "warm2", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav"},
+        {"id": "warm3", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav"}
       ]
     },
     {
@@ -2342,6 +3305,64 @@
           "id": "sample_en_words",
           "audio": "resources/sample_16k.wav",
           "language": "en"
+        }
+      ]
+    },
+    {
+      "id": "lfm2_audio_en_q8_offline",
+      "coverage": "LFM2.5-Audio EN Q8_0 package directory: whole-input, VAD and fixed chunking",
+      "family": "lfm2_audio",
+      "model": "models/LFM2.5-Audio-1.5B-GGUF",
+      "task": "asr",
+      "mode": "offline",
+      "session_options": {
+        "lfm2_audio.model_gguf": "LFM2.5-Audio-1.5B-Q8_0.gguf"
+      },
+      "outputs": [
+        "text"
+      ],
+      "requests": [
+        {
+          "id": "librispeech_whole",
+          "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav"
+        },
+        {
+          "id": "librispeech_vad",
+          "audio": "assets/asr_validation/librispeech/librispeech_test_other_7902-96591-0000.wav",
+          "options": {
+            "audio_chunk_mode": "vad"
+          }
+        },
+        {
+          "id": "librispeech_fixed_2s",
+          "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0001.wav",
+          "language": "en",
+          "options": {
+            "audio_chunk_mode": "fixed",
+            "audio_chunk_seconds": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "lfm2_audio_en_q8_s2s",
+      "coverage": "LFM2.5-Audio EN Q8_0 spoken chat: a spoken turn in, a reply of interleaved text and 24 kHz speech out",
+      "family": "lfm2_audio",
+      "model": "models/LFM2.5-Audio-1.5B-GGUF",
+      "task": "s2s",
+      "mode": "offline",
+      "session_options": {
+        "lfm2_audio.model_gguf": "LFM2.5-Audio-1.5B-Q8_0.gguf"
+      },
+      "outputs": [
+        "audio",
+        "text"
+      ],
+      "requests": [
+        {
+          "id": "greeting",
+          "audio": "assets/resources/c.wav",
+          "seed": 1234
         }
       ]
     },
@@ -2789,6 +3810,46 @@
       ]
     },
     {
+      "id": "firered_vad_offline",
+      "coverage": "FireRed VAD frontend, offline lookahead, segmentation options and repeated requests",
+      "family": "firered_vad",
+      "model": "models/FireRedVAD-GGUF/firered-vad-f32.gguf",
+      "task": "vad",
+      "mode": "offline",
+      "outputs": ["segments"],
+      "requests": [
+        {"id": "short", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav"},
+        {"id": "different_audio", "audio": "assets/resources/sample_16k.wav"},
+        {"id": "segment_options", "audio": "assets/resources/sample_16k.wav", "options": {"threshold": 0.6, "merge_silence_duration_ms": 150, "speech_pad_ms": 30}},
+        {"id": "timed_chunks", "audio": "assets/resources/sample_16k.wav", "options": {"smooth_window_ms": 35, "min_speech_duration_ms": 105, "max_speech_duration_sec": 0.405, "min_silence_duration_ms": 95, "audio_chunk_duration_sec": 0.645}},
+        {"id": "repeat_short", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav"}
+      ]
+    },
+    {
+      "id": "firered_stream_vad_streaming",
+      "coverage": "FireRed Stream-VAD causal cache, overlapping feature frames and final segments",
+      "family": "firered_vad",
+      "model": "models/FireRedVAD-GGUF/firered-stream-vad-f32.gguf",
+      "task": "vad",
+      "mode": "streaming",
+      "outputs": ["segments"],
+      "requests": [
+        {"id": "first", "audio": "assets/resources/sample_16k.wav"}
+      ]
+    },
+    {
+      "id": "firered_stream_vad_options",
+      "coverage": "FireRed Stream-VAD segmentation options",
+      "family": "firered_vad",
+      "model": "models/FireRedVAD-GGUF/firered-stream-vad-f32.gguf",
+      "task": "vad",
+      "mode": "streaming",
+      "outputs": ["segments"],
+      "requests": [
+        {"id": "segment_options", "audio": "assets/resources/sample_16k.wav", "options": {"smooth_window_ms": 30, "min_speech_duration_ms": 100, "max_speech_duration_sec": 0.4, "min_silence_duration_ms": 100, "speech_start_pad_ms": 30}}
+      ]
+    },
+    {
       "id": "silero_vad_streaming",
       "coverage": "Silero VAD streaming chunk state and final speech segments",
       "family": "silero_vad",
@@ -3089,6 +4150,38 @@
             "template_name": "acoustic_edit",
             "instruction": "adjust the speed to 0.5x"
           }
+        }
+      ]
+    },
+    {
+      "id": "index_echo_s2tt_2b_zh_en",
+      "coverage": "Index-Echo-S2TT 2B Qwen3-Omni audio encoder and Qwen3.5 translation decoder",
+      "family": "index_echo",
+      "model": "models/Index-Echo-S2TT-GGUF/index-echo-s2tt-2b-orig.gguf",
+      "task": "asr",
+      "mode": "offline",
+      "outputs": ["text"],
+      "requests": [
+        {
+          "id": "zh_to_en",
+          "audio": "reference/FireRedAudio/assets/examples/asr_zh_fleurs.wav",
+          "options": {"target_language": "en"}
+        }
+      ]
+    },
+    {
+      "id": "index_echo_s2tt_9b_q8_zh_en",
+      "coverage": "Index-Echo-S2TT 9B Qwen3-Omni audio encoder and Qwen3.5 translation decoder",
+      "family": "index_echo",
+      "model": "models/Index-Echo-S2TT-GGUF/index-echo-s2tt-9b-q8_0.gguf",
+      "task": "asr",
+      "mode": "offline",
+      "outputs": ["text"],
+      "requests": [
+        {
+          "id": "zh_to_en",
+          "audio": "reference/FireRedAudio/assets/examples/asr_zh_fleurs.wav",
+          "options": {"target_language": "en"}
         }
       ]
     },
@@ -3794,6 +4887,62 @@
       ]
     },
     {
+      "id": "audio_flamingo_short",
+      "coverage": "Audio Flamingo Next short transcription, warmed repetition, and changed input length",
+      "family": "audio_flamingo",
+      "model": "models/Audio-Flamingo-GGUF/audio-flamingo-next-bf16.gguf",
+      "task": "asr",
+      "mode": "offline",
+      "outputs": ["text"],
+      "requests": [
+        {"id": "cold", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"instruct": "Transcribe the input speech.", "max_tokens": 128}},
+        {"id": "warm", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"instruct": "Transcribe the input speech.", "max_tokens": 128}},
+        {"id": "different_length", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0001.wav", "options": {"instruct": "Transcribe the input speech.", "max_tokens": 128}},
+        {"id": "short_after_different_length", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"instruct": "Transcribe the input speech.", "max_tokens": 128}}
+      ]
+    },
+    {
+      "id": "audio_flamingo_understanding",
+      "coverage": "Audio Flamingo Next audio questions, long-context summarization, and short input after long input",
+      "family": "audio_flamingo",
+      "model": "models/Audio-Flamingo-GGUF/audio-flamingo-next-bf16.gguf",
+      "task": "asr",
+      "mode": "offline",
+      "outputs": ["text"],
+      "requests": [
+        {"id": "speech_question", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"instruct": "Is there speech or music in this recording?", "max_tokens": 128}},
+        {"id": "long_summary", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav", "options": {"instruct": "Summarize the recording in two sentences.", "max_tokens": 256}},
+        {"id": "long_repeat", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav", "options": {"instruct": "Summarize the recording in two sentences.", "max_tokens": 256}},
+        {"id": "short_after_long", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"instruct": "Transcribe the input speech.", "max_tokens": 128}}
+      ]
+    },
+    {
+      "id": "audio_flamingo_3_short",
+      "coverage": "Audio Flamingo 3 transcription, warmed repetition, and changed input length",
+      "family": "audio_flamingo",
+      "model": "models/Audio-Flamingo-GGUF/audio-flamingo-3-bf16.gguf",
+      "task": "asr",
+      "mode": "offline",
+      "outputs": ["text"],
+      "requests": [
+        {"id": "cold", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"instruct": "Transcribe the input speech.", "max_tokens": 128}},
+        {"id": "warm", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav", "options": {"instruct": "Transcribe the input speech.", "max_tokens": 128}},
+        {"id": "different_length", "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0001.wav", "options": {"instruct": "Describe the audio.", "max_tokens": 128}}
+      ]
+    },
+    {
+      "id": "audio_flamingo_3_long_context",
+      "coverage": "Audio Flamingo 3 five-minute audio context",
+      "family": "audio_flamingo",
+      "model": "models/Audio-Flamingo-GGUF/audio-flamingo-3-bf16.gguf",
+      "task": "asr",
+      "mode": "offline",
+      "outputs": ["text"],
+      "requests": [
+        {"id": "long_summary", "audio": "assets/resources/qwen3_tts_longform_asr_input.wav", "options": {"instruct": "Summarize the recording in two sentences.", "max_tokens": 256}}
+      ]
+    },
+    {
       "id": "breeze_tts_clone_official_paths",
       "coverage": "BreezeTTS 2 official voice clone and voice direction paths using prompt audio, prompt transcript, T5Gemma text conditioning, Qwen acoustic generation, depth codebook decoding, and Mimi decode",
       "family": "breeze_tts",
@@ -3853,6 +5002,51 @@
           },
           "guidance_scale": 4.0,
           "seed": 44
+        }
+      ]
+    },
+    {
+      "id": "kugelaudio_offline_reuse",
+      "coverage": "Preset switching, diffusion graph shape changes, and deterministic state reset",
+      "family": "kugelaudio",
+      "model": "models/KugelAudio-0-Open-GGUF/kugelaudio-0-open-bf16.gguf",
+      "task": "tts",
+      "mode": "offline",
+      "outputs": ["audio"],
+      "requests": [
+        {"id": "default", "text": "The next train leaves in ten minutes.", "seed": 1234},
+        {"id": "clear", "text": "The next train leaves in ten minutes.", "seed": 1234, "options": {"voice_id": "clear"}},
+        {"id": "cfg_disabled", "text": "The next train leaves in ten minutes.", "seed": 1234, "options": {"guidance_scale": 1}},
+        {"id": "four_steps", "text": "The next train leaves in ten minutes.", "seed": 1234, "options": {"num_inference_steps": 4}},
+        {"id": "default_repeat", "text": "The next train leaves in ten minutes.", "seed": 1234}
+      ]
+    },
+    {
+      "id": "kugelaudio_streaming",
+      "coverage": "Incremental codec audio through the CLI streaming route",
+      "family": "kugelaudio",
+      "model": "models/KugelAudio-0-Open-GGUF/kugelaudio-0-open-bf16.gguf",
+      "task": "tts",
+      "mode": "streaming",
+      "outputs": ["audio"],
+      "requests": [
+        {"id": "first", "text": "The next train leaves in ten minutes.", "seed": 1234}
+      ]
+    },
+    {
+      "id": "kugelaudio_longform",
+      "coverage": "Framework text chunking across multiple synthesis calls",
+      "family": "kugelaudio",
+      "model": "models/KugelAudio-0-Open-GGUF/kugelaudio-0-open-bf16.gguf",
+      "task": "tts",
+      "mode": "offline",
+      "outputs": ["audio"],
+      "requests": [
+        {
+          "id": "longform",
+          "text": "The next train leaves in ten minutes. Please check the departure board before you walk to the platform. Keep your ticket ready, and remember to take all your bags with you. The journey follows the river through several small towns. There is a quiet carriage near the front of the train. If you need assistance, speak to a member of staff. We hope you have a comfortable journey and a pleasant afternoon.",
+          "seed": 1234,
+          "options": {"voice_id": "english_female"}
         }
       ]
     }

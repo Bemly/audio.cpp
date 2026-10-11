@@ -67,7 +67,7 @@ Use the medium package for the larger Stable Audio 3 music model. It uses the sa
 audiocpp_cli --task gen --family stable_audio --model models/stable-audio-3-medium --backend cuda --text "wide cinematic ambient music with soft piano and evolving strings" --duration-seconds 30 --out music_medium.wav
 ```
 
-## Parameters
+## Common Options (use directly)
 
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
@@ -77,17 +77,40 @@ audiocpp_cli --task gen --family stable_audio --model models/stable-audio-3-medi
 | `--num-inference-steps` | integer | `8` | RF diffusion steps. |
 | `--guidance-scale` | float | `1.0` | Classifier-free guidance scale. |
 | `--seed` | integer | random if omitted | Generation seed. |
-| `--request-option negative_prompt=<text>` | text | empty string | Negative prompt. |
-| `--request-option sampler=<name>` | `pingpong`, `euler`, `dpmpp-2m`, `dpmpp-3m-sde` | `pingpong` | Diffusion sampler for Stable Audio 3. The foundation/medium path also accepts the DPM++ samplers. |
-| `--request-option apg_scale=<float>` | float | `1.0` | Adaptive projected guidance scale. |
-| `--request-option batch_size=<n>` | integer | `1` | Prompt batch size. |
-| `--request-option duration_padding_seconds=<seconds>` | seconds | `6.0` | Extra generated padding before truncation. |
-| `--request-option truncate_output_to_duration=true\|false` | bool | `true` | Trim decoded audio to requested duration. |
-| `--request-option chunked_decode=true\|false` | bool | `true` | Decode the autoencoder in chunks. |
-| `--request-option audio_input_kind=<kind>` | `init_audio`, `inpaint_audio` | `init_audio` when `--audio` is provided | How the model uses input audio. |
-| `--request-option init_noise_level=<float>` | `0..1` | `1.0` | Strength for audio-conditioned generation. |
-| `--request-option inpaint_mask_start_seconds=<list>` | comma-separated seconds | not set | Inpaint region start times. |
-| `--request-option inpaint_mask_end_seconds=<list>` | comma-separated seconds | not set | Inpaint region end times. |
-| `--session-option stable_audio.mem_saver=true\|false` | bool | `false` | Release staged graph/cache state after conditioner, diffusion, and autoencoder phases to reduce resident VRAM. Later requests may rebuild released graphs. |
+
+## Request Options (use with `--request-option`)
+
+| Option | Values | Default | Meaning |
+|---|---|---:|---|
+| `prompt` | text | not set | Fallback text prompt when text_input is absent; pipe separates batch prompts. |
+| `negative_prompt` | text | not set | Negative prompt. |
+| `duration_sec` | seconds or comma-separated seconds | `120` | Target duration per batch prompt; encode multiple durations as a comma-separated string, not a JSON array. |
+| `batch_size` | integer | `1` | Prompt batch size. |
+| `num_inference_steps` | integer >= 1 | `8` | Diffusion steps. |
+| `guidance_scale` | float | `1` | Classifier-free guidance scale. |
+| `apg_scale` | float | `1` | Adaptive projected guidance scale. |
+| `sampler` | `pingpong`, `euler`, `dpmpp-2m`, `dpmpp-3m-sde` | not set | Diffusion sampler for Stable Audio 3. The foundation/medium path also accepts the DPM++ samplers. |
+| `seed` | integer >= 0 | random | Sampling seed; omitted chooses a random seed. |
+| `duration_padding_sec` | seconds | `6` | Extra generated padding before truncation. |
+| `truncate_output_to_duration` | bool | `true` | Trim decoded audio to requested duration. |
+| `chunked_decode` | bool | `true` | Decode the autoencoder in chunks. |
+| `init_noise_level` | `0..1` | `1` | Strength for audio-conditioned generation. |
+| `audio_input_kind` | `init_audio`, `inpaint_audio` | `init_audio` | How the model uses input audio. |
+| `inpaint_mask_start_sec` | comma-separated seconds | not set | Inpaint region start times. |
+| `inpaint_mask_end_sec` | comma-separated seconds | not set | Inpaint region end times. |
+| `sigma_min` | float | not set | Foundation sampler minimum noise level. |
+| `sigma_max` | float | not set | Foundation sampler maximum noise level. |
+| `rho` | float | not set | Foundation sampler noise schedule exponent. |
+
+The corresponding legacy `*_seconds` request names remain accepted. Use only
+one name for each control in a request.
+
+## Session Options (use with `--session-option`)
+
+| Option | Values | Default | Meaning |
+|---|---|---:|---|
+| `stable_audio.max_batch` | integer >= 1 | `1` | Maximum prompt batch size. |
+| `stable_audio.weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | not set | Weight storage type; defaults to native. |
+| `stable_audio.mem_saver` | bool | `false` | Release staged graph/cache state after conditioner, diffusion, and autoencoder phases to reduce resident VRAM. Later requests may rebuild released graphs. |
 
 For backend weight-type controls, use `audiocpp_cli --inspect --model <model-dir> --family stable_audio`.

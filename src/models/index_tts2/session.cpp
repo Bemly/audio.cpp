@@ -283,7 +283,7 @@ IndexTTS2Session::IndexTTS2Session(
         weight_context_bytes_,
         matmul_weight_storage_type_,
         conv_weight_storage_type_);
-    style_encoder_ = std::make_unique<IndexTTS2StyleEncoder>(
+    style_encoder_ = std::make_unique<IndexTTS2CampplusStyleEncoder>(
         assets_,
         options.backend,
         conv_weight_storage_type_);
@@ -305,13 +305,6 @@ IndexTTS2Session::IndexTTS2Session(
         assets_,
         options.backend,
         conv_weight_storage_type_);
-    qwen_emotion_ = std::make_unique<IndexTTS2QwenEmotionRuntime>(
-        assets_,
-        execution_context(),
-        emotion_text_prefill_graph_arena_bytes_,
-        emotion_text_decode_graph_arena_bytes_,
-        weight_context_bytes_,
-        matmul_weight_storage_type_);
     int64_t matrix_rows = 0;
     for (const int64_t count : assets_->config.emo_num) {
         matrix_rows += count;
@@ -582,6 +575,11 @@ std::vector<float> IndexTTS2Session::resolve_emotion_vector(
             const bool will_evict =
                 emotion_text_weights_cache_.capacity() > 0 &&
                 emotion_text_weights_cache_.size() >= emotion_text_weights_cache_.capacity();
+            if (!qwen_emotion_) {
+                qwen_emotion_ = std::make_unique<IndexTTS2Qwen3EmotionRuntime>(
+                    assets_, execution_context(), emotion_text_prefill_graph_arena_bytes_,
+                    emotion_text_decode_graph_arena_bytes_, weight_context_bytes_, matmul_weight_storage_type_);
+            }
             explicit_weights = qwen_emotion_->infer(emotion_text, emotion_text_max_tokens_).values;
             if (mem_saver_) {
                 qwen_emotion_->release_graphs();

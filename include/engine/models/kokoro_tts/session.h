@@ -2,13 +2,18 @@
 
 #include "engine/framework/model_spec/metadata.h"
 #include "engine/framework/runtime/session_base.h"
+#include "engine/framework/runtime/streaming_tts_session.h"
 #include "engine/models/kokoro_tts/assets.h"
 
-#include <memory>
 #include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace kokoro_ggml {
-class KokoroDecoderRuntime;
+class KokoroIstftNetDecoderRuntime;
 class KokoroPredictorRuntime;
 }
 
@@ -16,10 +21,34 @@ namespace engine::models::kokoro_tts {
 
 std::shared_ptr<runtime::IVoiceModelLoader> make_kokoro_tts_loader();
 
+/// One timing per PHONEME GROUP -- a run of tokens between the space tokens Kokoro's vocabulary
+/// carries -- from the durations its duration predictor produced, appended to `out`.
+///
+/// A group is NOT a written word: on the text path eSpeak-ng merges function words, so
+/// `on the` arrives as one group. See the note on the definition in session.cpp.
+///
+/// Declared here rather than kept in session.cpp's anonymous namespace so it can be tested
+/// directly: it is a pure function of its arguments, and the pad/space boundaries, the
+/// punctuation-only groups and the frames->samples scale are all worth pinning down without
+/// standing up a session. It takes the vocabulary rather than the whole KokoroAssets for the same
+/// reason -- that is all it needs.
+///
+/// `chunk_start_sample` offsets the spans into a buffer several chunks are being merged into.
+/// Reports nothing at all rather than throwing if the token and duration counts disagree: the
+/// audio is the product and an empty word list is a state every caller already handles.
+void append_kokoro_word_timings(
+    std::vector<runtime::WordTimestamp> & out,
+    const std::vector<int32_t> & input_ids,
+    const std::vector<int32_t> & durations,
+    const std::unordered_map<std::string, int32_t> & vocab,
+    size_t chunk_samples,
+    int64_t chunk_start_sample);
+
 struct KokoroSynthesisInput;
 class KokoroTTSSession final
     : public runtime::RuntimeSessionBase
-    , public runtime::IOfflineVoiceTaskSession {
+    , public runtime::IOfflineVoiceTaskSession
+    , public runtime::StreamingTtsSessionBase {
 public:
     KokoroTTSSession(
         runtime::TaskSpec task,
@@ -35,6 +64,10 @@ public:
     runtime::TaskResult run(const runtime::TaskRequest & request) override;
 
 private:
+    runtime::TaskResult synthesize(const runtime::TaskRequest & request, bool streaming);
+    runtime::TaskResult generate_stream(const runtime::TaskRequest & request) override;
+    void reset_stream_state() override {}
+
     struct DecoderCapacityContract {
         int64_t decoder_frame_capacity = 0;
         int64_t conditioning_sample_capacity = 0;
@@ -64,7 +97,7 @@ private:
     std::string cached_request_key_;
     std::unique_ptr<KokoroSynthesisInput> cached_input_;
     int64_t prepared_decoder_capacity_ = 0;
-    std::unique_ptr<kokoro_ggml::KokoroDecoderRuntime> prepared_decoder_;
+    std::unique_ptr<kokoro_ggml::KokoroIstftNetDecoderRuntime> prepared_decoder_;
     DecoderCapacityContract prepared_decoder_context_ = {};
     int64_t prepared_session_capacity_ = 0;
     std::unique_ptr<kokoro_ggml::KokoroPredictorRuntime> prepared_predictor_;

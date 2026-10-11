@@ -11,16 +11,18 @@
 
 namespace engine::community_models::mira_tts {
 
-class MiraSpeakerEncoder final {
+std::vector<float> compute_mira_reference_mel(const runtime::AudioBuffer & audio, size_t threads);
+
+class MiraEcapaPerceiverEncoder final {
 public:
-    MiraSpeakerEncoder(
+    MiraEcapaPerceiverEncoder(
         const MiraTTSAssets & assets,
         core::ExecutionContext & execution,
         size_t weight_context_bytes,
         size_t graph_context_bytes,
         assets::TensorStorageType linear_storage_type,
         assets::TensorStorageType conv_storage_type);
-    ~MiraSpeakerEncoder();
+    ~MiraEcapaPerceiverEncoder();
 
     // Returns the 32 discrete context codes consumed by Mira's prompt and
     // acoustic processor.

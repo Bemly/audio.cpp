@@ -1,4 +1,5 @@
 #include "engine/community_models/parakeet_tdt/session.h"
+#include "engine/community_models/parakeet_tdt/phonon_streaming.h"
 
 #include "engine/framework/audio/chunking.h"
 #include "engine/framework/core/backend.h"
@@ -263,13 +264,13 @@ ParakeetTDTSessionBase::ParakeetTDTSessionBase(
         matmul_weight_storage_type_,
         conv_weight_storage_type_,
         weight_context_bytes_);
-    encoder_ = std::make_unique<ParakeetEncoderRuntime>(
+    encoder_ = std::make_unique<ParakeetFastConformerEncoderRuntime>(
         assets_,
         weights_,
         execution_context(),
         encoder_graph_arena_bytes_,
         encoder_flash_attention_);
-    decoder_ = std::make_unique<ParakeetDecoderRuntime>(
+    decoder_ = std::make_unique<ParakeetTDTDecoderRuntime>(
         assets_,
         weights_,
         execution_context(),
@@ -290,6 +291,31 @@ ParakeetDecodeOptions ParakeetTDTSessionBase::decode_options_for_request(const r
     }
     if (const auto value = runtime::find_option(request.options, {"keep_language_tags"})) {
         opts.keep_language_tags = runtime::parse_bool_option(*value, "keep_language_tags");
+    }
+    const bool phonon = assets_->config.variant == "phonon2";
+    std::optional<std::string> hotwords;
+    if (const auto it = request.options.find("hotwords"); it != request.options.end())
+        hotwords = it->second;
+    const auto array = request.option_arrays.find("hotwords");
+    if (!hotwords && array == request.option_arrays.end() && phonon && request.text_input)
+        hotwords = request.text_input->text;
+    const auto strength = runtime::parse_float_option(request.options, {"hotwords_score"}).value_or(2.f);
+    if (!std::isfinite(strength) || strength < 0 || strength > 100)
+        throw std::runtime_error("Phonon hotwords_score must be between 0 and 100");
+    if (hotwords || array != request.option_arrays.end()) {
+        if (!phonon) throw std::runtime_error("hotwords currently require a Phonon-2 package");
+        std::vector<PhononHotword> terms;
+        if (hotwords) terms = parse_phonon_hotwords(*hotwords);
+        else {
+            engine::io::json::Value::Array entries;
+            for (const auto & word : array->second) entries.push_back(engine::io::json::Value::make_string(word));
+            terms = parse_phonon_hotwords(engine::io::json::stringify(engine::io::json::Value::make_array(std::move(entries))));
+        }
+        if (!terms.empty() && strength > 0) {
+            auto policy = std::make_shared<PhononHotwordAutomaton>(terms, assets_->tokenizer->id_to_token(),
+                static_cast<int32_t>(assets_->config.blank_token_id), strength);
+            if (!policy->empty()) opts.hotwords = std::move(policy);
+        }
     }
     return opts;
 }
@@ -451,7 +477,7 @@ runtime::TaskResult ParakeetTDTOfflineSession::run(const runtime::TaskRequest & 
         throw std::runtime_error("Parakeet TDT run() received an invalid audio layout");
     }
     const auto wall_start = Clock::now();
-    const auto decode_options = decode_options_for_request(normalized_request);
+    auto decode_options = decode_options_for_request(normalized_request);
     const int64_t source_frames =
         static_cast<int64_t>(normalized_request.audio_input->samples.size()) /
         std::max(normalized_request.audio_input->channels, 1);
@@ -459,6 +485,7 @@ runtime::TaskResult ParakeetTDTOfflineSession::run(const runtime::TaskRequest & 
         static_cast<double>(source_frames) *
         static_cast<double>(assets_->config.frontend.sample_rate) /
         static_cast<double>(normalized_request.audio_input->sample_rate)));
+    decode_options.audio_end_sample = target_samples;
     const auto chunk_mode = engine::audio::parse_audio_chunk_mode(normalized_request.options);
     if (chunk_mode == engine::audio::AudioChunkMode::QuietEnergy) {
         throw std::runtime_error("Parakeet TDT supports audio_chunk_mode=auto, fixed, vad, or none");
@@ -642,6 +669,9 @@ runtime::TaskResult ParakeetTDTOfflineSession::run_vad_chunks(
             continue;
         }
         auto item_decode_options = decode_options;
+        item_decode_options.audio_end_sample = static_cast<int64_t>(std::ceil(
+            static_cast<double>(window.samples.size() / std::max(window.channels, 1)) *
+            assets_->config.frontend.sample_rate / window.sample_rate));
         if (item_decode_options.max_tokens > 0) {
             item_decode_options.max_tokens = std::max<int64_t>(
                 0,
@@ -1003,6 +1033,10 @@ std::shared_ptr<runtime::IVoiceModelLoader> make_parakeet_tdt_loader() {
                                 std::shared_ptr<const ParakeetTDTAssets> assets,
                                 std::shared_ptr<const engine::model_spec::ModelContract> contract) {
         if (task.mode == runtime::RunMode::Streaming) {
+            if (assets->config.variant == "phonon2") {
+                return std::unique_ptr<runtime::IVoiceTaskSession>(std::make_unique<PhononStreamingSession>(
+                    task, options, std::move(assets), std::move(contract)));
+            }
             return std::unique_ptr<runtime::IVoiceTaskSession>(
                 std::make_unique<ParakeetTDTStreamingSession>(
                     task,

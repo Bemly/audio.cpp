@@ -2,6 +2,7 @@
 
 #include "engine/framework/core/backend.h"
 #include "engine/framework/debug/trace.h"
+#include "engine/framework/io/json.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +35,9 @@ enum class VoiceTaskKind {
     SpeakerRecognition,
     Svc,
     Midi,
+    TurnDetection,
+    WakeWord,
+    AudioClassification,
 };
 
 enum class RunMode {
@@ -135,6 +139,8 @@ enum class ArtifactKind {
     TranscriptAlignment,
     DiarizationState,
     VadState,
+    // Keep last: the request reader in app/cli/request.cpp checks at build
+    // time that it names every kind up to this one.
     Custom,
 };
 
@@ -198,6 +204,11 @@ struct VoiceActivityEvent {
     std::optional<SpeechSegment> segment = std::nullopt;
 };
 
+struct CustomSchemaOutput {
+    std::string schema;
+    io::json::Value data;
+};
+
 struct TaskResult {
     std::optional<AudioBuffer> audio_output = std::nullopt;
     std::vector<NamedAudioBuffer> named_audio_outputs;
@@ -205,6 +216,7 @@ struct TaskResult {
     std::vector<SpeechSegment> speech_segments;
     std::vector<SpeakerTurn> speaker_turns;
     std::vector<WordTimestamp> word_timestamps;
+    std::optional<CustomSchemaOutput> custom_schema_output = std::nullopt;
     std::optional<VoiceArtifact> artifact_output = std::nullopt;
     std::vector<VoiceArtifact> output_artifacts;
 };
@@ -218,6 +230,9 @@ struct StreamEvent {
     std::vector<WordTimestamp> word_timestamps;
     std::vector<VoiceArtifact> output_artifacts;
     bool is_final = false;
+    // Revisable whole-transcript hypothesis; clients replace their provisional
+    // display. partial_text remains append-only committed text. Opt-in only.
+    std::optional<Transcript> partial_text_snapshot = std::nullopt;
 };
 
 enum class StreamingInputKind {
@@ -254,6 +269,24 @@ public:
     ~IOfflineVoiceTaskSession() override = default;
 
     virtual TaskResult run(const TaskRequest & request) = 0;
+};
+
+class IBatchedOfflineVoiceTaskSession : public virtual IVoiceTaskSession {
+public:
+    using ResultCallback = std::function<void(size_t, TaskResult)>;
+
+    ~IBatchedOfflineVoiceTaskSession() override = default;
+
+    virtual std::vector<TaskResult> run_batch(const std::vector<TaskRequest> & requests) = 0;
+
+    virtual void run_batch(
+        const std::vector<TaskRequest> & requests,
+        const ResultCallback & on_result) {
+        auto results = run_batch(requests);
+        for (size_t index = 0; index < results.size(); ++index) {
+            on_result(index, std::move(results[index]));
+        }
+    }
 };
 
 class IStreamingVoiceTaskSession : public virtual IVoiceTaskSession {

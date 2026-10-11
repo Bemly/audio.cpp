@@ -3,6 +3,7 @@
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/model_spec/metadata.h"
 #include "engine/framework/model_spec/package.h"
+#include "engine/framework/runtime/errors.h"
 #include "engine/framework/runtime/options.h"
 #include "engine/framework/text/chinese_variant.h"
 #include "engine/framework/text/chunking.h"
@@ -383,6 +384,11 @@ VoxCPM1SessionBase::run_streaming_request(
         "VoxCPM1 run_streaming requires a streaming session");
   }
   validate_request(request);
+  // Declared before release_guard on purpose: the decoder's streaming graph is
+  // built against this state's tensors, and release_guard drops that graph via
+  // decoder_->release_runtime_memory(). Reverse destruction order then frees
+  // the graph before the state it points into, on return and on exceptions.
+  AudioVAEStreamingDecodeState streaming_state;
   auto release_runtime_memory = [this](VoxCPM1SessionBase *self) {
     if (self != nullptr) {
       self->release_request_runtime_memory();
@@ -426,7 +432,6 @@ VoxCPM1SessionBase::run_streaming_request(
   // Carry AudioVAE decoder convolution state across streamed patches so the
   // boundary between consecutive chunks stays continuous instead of resetting.
   bool use_streaming_decode = decoder_->supports_streaming_decode();
-  AudioVAEStreamingDecodeState streaming_state;
   if (use_streaming_decode) {
     use_streaming_decode =
         decoder_->initialize_streaming_decode_state(streaming_state);
@@ -717,7 +722,7 @@ void VoxCPM1SessionBase::validate_request(
     }
   }
   if (!request.input_artifacts.empty()) {
-    throw std::runtime_error(
+    throw runtime::InvalidRequestError(
         "VoxCPM1 C++ session does not consume input artifacts");
   }
 }

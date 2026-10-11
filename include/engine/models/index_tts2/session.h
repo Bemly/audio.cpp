@@ -88,8 +88,8 @@ private:
 
     runtime::TaskSpec task_;
     std::shared_ptr<const IndexTTS2Assets> assets_;
-    size_t gpt_graph_arena_bytes_ = 2048ull * 1024ull * 1024ull;
-    size_t s2mel_graph_arena_bytes_ = 2048ull * 1024ull * 1024ull;
+    size_t gpt_graph_arena_bytes_ = 32ull * 1024ull * 1024ull;
+    size_t s2mel_graph_arena_bytes_ = 32ull * 1024ull * 1024ull;
     size_t reference_graph_arena_bytes_ = 512ull * 1024ull * 1024ull;
     size_t emotion_text_prefill_graph_arena_bytes_ = 2048ull * 1024ull * 1024ull;
     size_t emotion_text_decode_graph_arena_bytes_ = 512ull * 1024ull * 1024ull;
@@ -102,11 +102,11 @@ private:
     IndexTTS2TextTokenizer tokenizer_;
     std::unique_ptr<IndexTTS2Wav2Vec2BertRuntime> semantic_encoder_;
     std::unique_ptr<IndexTTS2SemanticCodecRuntime> semantic_codec_;
-    std::unique_ptr<IndexTTS2StyleEncoder> style_encoder_;
+    std::unique_ptr<IndexTTS2CampplusStyleEncoder> style_encoder_;
     std::unique_ptr<IndexTTS2GptRuntime> gpt_;
     std::unique_ptr<IndexTTS2S2MelRuntime> s2mel_;
     std::unique_ptr<IndexTTS2BigVganVocoder> vocoder_;
-    std::unique_ptr<IndexTTS2QwenEmotionRuntime> qwen_emotion_;
+    std::unique_ptr<IndexTTS2Qwen3EmotionRuntime> qwen_emotion_;
 
     std::vector<float> speaker_matrix_;
     std::vector<float> emotion_matrix_;

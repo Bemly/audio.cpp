@@ -5,7 +5,7 @@
 #include "engine/framework/core/backend_weight_store.h"
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/core/module.h"
-#include "engine/framework/modules/attention/feed_forward.h"
+#include "engine/framework/modules/feed_forward_modules.h"
 #include "engine/framework/modules/attention/types.h"
 #include "engine/framework/modules/conv_modules.h"
 #include "engine/framework/modules/linear_module.h"
@@ -561,6 +561,7 @@ core::TensorValue build_logmel_frontend(
         modules::MulModule().build(ctx, real, real),
         modules::MulModule().build(ctx, imag, imag));
     auto power_btf = modules::TransposeModule({{0, 2, 1, 3}, power.shape.rank}).build(ctx, power);
+    power_btf = core::ensure_backend_addressable_layout(ctx, power_btf);
     auto mel_weights = modules::RepeatModule({
         core::TensorShape::from_dims({waveform.shape.dims[0], freq_bins, config.mel_bins})})
                            .build(ctx, weights.mel_projection);

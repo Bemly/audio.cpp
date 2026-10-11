@@ -10,7 +10,7 @@
 #include "engine/framework/modules/positional_modules.h"
 #include "engine/framework/modules/primitive_modules.h"
 #include "engine/framework/modules/structural_modules.h"
-#include "engine/framework/modules/transformers/qwen_decoder.h"
+#include "engine/framework/modules/transformers/decoder.h"
 #include "engine/framework/modules/weight_binding.h"
 
 #include <algorithm>
@@ -37,25 +37,25 @@ struct GgmlContextDeleter {
     }
 };
 
-struct Yue2NarWeights {
+struct Yue2NARWeights {
     std::shared_ptr<core::BackendWeightStore> store;
     engine::modules::LinearWeights vae2llm;
     engine::modules::LinearWeights time0;
     engine::modules::LinearWeights time2;
     core::TensorValue latent_pos_embed;
-    engine::modules::QwenDecoderStackWeights nar_stack;
+    engine::modules::DecoderStackWeights nar_stack;
     engine::modules::NormWeights final_norm;
     engine::modules::LinearWeights llm2vae;
 };
 
-engine::modules::QwenDecoderLayerWeights load_nar_layer(
+engine::modules::DecoderLayerWeights load_nar_layer(
     core::BackendWeightStore & store,
     const assets::TensorSource & source,
     const Yue2ModelConfig & config,
     assets::TensorStorageType storage_type,
     int64_t layer) {
     const std::string prefix = "model.layers." + std::to_string(layer);
-    engine::modules::QwenDecoderLayerWeights out;
+    engine::modules::DecoderLayerWeights out;
     out.input_norm = binding::norm_weight_from_source(store, source, prefix + ".nar_input_layernorm", config.hidden_size);
     out.self_attention.q_weight = store.load_tensor(
         source,
@@ -107,12 +107,12 @@ engine::modules::QwenDecoderLayerWeights load_nar_layer(
     return out;
 }
 
-std::shared_ptr<const Yue2NarWeights> load_nar_weights(
+std::shared_ptr<const Yue2NARWeights> load_nar_weights(
     const Yue2Assets & assets,
     core::ExecutionContext & execution,
     size_t weight_context_bytes,
     assets::TensorStorageType storage_type) {
-    auto weights = std::make_shared<Yue2NarWeights>();
+    auto weights = std::make_shared<Yue2NARWeights>();
     weights->store = std::make_shared<core::BackendWeightStore>(
         execution.backend(),
         execution.backend_type(),
@@ -224,7 +224,7 @@ core::TensorValue reshape_heads(
 QKVParts build_qkv_part(
     core::ModuleBuildContext & ctx,
     const core::TensorValue & input,
-    const engine::modules::QwenDecoderLayerWeights & weights,
+    const engine::modules::DecoderLayerWeights & weights,
     const Yue2ModelConfig & config) {
     auto q = engine::modules::LinearModule({config.hidden_size, config.attention_heads * config.head_dim, false})
                  .build(ctx, input, {weights.self_attention.q_weight, std::nullopt});
@@ -261,6 +261,26 @@ core::TensorValue repeat_kv_heads(core::ModuleBuildContext & ctx, const core::Te
         core::TensorShape::from_dims({batch, kv_heads * repeats, steps, dim}));
 }
 
+// The eager lowering below holds the whole score matrix (query steps x kv steps
+// x heads x 4 bytes) in one graph tensor, so its peak allocation grows with the
+// square of the song length while a single NAR chunk reaches ~12k frames. Both
+// Intel and RADV cap a single buffer at 4 GiB, and a single storage binding
+// cannot address more than that either, so the query rows are split into tiles
+// keeping one tile's scores below this budget. Softmax is per query row, so the
+// split is exact.
+constexpr int64_t kAttentionScoreTileBytes = 3LL * 1024LL * 1024LL * 1024LL;
+
+int64_t attention_score_bytes_per_row(int64_t kv_steps, int64_t heads, int64_t batch) {
+    return kv_steps * heads * batch * static_cast<int64_t>(ggml_type_size(GGML_TYPE_F32));
+}
+
+int64_t attention_tile_count(int64_t steps, int64_t score_bytes_per_row, int64_t forced_tile_rows) {
+    const int64_t tile_rows = forced_tile_rows > 0
+        ? forced_tile_rows
+        : std::max<int64_t>(1, kAttentionScoreTileBytes / std::max<int64_t>(1, score_bytes_per_row));
+    return std::max<int64_t>(1, (steps + tile_rows - 1) / tile_rows);
+}
+
 core::TensorValue mixed_attention(
     core::ModuleBuildContext & ctx,
     const core::TensorValue & q,
@@ -269,7 +289,8 @@ core::TensorValue mixed_attention(
     const core::TensorValue * attention_mask,
     const Yue2ModelConfig & config,
     core::BackendType backend_type,
-    bool allow_flash_attention) {
+    bool allow_flash_attention,
+    int64_t attention_tile_rows) {
     auto q_heads = engine::modules::TransposeModule({{0, 2, 1, 3}, q.shape.rank}).build(ctx, q);
     q_heads = core::wrap_tensor(ggml_cont(ctx.ggml, q_heads.tensor), q_heads.shape, q_heads.type);
     auto k_heads = engine::modules::TransposeModule({{0, 2, 1, 3}, k.shape.rank}).build(ctx, k);
@@ -298,20 +319,62 @@ core::TensorValue mixed_attention(
         // has no REPEAT kernel for F16 and the copies would dominate anyway).
         // Layouts (ggml ne order): q {dim, steps, heads, batch},
         // k {dim, kv_steps, kv_heads, batch}, v^T {kv_steps, dim, kv_heads, batch}.
-        auto * scores = ggml_mul_mat(ctx.ggml, k_heads.tensor, q_heads.tensor);
-        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-        auto * attn = ggml_soft_max_ext(
-            ctx.ggml,
-            scores,
-            attention_mask != nullptr ? attention_mask->tensor : nullptr,
-            1.0F / std::sqrt(static_cast<float>(config.head_dim)),
-            0.0F);
         // v is {dim, kv_heads, kv_steps, batch}; mul_mat wants kv_steps innermost.
         auto * v_t = ggml_cont(ctx.ggml, ggml_permute(ctx.ggml, v.tensor, 1, 2, 0, 3));
-        auto * context = ggml_mul_mat(ctx.ggml, v_t, attn);
-        ggml_mul_mat_set_prec(context, GGML_PREC_F32);
+        const int64_t steps = q_heads.tensor->ne[1];
+        const int64_t tiles = attention_tile_count(
+            steps,
+            attention_score_bytes_per_row(k_heads.tensor->ne[1], q_heads.tensor->ne[2], q_heads.tensor->ne[3]),
+            attention_tile_rows);
+        // Spread the rows evenly instead of leaving a small remainder tile: the
+        // matmul kernels lose throughput on a short tile.
+        const int64_t rows_per_tile = steps / tiles;
+        const int64_t wide_tiles = steps % tiles;
+        ggml_tensor * joined = nullptr;
+        int64_t first_row = 0;
+        for (int64_t tile = 0; tile < tiles; ++tile) {
+            const int64_t rows = rows_per_tile + (tile < wide_tiles ? 1 : 0);
+            auto * q_tile = q_heads.tensor;
+            auto * mask_tile = attention_mask != nullptr ? attention_mask->tensor : nullptr;
+            if (tiles > 1) {
+                // A row slice keeps the head stride of the full tensor. Backends
+                // derive the batch stride of a row-contiguous mul_mat operand
+                // from ne0*ne1 instead of nb2, so the slice is made contiguous
+                // rather than handed over as a view.
+                q_tile = ggml_cont(
+                    ctx.ggml,
+                    ggml_view_4d(
+                        ctx.ggml,
+                        q_heads.tensor,
+                        q_heads.tensor->ne[0],
+                        rows,
+                        q_heads.tensor->ne[2],
+                        q_heads.tensor->ne[3],
+                        q_heads.tensor->nb[1],
+                        q_heads.tensor->nb[2],
+                        q_heads.tensor->nb[3],
+                        static_cast<size_t>(first_row) * q_heads.tensor->nb[1]));
+                if (mask_tile != nullptr) {
+                    throw std::runtime_error("Yue2 NAR tiled attention does not support an attention mask");
+                }
+            }
+            auto * scores = ggml_mul_mat(ctx.ggml, k_heads.tensor, q_tile);
+            ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+            auto * attn = ggml_soft_max_ext(
+                ctx.ggml,
+                scores,
+                mask_tile,
+                1.0F / std::sqrt(static_cast<float>(config.head_dim)),
+                0.0F);
+            auto * context = ggml_mul_mat(ctx.ggml, v_t, attn);
+            ggml_mul_mat_set_prec(context, GGML_PREC_F32);
+            // Joining tile by tile keeps the tiles sequential in the graph, so
+            // the allocator reuses one tile's score memory for the next.
+            joined = joined == nullptr ? context : ggml_concat(ctx.ggml, joined, context, 1);
+            first_row += rows;
+        }
         return core::wrap_tensor(
-            ggml_permute(ctx.ggml, context, 0, 2, 1, 3),
+            ggml_permute(ctx.ggml, joined, 0, 2, 1, 3),
             core::TensorShape::from_dims({q_heads.shape.dims[0], q_heads.shape.dims[2], q_heads.shape.dims[1], config.head_dim}),
             GGML_TYPE_F32);
     }
@@ -340,7 +403,7 @@ core::TensorValue mixed_attention(
 core::TensorValue build_mlp_part(
     core::ModuleBuildContext & ctx,
     const core::TensorValue & input,
-    const engine::modules::QwenMLPWeights & weights,
+    const engine::modules::DecoderMLPWeights & weights,
     const Yue2ModelConfig & config) {
     auto gate = engine::modules::LinearModule({config.hidden_size, config.intermediate_size, false})
                     .build(ctx, input, {weights.gate_proj.weight, std::nullopt});
@@ -356,12 +419,13 @@ core::TensorValue build_cached_nar_layer(
     core::ModuleBuildContext & ctx,
     const core::TensorValue & input,
     const core::TensorValue & positions,
-    const engine::modules::QwenDecoderLayerWeights & nar_weights,
+    const engine::modules::DecoderLayerWeights & nar_weights,
     const core::TensorValue & ar_key,
     const core::TensorValue & ar_value,
     const Yue2ModelConfig & config,
     core::BackendType backend_type,
-    bool allow_flash_attention) {
+    bool allow_flash_attention,
+    int64_t attention_tile_rows) {
     auto norm = engine::modules::RMSNormModule({config.hidden_size, config.rms_norm_eps, true, false})
                     .build(ctx, input, nar_weights.input_norm);
     auto qkv = build_qkv_part(ctx, norm, nar_weights, config);
@@ -375,7 +439,8 @@ core::TensorValue build_cached_nar_layer(
     qkv.v = core::wrap_tensor(ggml_cast(ctx.ggml, qkv.v.tensor, GGML_TYPE_F16), qkv.v.shape, GGML_TYPE_F16);
     auto k = engine::modules::ConcatModule({1}).build(ctx, ar_key, qkv.k);
     auto v = engine::modules::ConcatModule({1}).build(ctx, ar_value, qkv.v);
-    auto context = mixed_attention(ctx, qkv.q, k, v, nullptr, config, backend_type, allow_flash_attention);
+    auto context =
+        mixed_attention(ctx, qkv.q, k, v, nullptr, config, backend_type, allow_flash_attention, attention_tile_rows);
     context = core::ensure_backend_addressable_layout(ctx, context);
     context = core::reshape_tensor(
         ctx,
@@ -391,18 +456,20 @@ core::TensorValue build_cached_nar_layer(
 
 }  // namespace
 
-struct Yue2NarRuntime::Impl {
+struct Yue2NARRuntime::Impl {
     Impl(
         core::ExecutionContext & execution,
         std::shared_ptr<const Yue2Assets> assets,
         assets::TensorStorageType weight_type,
         size_t weight_context_bytes,
         size_t graph_arena_bytes,
-        bool allow_flash_attention)
+        bool allow_flash_attention,
+        int64_t attention_tile_rows)
         : execution(execution),
           assets(std::move(assets)),
           graph_arena_bytes(graph_arena_bytes),
-          allow_flash_attention(allow_flash_attention) {
+          allow_flash_attention(allow_flash_attention),
+          attention_tile_rows(attention_tile_rows) {
         if (!this->assets) {
             throw std::runtime_error("Yue2 NAR runtime requires assets");
         }
@@ -413,7 +480,7 @@ struct Yue2NarRuntime::Impl {
         Graph(
             Impl & owner,
             int64_t frames,
-            const Yue2ArDevicePrefixState & ar_state)
+            const Yue2ARDevicePrefixState & ar_state)
             : owner(&owner),
               frames(frames),
               ar_length(ar_state.current_end) {
@@ -492,7 +559,8 @@ struct Yue2NarRuntime::Impl {
                     ar_values[static_cast<size_t>(layer)],
                     config,
                     owner.execution.backend_type(),
-                    owner.allow_flash_attention);
+                    owner.allow_flash_attention,
+                    owner.attention_tile_rows);
             }
             hidden = engine::modules::RMSNormModule({config.hidden_size, config.rms_norm_eps, true, false})
                          .build(build, hidden, owner.weights->final_norm);
@@ -504,6 +572,7 @@ struct Yue2NarRuntime::Impl {
             graph = ggml_new_graph_custom(ctx.get(), 262144, false);
             ggml_build_forward_expand(graph, output.tensor);
             engine::debug::timing_log_scalar("yue2.nar.graph.build_ms", engine::debug::elapsed_ms(build_start));
+            engine::debug::timing_log_context_reservation("yue2.nar.graph", ctx.get());
             const auto alloc_start = Clock::now();
             input_buffer = ggml_backend_alloc_ctx_tensors(input_ctx.get(), owner.execution.backend());
             gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(owner.execution.backend()));
@@ -519,6 +588,16 @@ struct Yue2NarRuntime::Impl {
             }
             ggml_backend_tensor_set(positions.tensor, pos_values.data(), 0, pos_values.size() * sizeof(int32_t));
             engine::debug::timing_log_scalar("yue2.nar.graph.frames", frames);
+            engine::debug::timing_log_scalar(
+                "yue2.nar.graph.buffer_bytes", ggml_gallocr_get_buffer_size(gallocr, 0));
+            if (!owner.allow_flash_attention && owner.execution.backend_type() != core::BackendType::Cpu) {
+                engine::debug::timing_log_scalar(
+                    "yue2.nar.graph.attention_tiles",
+                    attention_tile_count(
+                        nar_length,
+                        attention_score_bytes_per_row(total_length, config.attention_heads, 1),
+                        owner.attention_tile_rows));
+            }
         }
 
         ~Graph() {
@@ -575,7 +654,7 @@ struct Yue2NarRuntime::Impl {
 
     std::vector<float> velocity(
         Graph & graph,
-        const Yue2ArDevicePrefixState & ar_state,
+        const Yue2ARDevicePrefixState & ar_state,
         const std::vector<float> & state,
         float raw_t) {
         const auto & config = assets->config.model;
@@ -594,7 +673,7 @@ struct Yue2NarRuntime::Impl {
     }
 
     std::vector<float> solve_chunk(
-        const Yue2ArDevicePrefixState & ar_state,
+        const Yue2ARDevicePrefixState & ar_state,
         const std::vector<float> & noise,
         int64_t ode_steps) {
         auto state = noise;
@@ -621,7 +700,7 @@ struct Yue2NarRuntime::Impl {
     std::vector<float> synthesize(
         const std::vector<int32_t> & prefix,
         const std::vector<int32_t> & codec,
-        const std::function<Yue2ArDevicePrefixState(const std::vector<int32_t> &)> & prefill_state,
+        const std::function<Yue2ARDevicePrefixState(const std::vector<int32_t> &)> & prefill_state,
         const std::vector<float> & noise,
         uint64_t seed,
         int64_t ode_steps,
@@ -680,31 +759,34 @@ struct Yue2NarRuntime::Impl {
     std::shared_ptr<const Yue2Assets> assets;
     size_t graph_arena_bytes = 0;
     bool allow_flash_attention = true;
-    std::shared_ptr<const Yue2NarWeights> weights;
+    int64_t attention_tile_rows = 0;
+    std::shared_ptr<const Yue2NARWeights> weights;
     std::unique_ptr<Graph> graph;
 };
 
-Yue2NarRuntime::Yue2NarRuntime(
+Yue2NARRuntime::Yue2NARRuntime(
     core::ExecutionContext & execution,
     std::shared_ptr<const Yue2Assets> assets,
     assets::TensorStorageType weight_type,
     size_t weight_context_bytes,
     size_t graph_arena_bytes,
-    bool allow_flash_attention)
+    bool allow_flash_attention,
+    int64_t attention_tile_rows)
     : impl_(std::make_unique<Impl>(
           execution,
           std::move(assets),
           weight_type,
           weight_context_bytes,
           graph_arena_bytes,
-          allow_flash_attention)) {}
+          allow_flash_attention,
+          attention_tile_rows)) {}
 
-Yue2NarRuntime::~Yue2NarRuntime() = default;
+Yue2NARRuntime::~Yue2NARRuntime() = default;
 
-std::vector<float> Yue2NarRuntime::synthesize(
+std::vector<float> Yue2NARRuntime::synthesize(
     const std::vector<int32_t> & prefix,
     const std::vector<int32_t> & codec,
-    const std::function<Yue2ArDevicePrefixState(const std::vector<int32_t> &)> & prefill_state,
+    const std::function<Yue2ARDevicePrefixState(const std::vector<int32_t> &)> & prefill_state,
     const std::vector<float> & noise,
     uint64_t seed,
     int64_t ode_steps,
@@ -712,7 +794,7 @@ std::vector<float> Yue2NarRuntime::synthesize(
     return impl_->synthesize(prefix, codec, prefill_state, noise, seed, ode_steps, context);
 }
 
-void Yue2NarRuntime::release_runtime_graphs() {
+void Yue2NARRuntime::release_runtime_graphs() {
     impl_->graph.reset();
 }
 

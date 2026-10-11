@@ -3,8 +3,8 @@
 #include "engine/framework/core/backend_weight_store.h"
 #include "engine/framework/core/backend.h"
 #include "engine/framework/debug/profiler.h"
-#include "engine/framework/modules/transformers/qwen_causal_decoder.h"
-#include "engine/framework/modules/transformers/qwen_decoder.h"
+#include "engine/framework/modules/transformers/causal_decoder.h"
+#include "engine/framework/modules/transformers/decoder.h"
 #include "engine/framework/modules/linear_module.h"
 #include "engine/framework/modules/norm_modules.h"
 #include "engine/framework/modules/structural_modules.h"
@@ -101,7 +101,7 @@ struct FishLayerWeights {
     core::TensorValue down_proj;
 };
 
-struct FishARWeights {
+struct FishDualARWeights {
     std::shared_ptr<core::BackendWeightStore> store;
     assets::TensorData text_embedding_host;
     assets::TensorData codebook_embedding_host;
@@ -128,8 +128,8 @@ struct FishPrefillCacheTarget {
     std::vector<core::TensorValue> values;
 };
 
-modules::QwenDecoderActivationCastPolicy fish_activation_cast_policy(core::BackendType backend_type) {
-    modules::QwenDecoderActivationCastPolicy policy;
+modules::DecoderActivationCastPolicy fish_activation_cast_policy(core::BackendType backend_type) {
+    modules::DecoderActivationCastPolicy policy;
     if (backend_type == core::BackendType::Vulkan) {
         return policy;
     }
@@ -155,10 +155,10 @@ modules::QwenDecoderActivationCastPolicy fish_activation_cast_policy(core::Backe
     return policy;
 }
 
-modules::QwenCausalDecoderConfig make_slow_decoder_config(
+modules::CausalDecoderConfig make_slow_decoder_config(
     const FishAudioTextConfig & config,
     core::BackendType backend_type) {
-    modules::QwenCausalDecoderConfig out;
+    modules::CausalDecoderConfig out;
     out.stack.hidden_size = config.dim;
     out.stack.num_attention_heads = config.n_head;
     out.stack.num_key_value_heads = config.n_local_heads;
@@ -169,21 +169,21 @@ modules::QwenCausalDecoderConfig make_slow_decoder_config(
     out.stack.rope_theta = config.rope_base;
     out.stack.rope_type = GGML_ROPE_TYPE_NORMAL;
     out.stack.attention_precision = GGML_PREC_F32;
-    out.stack.qkv_layout = modules::QwenDecoderQKVLayout::PackedQKV;
+    out.stack.qkv_layout = modules::DecoderQKVLayout::PackedQKV;
     out.stack.use_qk_norm = config.attention_qk_norm;
     out.stack.activation_cast = fish_activation_cast_policy(backend_type);
     // Metal without the FA-RDNA2 kernels has no flash kernel: fall back to
     // the manual path instead of emitting an unsupported op.
     const auto attn_mode = (backend_type == core::BackendType::Metal && !core::metal_fa_rdna2_enabled())
-        ? modules::QwenDecoderAttentionMode::ManualRepeat
-        : modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+        ? modules::DecoderAttentionMode::ManualRepeat
+        : modules::DecoderAttentionMode::FlashGroupedViewKV;
     out.stack.runtime.attention.prefill_mode = attn_mode;
     out.stack.runtime.attention.static_mode = attn_mode;
-    out.stack.runtime.static_cache.update_mode = modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
-    out.stack.runtime.static_cache.set_rows_mode = modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;
-    out.stack.runtime.mlp.mode = modules::QwenDecoderMLPMode::PackedGateUp;
+    out.stack.runtime.static_cache.update_mode = modules::DecoderStaticCacheUpdateMode::DirectSetRows;
+    out.stack.runtime.static_cache.set_rows_mode = modules::DecoderStaticCacheSetRowsMode::BackendViewOptimized;
+    out.stack.runtime.mlp.mode = modules::DecoderMLPMode::PackedGateUp;
     out.logits_size = config.vocab_size;
-    out.logits_mode = modules::QwenCausalDecoderLogitsMode::LastStep;
+    out.logits_mode = modules::CausalDecoderLogitsMode::LastStep;
     out.lm_head_precision = GGML_PREC_F32;
     if (backend_type == core::BackendType::Metal) {
         // FA-RDNA2 takes F16 KV directly (Q stays F32, acc is F32 above).
@@ -192,10 +192,10 @@ modules::QwenCausalDecoderConfig make_slow_decoder_config(
     return out;
 }
 
-modules::QwenCausalDecoderConfig make_fast_decoder_config(
+modules::CausalDecoderConfig make_fast_decoder_config(
     const FishAudioFastConfig & config,
     core::BackendType backend_type) {
-    modules::QwenCausalDecoderConfig out;
+    modules::CausalDecoderConfig out;
     out.stack.hidden_size = config.dim;
     out.stack.num_attention_heads = config.n_head;
     out.stack.num_key_value_heads = config.n_local_heads;
@@ -206,21 +206,21 @@ modules::QwenCausalDecoderConfig make_fast_decoder_config(
     out.stack.rope_theta = config.rope_base;
     out.stack.rope_type = GGML_ROPE_TYPE_NORMAL;
     out.stack.attention_precision = GGML_PREC_F32;
-    out.stack.qkv_layout = modules::QwenDecoderQKVLayout::PackedQKV;
+    out.stack.qkv_layout = modules::DecoderQKVLayout::PackedQKV;
     out.stack.use_qk_norm = config.attention_qk_norm;
     out.stack.activation_cast = fish_activation_cast_policy(backend_type);
     // Metal without the FA-RDNA2 kernels has no flash kernel: fall back to
     // the manual path instead of emitting an unsupported op.
     const auto attn_mode = (backend_type == core::BackendType::Metal && !core::metal_fa_rdna2_enabled())
-        ? modules::QwenDecoderAttentionMode::ManualRepeat
-        : modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+        ? modules::DecoderAttentionMode::ManualRepeat
+        : modules::DecoderAttentionMode::FlashGroupedViewKV;
     out.stack.runtime.attention.prefill_mode = attn_mode;
     out.stack.runtime.attention.static_mode = attn_mode;
-    out.stack.runtime.static_cache.update_mode = modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
-    out.stack.runtime.static_cache.set_rows_mode = modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;
-    out.stack.runtime.mlp.mode = modules::QwenDecoderMLPMode::PackedGateUp;
+    out.stack.runtime.static_cache.update_mode = modules::DecoderStaticCacheUpdateMode::DirectSetRows;
+    out.stack.runtime.static_cache.set_rows_mode = modules::DecoderStaticCacheSetRowsMode::BackendViewOptimized;
+    out.stack.runtime.mlp.mode = modules::DecoderMLPMode::PackedGateUp;
     out.logits_size = config.vocab_size;
-    out.logits_mode = modules::QwenCausalDecoderLogitsMode::LastStep;
+    out.logits_mode = modules::CausalDecoderLogitsMode::LastStep;
     out.lm_head_precision = GGML_PREC_F32;
     if (backend_type == core::BackendType::Metal) {
         // FA-RDNA2 takes F16 KV directly (Q stays F32, acc is F32 above).
@@ -229,11 +229,11 @@ modules::QwenCausalDecoderConfig make_fast_decoder_config(
     return out;
 }
 
-modules::QwenDecoderLayerWeights bind_layer(
+modules::DecoderLayerWeights bind_layer(
     core::ConstantTensorCache & constants,
     const FishLayerWeights & weights,
     bool use_qk_norm) {
-    modules::QwenDecoderLayerWeights out;
+    modules::DecoderLayerWeights out;
     out.input_norm = binding::norm_data(constants, weights.input_norm);
     out.self_attention.qkv_weight = weights.qkv_proj;
     out.self_attention.out_weight = weights.o_proj;
@@ -250,11 +250,11 @@ modules::QwenDecoderLayerWeights bind_layer(
     return out;
 }
 
-modules::QwenCausalDecoderWeights bind_slow_weights(
+modules::CausalDecoderWeights bind_slow_weights(
     core::ConstantTensorCache & constants,
-    const FishARWeights & weights,
+    const FishDualARWeights & weights,
     const FishAudioTextConfig & config) {
-    modules::QwenCausalDecoderWeights out;
+    modules::CausalDecoderWeights out;
     out.stack.layers.reserve(weights.slow_layers.size());
     for (const auto & layer : weights.slow_layers) {
         out.stack.layers.push_back(bind_layer(constants, layer, config.attention_qk_norm));
@@ -264,7 +264,7 @@ modules::QwenCausalDecoderWeights bind_slow_weights(
     return out;
 }
 
-modules::QwenDecoderLayerWeights bind_fast_layer(
+modules::DecoderLayerWeights bind_fast_layer(
     core::ConstantTensorCache & constants,
     const FishLayerWeights & weights,
     const FishAudioFastConfig & config) {
@@ -313,7 +313,7 @@ bool is_semantic_token(const FishAudioConfig & config, int32_t token) {
 
 std::vector<float> build_slow_embeddings(
     const FishAudioConfig & config,
-    const FishARWeights & weights,
+    const FishDualARWeights & weights,
     const int32_t * matrix,
     int64_t steps) {
     const int64_t rows = config.fast.num_codebooks + 1;
@@ -343,7 +343,7 @@ std::vector<float> build_slow_embeddings(
 
 std::vector<float> build_slow_embedding_for_frame(
     const FishAudioConfig & config,
-    const FishARWeights & weights,
+    const FishDualARWeights & weights,
     const std::vector<int32_t> & frame) {
     if (static_cast<int64_t>(frame.size()) != config.fast.num_codebooks + 1) {
         throw std::runtime_error("Fish Audio frame size mismatch");
@@ -353,7 +353,7 @@ std::vector<float> build_slow_embedding_for_frame(
 
 std::vector<float> build_fast_embedding(
     const FishAudioConfig & config,
-    const FishARWeights & weights,
+    const FishDualARWeights & weights,
     int32_t code) {
     return lookup_row(weights.fast_embedding_host, code, config.fast.dim);
 }
@@ -415,7 +415,7 @@ FishLayerWeights load_layer(
     return w;
 }
 
-FishARWeights load_ar_weights(
+FishDualARWeights load_ar_weights(
     const FishAudioAssets & assets,
     ggml_backend_t backend,
     core::BackendType backend_type,
@@ -423,7 +423,7 @@ FishARWeights load_ar_weights(
     assets::TensorStorageType storage_type) {
     const auto & source = *assets.model_weights;
     const auto & config = assets.config;
-    FishARWeights weights;
+    FishDualARWeights weights;
     weights.store = std::make_shared<core::BackendWeightStore>(
         backend,
         backend_type,
@@ -679,7 +679,7 @@ core::TensorValue make_fish_causal_mask(
     core::ModuleBuildContext &,
     core::ConstantTensorCache & constants,
     int64_t steps) {
-    auto values = modules::qwen_causal_prefill_mask_values(1, steps);
+    auto values = modules::causal_prefill_mask_values(1, steps);
     return constants.make_tensor(
         core::TensorShape::from_dims({1, 1, steps, steps}),
         GGML_TYPE_F16,
@@ -690,7 +690,7 @@ core::TensorValue make_fish_causal_mask(
 struct FishCausalDecoderOutputs {
     core::TensorValue hidden;
     core::TensorValue logits;
-    modules::QwenDecoderStackState state;
+    modules::DecoderStackState state;
 };
 
 FishCausalDecoderOutputs build_fish_causal_decoder(
@@ -698,15 +698,15 @@ FishCausalDecoderOutputs build_fish_causal_decoder(
     core::ConstantTensorCache & constants,
     const core::TensorValue & input,
     const core::TensorValue & positions,
-    const modules::QwenCausalDecoderWeights & weights,
-    const modules::QwenCausalDecoderConfig & config,
+    const modules::CausalDecoderWeights & weights,
+    const modules::CausalDecoderConfig & config,
     bool norm_fastlayer_input) {
     auto mask = make_fish_causal_mask(ctx, constants, input.shape.dims[1]);
     auto x = input;
-    modules::QwenDecoderStackState state;
+    modules::DecoderStackState state;
     state.layers.reserve(weights.stack.layers.size());
-    const auto layer_config = modules::qwen_decoder_layer_config_from_stack(config.stack);
-    const modules::QwenDecoderLayerModule layer_module(layer_config);
+    const auto layer_config = modules::decoder_layer_config_from_stack(config.stack);
+    const modules::DecoderLayerModule layer_module(layer_config);
     for (const auto & layer : weights.stack.layers) {
         auto out = layer_module.build(ctx, x, positions, layer, std::nullopt, std::nullopt, mask);
         x = out.output;
@@ -737,8 +737,8 @@ FishStaticDecoderOutputs build_fish_static_decoder(
     ggml_cgraph * graph,
     const core::TensorValue & input,
     const core::TensorValue & positions,
-    const modules::QwenCausalDecoderWeights & weights,
-    const modules::QwenCausalDecoderConfig & config,
+    const modules::CausalDecoderWeights & weights,
+    const modules::CausalDecoderConfig & config,
     int64_t cache_steps,
     const core::TensorValue & attention_mask,
     const core::TensorValue & cache_slot,
@@ -750,8 +750,8 @@ FishStaticDecoderOutputs build_fish_static_decoder(
     }
     const int64_t step_elems = config.stack.num_key_value_heads * config.stack.head_dim;
     auto x = input;
-    const auto layer_config = modules::qwen_decoder_layer_config_from_stack(config.stack);
-    const modules::QwenDecoderLayerModule layer_module(layer_config);
+    const auto layer_config = modules::decoder_layer_config_from_stack(config.stack);
+    const modules::DecoderLayerModule layer_module(layer_config);
     for (size_t layer_index = 0; layer_index < weights.stack.layers.size(); ++layer_index) {
         auto out = layer_module.build_with_static_cache_tail(
             ctx,
@@ -791,9 +791,9 @@ FishStaticDecoderOutputs build_fish_static_decoder(
 
 }  // namespace
 
-class FishARWeightsRuntime {
+class FishDualARWeightsRuntime {
 public:
-    FishARWeightsRuntime(
+    FishDualARWeightsRuntime(
         std::shared_ptr<const FishAudioAssets> assets,
         core::BackendConfig backend_config,
         int threads,
@@ -809,7 +809,7 @@ public:
         backend_config.threads = threads_;
         backend_ = core::init_backend(backend_config);
         backend_type_ = core::backend_type(backend_);
-        weights_ = std::make_shared<FishARWeights>(
+        weights_ = std::make_shared<FishDualARWeights>(
             load_ar_weights(*assets_, backend_, backend_type_, weight_context_bytes, weight_storage_type));
         slow_step_constants_ = std::make_unique<core::ConstantTensorCache>(
             backend_,
@@ -823,7 +823,7 @@ public:
             256ull * 1024ull * 1024ull);
     }
 
-    ~FishARWeightsRuntime() {
+    ~FishDualARWeightsRuntime() {
         fast_constants_.reset();
         slow_step_constants_.reset();
         weights_.reset();
@@ -832,14 +832,14 @@ public:
         }
     }
 
-    FishARWeightsRuntime(const FishARWeightsRuntime &) = delete;
-    FishARWeightsRuntime & operator=(const FishARWeightsRuntime &) = delete;
+    FishDualARWeightsRuntime(const FishDualARWeightsRuntime &) = delete;
+    FishDualARWeightsRuntime & operator=(const FishDualARWeightsRuntime &) = delete;
 
     const FishAudioAssets & assets() const noexcept {
         return *assets_;
     }
 
-    const FishARWeights & weights() const noexcept {
+    const FishDualARWeights & weights() const noexcept {
         return *weights_;
     }
 
@@ -869,7 +869,7 @@ public:
 
 private:
     std::shared_ptr<const FishAudioAssets> assets_;
-    std::shared_ptr<const FishARWeights> weights_;
+    std::shared_ptr<const FishDualARWeights> weights_;
     int threads_ = 1;
     size_t graph_arena_bytes_ = 0;
     ggml_backend_t backend_ = nullptr;
@@ -878,7 +878,7 @@ private:
     std::unique_ptr<core::ConstantTensorCache> fast_constants_;
 };
 
-class FishAudioARRuntime::Impl {
+class FishAudioDualARRuntime::Impl {
 public:
     Impl(
         std::shared_ptr<const FishAudioAssets> assets,
@@ -887,7 +887,7 @@ public:
         size_t graph_arena_bytes,
         size_t weight_context_bytes,
         assets::TensorStorageType weight_storage_type)
-        : runtime_(std::make_shared<FishARWeightsRuntime>(
+        : runtime_(std::make_shared<FishDualARWeightsRuntime>(
               std::move(assets),
               backend_config,
               threads,
@@ -908,7 +908,10 @@ public:
         runtime_.reset();
     }
 
-    engine::codecs::FishDacCodes generate(const FishAudioPrompt & prompt, const FishAudioGenerationOptions & options) {
+    engine::codecs::FishDacCodes generate(
+        const FishAudioPrompt & prompt,
+        const FishAudioGenerationOptions & options,
+        const std::function<void(const std::vector<int32_t> &)> & on_frame) {
         FishARProfile profile;
         const auto & assets = runtime_->assets();
         const auto & weights = runtime_->weights();
@@ -949,6 +952,9 @@ public:
             const auto input = build_slow_embedding_for_frame(assets.config, weights, frame);
             profile.slow_embedding_ms += engine::debug::elapsed_ms(timing_start, Clock::now());
             auto step_out = step_graph_->run(input, profile);
+            // The last frame is discarded on a length-limited generation.
+            // Only publish it once a subsequent decoding step has started.
+            if (on_frame) on_frame(std::vector<int32_t>(frame.begin() + 1, frame.end()));
             frame = sample_frame(step_out.logits, step_out.hidden, options, sample, true, profile);
             if (frame.front() == im_end_id()) {
                 ended_by_im_end = true;
@@ -985,7 +991,7 @@ private:
     class PrefillGraph {
     public:
         PrefillGraph(
-            std::shared_ptr<const FishARWeightsRuntime> runtime,
+            std::shared_ptr<const FishDualARWeightsRuntime> runtime,
             int64_t steps,
             FishPrefillCacheTarget target_cache)
             : runtime_(std::move(runtime)),
@@ -1062,7 +1068,7 @@ private:
                 !ggml_gallocr_alloc_graph(gallocr_, graph_)) {
                 throw std::runtime_error("failed to allocate Fish Audio AR prefill graph");
             }
-            auto positions = modules::qwen_position_ids(steps_);
+            auto positions = modules::decoder_position_ids(steps_);
             ggml_backend_tensor_set(positions_, positions.data(), 0, positions.size() * sizeof(int32_t));
         }
 
@@ -1103,7 +1109,7 @@ private:
         int64_t steps() const noexcept { return steps_; }
 
     private:
-        std::shared_ptr<const FishARWeightsRuntime> runtime_;
+        std::shared_ptr<const FishDualARWeightsRuntime> runtime_;
         int64_t steps_ = 0;
         std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
         ggml_tensor * input_ = nullptr;
@@ -1118,7 +1124,7 @@ private:
 
     class StepGraph {
     public:
-        StepGraph(std::shared_ptr<const FishARWeightsRuntime> runtime, int64_t cache_steps)
+        StepGraph(std::shared_ptr<const FishDualARWeightsRuntime> runtime, int64_t cache_steps)
             : runtime_(std::move(runtime)),
               cache_steps_(cache_steps) {
             ggml_init_params state_params{8ull * 1024ull * 1024ull, nullptr, true};
@@ -1294,7 +1300,7 @@ private:
         }
 
     private:
-        std::shared_ptr<const FishARWeightsRuntime> runtime_;
+        std::shared_ptr<const FishDualARWeightsRuntime> runtime_;
         int64_t cache_steps_ = 0;
         std::unique_ptr<ggml_context, GgmlContextDeleter> state_ctx_;
         std::unique_ptr<ggml_context, GgmlContextDeleter> graph_ctx_;
@@ -1313,7 +1319,7 @@ private:
 
     class FastGraph {
     public:
-        explicit FastGraph(std::shared_ptr<const FishARWeightsRuntime> runtime)
+        explicit FastGraph(std::shared_ptr<const FishDualARWeightsRuntime> runtime)
             : runtime_(std::move(runtime)) {
             ggml_init_params state_params{8ull * 1024ull * 1024ull, nullptr, true};
             state_ctx_.reset(ggml_init(state_params));
@@ -1383,7 +1389,7 @@ private:
             graph_ = ggml_new_graph_custom(graph_ctx_.get(), 32768, false);
             auto & constants = runtime_->fast_constants();
             constants.begin_graph();
-            modules::QwenCausalDecoderWeights decoder_weights;
+            modules::CausalDecoderWeights decoder_weights;
             decoder_weights.stack.layers.reserve(weights.fast_layers.size());
             for (const auto & layer : weights.fast_layers) {
                 decoder_weights.stack.layers.push_back(bind_fast_layer(constants, layer, config));
@@ -1579,7 +1585,7 @@ private:
 #endif
 
     private:
-        std::shared_ptr<const FishARWeightsRuntime> runtime_;
+        std::shared_ptr<const FishDualARWeightsRuntime> runtime_;
         std::unique_ptr<ggml_context, GgmlContextDeleter> state_ctx_;
         std::unique_ptr<ggml_context, GgmlContextDeleter> graph_ctx_;
         ggml_tensor * input_ = nullptr;
@@ -1754,14 +1760,14 @@ private:
         engine::debug::trace_log_scalar("fish_audio.ar.profile.generated_frames", profile.generated_frames);
     }
 
-    std::shared_ptr<const FishARWeightsRuntime> runtime_;
+    std::shared_ptr<const FishDualARWeightsRuntime> runtime_;
     sampling::TorchCudaSamplingPolicy sampling_policy_;
     std::unique_ptr<PrefillGraph> prefill_graph_;
     std::unique_ptr<StepGraph> step_graph_;
     std::unique_ptr<FastGraph> fast_graph_;
 };
 
-FishAudioARRuntime::FishAudioARRuntime(
+FishAudioDualARRuntime::FishAudioDualARRuntime(
     std::shared_ptr<const FishAudioAssets> assets,
     core::BackendConfig backend,
     int threads,
@@ -1776,15 +1782,16 @@ FishAudioARRuntime::FishAudioARRuntime(
           weight_context_bytes,
           weight_storage_type)) {}
 
-FishAudioARRuntime::~FishAudioARRuntime() = default;
+FishAudioDualARRuntime::~FishAudioDualARRuntime() = default;
 
-engine::codecs::FishDacCodes FishAudioARRuntime::generate(
+engine::codecs::FishDacCodes FishAudioDualARRuntime::generate(
     const FishAudioPrompt & prompt,
-    const FishAudioGenerationOptions & options) {
-    return impl_->generate(prompt, options);
+    const FishAudioGenerationOptions & options,
+    const std::function<void(const std::vector<int32_t> &)> & on_frame) {
+    return impl_->generate(prompt, options, on_frame);
 }
 
-void FishAudioARRuntime::release_runtime_graphs() {
+void FishAudioDualARRuntime::release_runtime_graphs() {
     impl_->release_runtime_graphs();
 }
 

@@ -240,7 +240,8 @@ runtime::CapabilitySet capabilities_from_spec(const json::Value & spec) {
     out.supports_style_condition =
         has_capability(*capabilities, "style_control") || has_capability(*capabilities, "emotion_control");
     out.supports_timestamps =
-        has_capability(*capabilities, "word_timestamps") || has_capability(*capabilities, "segments");
+        has_capability(*capabilities, "word_timestamps") || has_capability(*capabilities, "segments") ||
+        has_capability(*capabilities, "speech_segments");
     return out;
 }
 
@@ -306,6 +307,13 @@ std::optional<ModelContract> model_contract(std::string_view family) {
             "model spec schema_version: expected " + std::to_string(kModelSpecSchemaVersion));
     }
     return contract_from_spec(spec);
+}
+
+std::optional<ModelContract> find_model_contract(std::string_view family) {
+    if (!engine::model_spec::find_contract_spec_path(family).has_value()) {
+        return std::nullopt;
+    }
+    return model_contract(family);
 }
 
 std::optional<runtime::CapabilitySet> advertised_capabilities(std::string_view family) {

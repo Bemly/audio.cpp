@@ -80,8 +80,20 @@ std::vector<int32_t> codec_from_semantic_tokens(const std::vector<int32_t> & tok
     return out;
 }
 
-Yue2ArSamplingWindow abc_window(const Yue2GenerationConfig & generation) {
-    return Yue2ArSamplingWindow{
+std::vector<int32_t> semantic_tokens_from_codec(const std::vector<int32_t> & codec) {
+    std::vector<int32_t> out;
+    out.reserve(codec.size());
+    for (const int32_t index : codec) {
+        if (index < 0 || index >= kCodecSize) {
+            throw std::runtime_error("Yue2 semantic prefix codec index is out of range");
+        }
+        out.push_back(kCodecOffset + index);
+    }
+    return out;
+}
+
+Yue2ARSamplingWindow abc_window(const Yue2GenerationConfig & generation) {
+    return Yue2ARSamplingWindow{
         0,
         kEodToken,
         kAbcEndToken,
@@ -91,8 +103,8 @@ Yue2ArSamplingWindow abc_window(const Yue2GenerationConfig & generation) {
     };
 }
 
-Yue2ArSamplingWindow semantic_window(const Yue2GenerationConfig & generation) {
-    return Yue2ArSamplingWindow{
+Yue2ARSamplingWindow semantic_window(const Yue2GenerationConfig & generation) {
+    return Yue2ARSamplingWindow{
         kCodecOffset,
         kCodecOffset + kCodecSize,
         kMusicEndToken,
@@ -117,7 +129,8 @@ public:
         size_t ar_decode_graph_arena_bytes,
         size_t nar_graph_arena_bytes,
         size_t vae_graph_arena_bytes,
-        core::AttentionPreference attention_preference)
+        core::AttentionPreference attention_preference,
+        int64_t nar_attention_tile_rows)
         : execution(&execution),
           assets(std::move(assets)),
           tokenizer(this->assets->tiktoken_path),
@@ -128,7 +141,8 @@ public:
           ar_prefill_graph_arena_bytes(ar_prefill_graph_arena_bytes),
           ar_decode_graph_arena_bytes(ar_decode_graph_arena_bytes),
           nar_graph_arena_bytes(nar_graph_arena_bytes),
-          vae_graph_arena_bytes(vae_graph_arena_bytes) {
+          vae_graph_arena_bytes(vae_graph_arena_bytes),
+          nar_attention_tile_rows(nar_attention_tile_rows) {
         if (!this->assets) {
             throw std::runtime_error("Yue2 pipeline requires assets");
         }
@@ -169,18 +183,18 @@ public:
     Yue2SemanticResult generate_semantic(const Yue2Request & request, Yue2Plan plan) {
         Yue2SemanticResult out;
         out.plan = std::move(plan);
-        if (request.cot != Yue2CotMode::Off && request.abc.empty()) {
-            ensure_ar();
-            const auto abc_start = Clock::now();
-            out.plan.abc_ids = ar->generate(out.plan.prefix, abc_window(request.generation), request.seed);
-            engine::debug::timing_log_scalar("yue2.semantic.abc_generate_ms", engine::debug::elapsed_ms(abc_start));
-            out.plan.truncated = static_cast<int64_t>(out.plan.abc_ids.size()) >= request.generation.abc.max_tokens;
-            out.plan.prefix.insert(out.plan.prefix.end(), out.plan.abc_ids.begin(), out.plan.abc_ids.end());
-            out.plan.prefix.push_back(kAbcEndToken);
-            out.plan.prefix.push_back(kMusicStartToken);
-            engine::debug::timing_log_scalar("yue2.semantic.abc_generated_tokens", out.plan.abc_ids.size());
-            engine::debug::timing_log_scalar("yue2.semantic.abc_truncated", out.plan.truncated);
-            ar->release_runtime_graphs();
+        generate_plan_abc(request, out.plan);
+        const auto forced = semantic_tokens_from_codec(request.semantic_prefix);
+        if (!forced.empty() &&
+            static_cast<int64_t>(forced.size()) >= request.generation.semantic.max_tokens) {
+            // The prefix already fills the window: nothing would be sampled, so
+            // the AR prefill and its logits are skipped. stop_after=audio still
+            // prefills the stream once, in the NAR stage, for its conditioning.
+            out.tokens = forced;
+            out.truncated = true;
+            engine::debug::timing_log_scalar("yue2.semantic.tokens", out.tokens.size());
+            engine::debug::timing_log_scalar("yue2.semantic.truncated", out.truncated);
+            return out;
         }
         ensure_ar();
         const auto neg = negative_prefix(request, tokenizer, out.plan.abc_ids);
@@ -189,7 +203,8 @@ public:
             neg,
             semantic_window(request.generation),
             request_guidance_scale(request),
-            request.seed);
+            request.seed,
+            forced);
         out.truncated = static_cast<int64_t>(out.tokens.size()) >= request.generation.semantic.max_tokens;
         engine::debug::timing_log_scalar("yue2.semantic.tokens", out.tokens.size());
         engine::debug::timing_log_scalar("yue2.semantic.truncated", out.truncated);
@@ -300,12 +315,14 @@ public:
             std::ostringstream settings;
             settings << "seed=" << request.seed
                      << " cot=" << cot_mode_name(request.cot)
+                     << " stop_after=" << stop_after_name(request.stop_after)
                      << " guidance_scale=" << request_guidance_scale(request)
                      << " num_inference_steps=" << request.generation.ode_steps
                      << " context=" << request.generation.context
                      << " abc=" << (request.abc.empty() ?
                          (request.cot == Yue2CotMode::Off ? "none" : "generated") : "provided")
-                     << " nar_noise=" << (request.nar_noise.empty() ? "generated" : "provided");
+                     << " nar_noise=" << (request.nar_noise.empty() ? "generated" : "provided")
+                     << " semantic_prefix_frames=" << request.semantic_prefix.size();
             engine::debug::trace_log_scalar("yue2.request", settings.str());
             for (const bool abc : {true, false}) {
                 if (abc && (request.cot == Yue2CotMode::Off || !request.abc.empty())) {
@@ -326,9 +343,28 @@ public:
         const auto plan_start = Clock::now();
         auto planned = plan(request);
         engine::debug::timing_log_scalar("yue2.plan_ms", engine::debug::elapsed_ms(plan_start, Clock::now()));
+        Yue2RunResult out;
+        if (request.stop_after == Yue2StopAfter::Abc) {
+            generate_plan_abc(request, planned);
+            ar.reset();
+            attach_plan_abc(request, planned, out);
+            return out;
+        }
         const auto semantic_start = Clock::now();
         auto semantic = generate_semantic(request, std::move(planned));
         engine::debug::timing_log_scalar("yue2.semantic_ms", engine::debug::elapsed_ms(semantic_start, Clock::now()));
+        if (request.export_semantic) {
+            out.semantic_codes = codec_from_semantic_tokens(semantic.tokens);
+            out.semantic_truncated = semantic.truncated;
+        }
+        attach_plan_abc(request, semantic.plan, out);
+        if (request.stop_after == Yue2StopAfter::Semantic) {
+            if (request.export_semantic && out.semantic_codes.empty()) {
+                throw std::runtime_error("Yue2 semantic generation produced no codec tokens");
+            }
+            ar.reset();
+            return out;
+        }
         const auto nar_start = Clock::now();
         auto latents = synthesize_latents(semantic, request.generation, request.nar_noise, request.seed);
         engine::debug::timing_log_scalar("yue2.nar_ms", engine::debug::elapsed_ms(nar_start, Clock::now()));
@@ -341,14 +377,7 @@ public:
         if (vae) {
             vae->release_runtime_graphs();
         }
-        Yue2RunResult out;
         out.audio = std::move(audio);
-        if (request.cot != Yue2CotMode::Off && request.abc.empty() && !semantic.plan.abc_ids.empty()) {
-            const auto decode_start = Clock::now();
-            out.plan_abc_text = tokenizer.decode(semantic.plan.abc_ids);
-            engine::debug::timing_log_scalar("yue2.plan.abc_decode_ms", engine::debug::elapsed_ms(decode_start, Clock::now()));
-            out.plan_abc_truncated = semantic.plan.truncated;
-        }
         return out;
     }
 
@@ -365,12 +394,39 @@ public:
     }
 
 private:
+    void generate_plan_abc(const Yue2Request & request, Yue2Plan & plan) {
+        if (request.cot == Yue2CotMode::Off || !request.abc.empty()) {
+            return;
+        }
+        ensure_ar();
+        const auto abc_start = Clock::now();
+        plan.abc_ids = ar->generate(plan.prefix, abc_window(request.generation), request.seed);
+        engine::debug::timing_log_scalar("yue2.semantic.abc_generate_ms", engine::debug::elapsed_ms(abc_start));
+        plan.truncated = static_cast<int64_t>(plan.abc_ids.size()) >= request.generation.abc.max_tokens;
+        plan.prefix.insert(plan.prefix.end(), plan.abc_ids.begin(), plan.abc_ids.end());
+        plan.prefix.push_back(kAbcEndToken);
+        plan.prefix.push_back(kMusicStartToken);
+        engine::debug::timing_log_scalar("yue2.semantic.abc_generated_tokens", plan.abc_ids.size());
+        engine::debug::timing_log_scalar("yue2.semantic.abc_truncated", plan.truncated);
+        ar->release_runtime_graphs();
+    }
+
+    void attach_plan_abc(const Yue2Request & request, const Yue2Plan & plan, Yue2RunResult & out) {
+        if (request.cot == Yue2CotMode::Off || !request.abc.empty() || plan.abc_ids.empty()) {
+            return;
+        }
+        const auto decode_start = Clock::now();
+        out.plan_abc_text = tokenizer.decode(plan.abc_ids);
+        engine::debug::timing_log_scalar("yue2.plan.abc_decode_ms", engine::debug::elapsed_ms(decode_start, Clock::now()));
+        out.plan_abc_truncated = plan.truncated;
+    }
+
     void ensure_ar() {
         if (ar) {
             return;
         }
         const auto start = Clock::now();
-        ar = std::make_unique<Yue2ArRuntime>(
+        ar = std::make_unique<Yue2ARRuntime>(
             *execution,
             assets,
             model_weight_type,
@@ -409,13 +465,14 @@ private:
             return;
         }
         const auto start = Clock::now();
-        nar = std::make_unique<Yue2NarRuntime>(
+        nar = std::make_unique<Yue2NARRuntime>(
             *execution,
             assets,
             model_weight_type,
             model_weight_context_bytes,
             nar_graph_arena_bytes,
-            allow_flash_attention);
+            allow_flash_attention,
+            nar_attention_tile_rows);
         engine::debug::timing_log_scalar("yue2.nar.init_ms", engine::debug::elapsed_ms(start));
     }
 
@@ -431,9 +488,10 @@ private:
     size_t ar_decode_graph_arena_bytes = 0;
     size_t nar_graph_arena_bytes = 0;
     size_t vae_graph_arena_bytes = 0;
+    int64_t nar_attention_tile_rows = 0;
     std::unique_ptr<codecs::OobleckAudioVaeRuntime> vae;
-    std::unique_ptr<Yue2ArRuntime> ar;
-    std::unique_ptr<Yue2NarRuntime> nar;
+    std::unique_ptr<Yue2ARRuntime> ar;
+    std::unique_ptr<Yue2NARRuntime> nar;
 };
 
 Yue2PipelineRuntime::Yue2PipelineRuntime(
@@ -447,7 +505,8 @@ Yue2PipelineRuntime::Yue2PipelineRuntime(
     size_t ar_decode_graph_arena_bytes,
     size_t nar_graph_arena_bytes,
     size_t vae_graph_arena_bytes,
-    core::AttentionPreference attention_preference)
+    core::AttentionPreference attention_preference,
+    int64_t nar_attention_tile_rows)
     : impl_(std::make_unique<Impl>(
           execution,
           std::move(assets),
@@ -459,7 +518,8 @@ Yue2PipelineRuntime::Yue2PipelineRuntime(
           ar_decode_graph_arena_bytes,
           nar_graph_arena_bytes,
           vae_graph_arena_bytes,
-          attention_preference)) {}
+          attention_preference,
+          nar_attention_tile_rows)) {}
 
 Yue2PipelineRuntime::~Yue2PipelineRuntime() = default;
 

@@ -35,7 +35,11 @@
   import { defaultChunkBudget, splitTtsChunks } from '$lib/text';
   import { UI_THEME_STORAGE_KEY, resolvedTheme, resolveUiTheme, uiThemes, type UiTheme } from '$lib/theme';
   import { modelStudioPanelFor, type GenericControlReplacements } from '$lib/models/panels';
+  import type { PanelRunner } from '$lib/models/panel_runner';
+  import { prepareLiveAvatarOutput } from '$lib/models/liveavatar/video';
   import Arena from './Arena.svelte';
+  import Configuration from './Configuration.svelte';
+  import { loadUiConfiguration, uiConfiguration, uiConfigurationError } from '$lib/configuration';
   import type {
     AudioOutput,
     CatalogEntry,
@@ -52,7 +56,7 @@
   } from '$lib/voices';
   import '../app.css';
 
-  let tab: 'studio' | 'arena' | 'models' | 'logs' = 'studio';
+  let tab: 'studio' | 'arena' | 'models' | 'logs' | 'configuration' = 'studio';
   let arenaComponent: { runArena: () => Promise<void> } | null = null;
   let selectedId = catalog[0]?.id || '';
   let selected: CatalogEntry = catalog[0];
@@ -69,6 +73,7 @@
   let errorStatus = '';
   let text = '';
   let language = '';
+  let mossLanguage = 'English';
   let context = '';
   let referenceText = '';
   let instructions = '';
@@ -76,6 +81,7 @@
   let duration = 30;
   let seed = 1234;
       let maxTokens = 1024;
+  let asrMaxTokens = 0;
       let sourceFile: File | null = null;
       let videoFile: File | null = null;
       let voiceFile: File | null = null;
@@ -90,11 +96,39 @@
   let advancedValues: Record<string, unknown> = {};
   let paramSpecs: ParamSpec[] = [];
   let outputAudio: AudioOutput[] = [];
-  let outputArtifacts: Array<{ id: string; url: string; extension: string }> = [];
+  let outputArtifacts: Array<{ id: string; url: string; extension: string; mime: string }> = [];
   let outputText = '';
   let outputJson = '';
+  let outputSettings: { url: string; filename: string } | null = null;
+  type GenerationHistoryEntry = {
+    id: number;
+    modelId: string;
+    task: string;
+    label: string;
+    createdAt: string;
+    seed: number;
+    audio: AudioOutput[];
+    artifacts: typeof outputArtifacts;
+    text: string;
+    json: string;
+    settings: { url: string; filename: string };
+    settingsJson: string;
+  };
+  let generationHistory: GenerationHistoryEntry[] = [];
+  let historyError = '';
+  let restoringHistory = false;
+  let nextGenerationId = 1;
+  let selectedGenerationId: number | null = null;
+  let outputModelId = '';
+  let generationElapsedSeconds = 0;
+  let generationTimer: number | null = null;
+  let settingsInput: HTMLInputElement | null = null;
+  let importedSessionOptions: Record<string, string> = {};
+  let importedLoadOptions: Record<string, string> = {};
+  let settingsReloadRequired = false;
   let logs: string[] = [];
   let aborter: AbortController | null = null;
+  let panelRunner: PanelRunner | null = null;
   let longText = true;
   let chunkBudget = defaultChunkBudget(selected?.family || '');
   let savedVoices: SavedVoice[] = [];
@@ -131,7 +165,7 @@
   let bundledVoices: string[] = [];
   let quickStartVoice = '';
   let uiLanguage = 'en';
-  let uiTheme: UiTheme = 'system';
+  let uiTheme: UiTheme = 'mocha';
   let systemPrefersDark = true;
   let themePreferenceQuery: MediaQueryList | null = null;
   let themePreferenceListener: ((event: MediaQueryListEvent) => void) | null = null;
@@ -145,6 +179,17 @@
     demo_4_woman: 'demo_4_woman'
   };
   const exposeAllStudioPackageFamilies = new Set([
+    'kugelaudio', 'crisperwhisper', 'index_echo', 'audio_flamingo', 'owsm', 'owsm_ctc', 'reuse', 'sidon', 'smart_turn',
+    'maya1',
+    'gigaam_asr',
+    'samsone',
+    'sam_audio',
+    'tone_color_vc',
+    'moss_ttsd',
+    'moss_voicegen',
+    'canary_asr',
+    'cohere_asr',
+    'moss_transcribe_diarize',
     'audiosr',
     'controlfoley',
     'breeze_tts',
@@ -170,7 +215,7 @@
     document.documentElement.dataset.theme = nextTheme;
     document.querySelector('meta[name="theme-color"]')?.setAttribute(
       'content',
-      nextTheme === 'dark' ? '#07101f' : '#f6f8fb'
+      getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()
     );
   }
 
@@ -206,8 +251,11 @@
     return translate(`workflow.${translationId}`, {}, fallback);
   }
 
-  function localizedTaskLabel(task: string | undefined, translate = tr) {
+  function localizedTaskLabel(task: string | undefined, translate = tr, entry?: CatalogEntry) {
     if (!task) return translate('studio.title');
+    if (entry && (entry.workflow || workflowForEntry(entry) === 'enhancement')) {
+      return workflowLabel(workflowForEntry(entry), task, translate);
+    }
     return translate(`task.${task}`, {}, taskLabels[task] || task);
   }
 
@@ -247,7 +295,7 @@
 
   function setParameterValue(spec: ParamSpec, value: unknown) {
     advancedValues = { ...advancedValues, [spec.name]: value };
-    if (selected?.family === 'yue2' && spec.scope === 'session') {
+    if (['auk', 'yue2', 'liveavatar'].includes(selected?.family || '') && spec.scope === 'session') {
       isLoaded = loadedModels.some((model) => model.id === selectedId && model.loaded &&
         modelMatchesSelectedPackage(model, selected));
     }
@@ -269,10 +317,11 @@
   const workflowTabs = [
     { id: 'tts', label: 'Text to speech', filterLabel: 'TTS', tasks: ['tts', 'clon'] },
     { id: 'asr', label: 'ASR / Transcription', filterLabel: 'ASR', tasks: ['asr'] },
-    { id: 'music', label: 'Music generation', filterLabel: 'Music', tasks: ['gen'] },
-    { id: 'conversion', label: 'Voice conversion', filterLabel: 'Voice conversion', tasks: ['vc', 'svc', 's2s'] },
-    { id: 'separation', label: 'Source separation', filterLabel: 'Separation', tasks: ['sep'] },
-    { id: 'analysis', label: 'Audio analysis', filterLabel: 'Analysis', tasks: ['vad', 'diar', 'align', 'spk', 'midi'] },
+    { id: 'music', label: 'Music / video generation', filterLabel: 'Music / video generation', tasks: ['gen'] },
+    { id: 'conversion', label: 'Voice Conversion / S2S', filterLabel: 'Voice Conversion / S2S', tasks: ['vc', 'svc', 's2s'] },
+    { id: 'enhancement', label: 'Enhancement / denoising', filterLabel: 'Enhancement / denoising', tasks: ['s2s'] },
+    { id: 'separation', label: 'Source separation', filterLabel: 'Separation', tasks: ['sep', 's2s'] },
+    { id: 'analysis', label: 'Audio analysis', filterLabel: 'Analysis', tasks: ['vad', 'diar', 'align', 'spk', 'midi', 'asr', 'turn', 'wake', 'cls'] },
     { id: 'design', label: 'Voice design', filterLabel: 'Voice design', tasks: ['vdes'] }
   ] as const;
 
@@ -285,6 +334,13 @@
   }
 
   const familyLabels: Record<string, string> = {
+    kugelaudio: 'KugelAudio', crisperwhisper: 'CrisperWhisper', index_echo: 'Index-Echo S2TT',
+    audio_flamingo: 'Audio Flamingo', owsm: 'OWSM', owsm_ctc: 'OWSM-CTC',
+    reuse: 'RE-USE', sidon: 'Sidon', smart_turn: 'Smart Turn',
+    gigaam_asr: 'GigaAM ASR',
+    samsone: 'SAMSONE',
+    sam_audio: 'SAM Audio',
+    builtin_audio_utils: 'Audio utilities',
     qwen3_tts: 'Qwen3-TTS',
     irodori_tts: 'Irodori-TTS',
     chatterbox: 'Chatterbox',
@@ -297,7 +353,26 @@
     magpie_tts: 'MagpieTTS',
     meanvc2: 'MeanVC2',
     niagara_asr: 'Niagara ASR',
+    canary_asr: 'Canary 180M Flash',
+    cohere_asr: 'Cohere Transcribe',
+    moss_transcribe_diarize: 'MOSS-Transcribe-Diarize',
+    apollo: 'Apollo',
+    universr: 'UniverSR',
+    pulsevad: 'PulseVAD',
+    nemotron_3_diar: 'Nemotron 3 Diarization',
+    lfm2_audio: 'LFM2.5-Audio',
     personaplex: 'PersonaPlex'
+  };
+
+  const asrTokenDefaults: Record<string, number> = {
+    canary_asr: 0, cohere_asr: 256, moss_transcribe_diarize: 5120
+  };
+  const asrLanguages: Record<string, string[]> = {
+    canary_asr: ['en', 'de', 'es', 'fr'],
+    cohere_asr: ['en', 'fr', 'de', 'es', 'it', 'pt', 'nl', 'pl', 'el', 'ar', 'ja', 'zh', 'vi', 'ko'],
+    // Confucius4-R2T2 takes canonical language names (the engine normalizes
+    // case); 'Auto' leaves language detection on.
+    confucius4_r2t2: ['Auto', 'Chinese', 'English', 'Cantonese', 'Japanese', 'Korean', 'Arabic', 'German', 'French', 'Spanish', 'Portuguese', 'Indonesian', 'Italian', 'Russian', 'Thai', 'Vietnamese', 'Turkish', 'Hindi', 'Malay', 'Dutch', 'Swedish', 'Danish', 'Finnish', 'Polish', 'Czech', 'Filipino', 'Persian', 'Greek', 'Romanian', 'Hungarian', 'Macedonian']
   };
 
   function pathVariantLabel(path: string) {
@@ -399,21 +474,22 @@
   $: selected = activeCatalog.find((entry) => entry.id === selectedId) || activeCatalog[0] || catalog[0];
   $: activeWorkflowSpec = workflowTabs.find((workflow) => workflow.id === activeWorkflow) || workflowTabs[0];
   $: workflowModels = activeCatalog
-    .filter((entry) => activeWorkflowSpec.tasks.some((task) => task === entry.task))
+    .filter((entry) => workflowForEntry(entry) === activeWorkflow)
     .sort((left, right) => compareModelNames(left.display_name, right.display_name));
   $: filteredModelGroups = modelGroups.map((group) => ({
     ...group,
     entries: group.entries.filter((entry) => {
-      const workflow = workflowTabs.find((candidate) => candidate.tasks.some((task) => task === entry.task));
-      return Boolean(workflow && modelWorkflowFilters.includes(workflow.id));
+      return modelWorkflowFilters.includes(workflowForEntry(entry));
     })
   })).filter((group) => group.entries.length > 0);
   $: isLoaded = loadedModels.some((model) => model.id === selectedId && model.loaded &&
     modelMatchesSelectedPackage(model, selected));
-  $: modelStudioPanelConfig = modelStudioPanelFor(selected?.family);
+  $: modelStudioPanelConfig = modelStudioPanelFor(selected?.family, selected?.task);
   $: modelStudioPanel = modelStudioPanelConfig?.component;
   $: replacesGenericControls = modelStudioPanelConfig?.replacesGenericControls || noGenericControlReplacements;
   $: usesYue2Request = modelStudioPanelConfig?.requestMode === 'yue2';
+  $: usesPanelRequest = modelStudioPanelConfig?.requestMode === 'panel';
+  $: modelPanelUploading = modelStudioPanelConfig?.blocksRunWhileUploading === true && loraUploading;
   $: isFireRedAudioEdit = selected?.id === 'firered-audio-semantic-edit' ||
     selected?.id === 'firered-audio-acoustic-edit';
   $: allowsAutoDuration = selected?.family === 'ace_step';
@@ -422,24 +498,27 @@
     selected?.family === 'midashenglm_gen';
   $: supportsTextOnlyTts = (
     selected?.family === 'breeze_tts' ||
-    selected?.family === 'chatterbox_turbo'
+    selected?.family === 'chatterbox_turbo' || selected?.family === 'maya1' || selected?.family === 'kugelaudio' ||
+    (selected?.family === 'lfm2_audio' && !selected?.builtin_voices?.length)
   ) && selected?.task === 'tts';
-  $: needsSource = ['asr', 'vc', 'svc', 's2s', 'sep', 'vad', 'diar', 'align', 'midi'].includes(selected?.task) ||
-    isFireRedAudioEdit;
+  $: needsSource = ['asr', 'vc', 'svc', 's2s', 'sep', 'vad', 'diar', 'align', 'midi', 'turn', 'wake', 'cls'].includes(selected?.task) ||
+    isFireRedAudioEdit || selected?.family === 'liveavatar' ||
+    (selected?.family === 'auk' && selected?.task === 'gen');
   $: acceptsSource = needsSource || (selected?.task === 'gen' && !replacesGenericControls.genSource);
   $: acceptsVideo = selected?.request_options?.includes('video') === true;
   $: needsVoice = (['clon', 'vc', 'svc'].includes(selected?.task) && selected?.family !== 'rvc') ||
     (selected?.task === 's2s' && selected?.family === 'personaplex') ||
     (selected?.task === 'tts' && !['supertonic'].includes(selected?.family) && !supportsTextOnlyTts);
-  $: usesVibeVoiceSpeakerFiles = selected?.family === 'vibevoice';
+  $: usesVibeVoiceSpeakerFiles = selected?.family === 'vibevoice' || selected?.family === 'moss_ttsd';
   $: usesBuiltInVoiceSelector = Boolean(selected?.builtin_voices?.length);
   $: isQwenBase = selected?.task === 'tts' && selected?.family === 'qwen3_tts' &&
     !selected?.id.includes('custom');
-  $: allowsQuickStartVoice = ['tts', 'clon'].includes(selected?.task);
+  $: allowsQuickStartVoice = ['tts', 'clon'].includes(selected?.task) && !['auk', 'maya1', 'moss_ttsd'].includes(selected?.family);
   $: referenceVoiceRequired = !(allowsQuickStartVoice && quickStartVoice) && (
     (['clon', 'vc', 'svc'].includes(selected?.task) && selected?.family !== 'rvc') || isQwenBase);
   $: lyricsRequired = requiresRequestOption(selected, 'lyrics');
-  $: referenceTextRequired = requiresRequestOption(selected, 'reference_text') ||
+  $: referenceTextRequired = (requiresRequestOption(selected, 'reference_text') &&
+    !(allowsQuickStartVoice && quickStartVoice)) ||
     (Boolean(voiceFile) && isQwenBase);
   $: quickStartVoices = server && !server.ui_management
     ? Array.from(new Set([
@@ -454,10 +533,15 @@
   $: quickStartVoicePreview = quickStartVoice && server?.ui_management !== false && !usesBuiltInVoiceSelector
     ? voicePreviewUrl(demoVoiceSources[quickStartVoice] || quickStartVoice)
     : '';
+  // LFM2.5-Audio S2S text would replace the chat system prompt the checkpoints
+  // were trained with, so it gets no text box, and text kept from another
+  // model is not sent.
+  $: usesFixedChatPrompt = selected?.family === 'lfm2_audio' && selected?.task === 's2s';
   $: showsText = ['tts', 'clon', 'gen', 's2s', 'align', 'vdes'].includes(selected?.task) &&
-    !replacesGenericControls.text;
+    !['apollo', 'universr', 'builtin_audio_utils', 'reuse', 'sidon'].includes(selected?.family) &&
+    !usesFixedChatPrompt && !replacesGenericControls.text;
   $: supportsLiveAsr = selected?.task === 'asr' &&
-    ['voxtral_realtime', 'nemotron_asr', 'higgs_audio_stt', 'sense_asr', 'vibevoice_asr_streaming'].includes(selected?.family);
+    ['voxtral_realtime', 'nemotron_asr', 'higgs_audio_stt', 'sense_asr', 'vibevoice_asr_streaming', 'confucius4_r2t2'].includes(selected?.family);
   $: modelInventoryLoading = server === null ||
     (Boolean(server.ui_management) && Object.keys(packageSizes).length === 0 && packageSizeState !== 'failed');
   $: selectableModelIds = new Set(activeCatalog.filter((entry) => {
@@ -516,11 +600,15 @@
   function mergedSessionOptions(entry: CatalogEntry) {
     const packageChoice = selectedPackageChoice(entry);
     const sessionParams = entry.id === selectedId ? sessionParameterOptions() : {};
-    return { ...(entry.session_options || {}), ...(packageChoice?.session_options || {}), ...sessionParams };
+    return { ...(entry.session_options || {}), ...(packageChoice?.session_options || {}),
+      ...(entry.id === selectedId ? importedSessionOptions : {}), ...sessionParams };
   }
 
   function packageSessionOptionsMatch(entry: CatalogEntry, choice: InstallPackageChoice, model: LoadedModel) {
     const expected = mergedSessionOptions(entry);
+    if (entry.family === 'lfm2_audio') {
+      expected['lfm2_audio.model_gguf'] = choice.session_options?.['lfm2_audio.model_gguf'];
+    }
     const keys = Array.from(new Set((entry.install_packages || [])
       .flatMap((candidate) => Object.keys(candidate.session_options || {}))));
     if (entry.id === selectedId) {
@@ -538,10 +626,10 @@
   }
 
   function modelMatchesSelectedPackage(model: LoadedModel, entry: CatalogEntry | undefined) {
-    if (!entry) return comparablePath(model.path) === comparablePath(modelPath);
+    if (!entry) return catalogPathMatches(modelPath, model.path);
     const choice = selectedPackageChoice(entry);
-    if (!choice) return comparablePath(model.path) === comparablePath(modelPath);
-    return comparablePath(model.path) === comparablePath(modelPath) &&
+    if (!choice) return catalogPathMatches(modelPath, model.path);
+    return catalogPathMatches(modelPath, model.path) &&
       packageSessionOptionsMatch(entry, choice, model);
   }
 
@@ -771,8 +859,10 @@
     return selectableModelIds.has(entry.id);
   }
 
-  function workflowForTask(task: string | undefined): WorkflowId {
-    return (workflowTabs.find((workflow) => workflow.tasks.some((candidate) => candidate === task))?.id || 'tts') as WorkflowId;
+  function workflowForEntry(entry: CatalogEntry): WorkflowId {
+    if (entry.workflow) return entry.workflow as WorkflowId;
+    if (['apollo', 'universr', 'audiosr'].includes(entry.family)) return 'enhancement';
+    return (workflowTabs.find((workflow) => workflow.tasks.some((candidate) => candidate === entry.task))?.id || 'tts') as WorkflowId;
   }
 
   function installButtonLabel(
@@ -1021,12 +1111,19 @@
   }
 
   function resetParams() {
+    importedSessionOptions = {};
+    importedLoadOptions = {};
+    settingsReloadRequired = false;
     const byId = parameterCatalog[selected?.id] || parameterCatalog[selected?.family] || [];
     const hidesDurationSec = selected?.family === 'controlfoley' || selected?.family === 'midashenglm_gen';
     paramSpecs = byId.filter((spec) =>
-      !(selected?.family === 'vibevoice' && spec.name === 'voice_samples') &&
+      !(['vibevoice', 'moss_ttsd'].includes(selected?.family) && spec.name === 'voice_samples') &&
       !(hidesDurationSec && spec.name === 'duration_sec'));
     advancedValues = Object.fromEntries(byId.map((spec) => [spec.name, spec.default ?? '']));
+    if (selected?.family in asrTokenDefaults) asrMaxTokens = asrTokenDefaults[selected.family];
+    if (selected?.family === 'confucius4_r2t2') language = 'Auto';
+    else if (['owsm', 'owsm_ctc', 'index_echo', 'audio_flamingo', 'kugelaudio', 'smart_turn', 'reuse', 'sidon'].includes(selected?.family)) language = '';
+    else if (selected?.family in asrLanguages) language = 'en';
     if (selected?.family === 'minimax_h3') {
       duration = 15;
       advancedValues = { ...advancedValues, num_frames: miniMaxFramesForDuration(duration), dit_acceleration: 'none' };
@@ -1038,13 +1135,17 @@
         const configured = loadedModels.find((model) => model.id === selectedId)?.session_options;
         advancedValues = {
           ...advancedValues,
-          lora: configured?.['yue2.lora'] ?? '',
-          lora_scale: Number(configured?.['yue2.lora_scale'] ?? 1)
+          ar_lora: configured?.['yue2.ar_lora'] ?? '',
+          ar_lora_scale: Number(configured?.['yue2.ar_lora_scale'] ?? 1),
+          nar_lora: configured?.['yue2.nar_lora'] ?? '',
+          nar_lora_scale: Number(configured?.['yue2.nar_lora_scale'] ?? 1)
         };
       }
       text = '';
       lyrics = '';
       ensureYue2DefaultLyrics();
+    } else if (['liveavatar', 'moss_ttsd', 'sam_audio'].includes(selected?.family)) {
+      text = selected.default_text || '';
     } else if (!text.trim() && selected?.default_text) {
       text = selected.default_text;
     }
@@ -1069,7 +1170,7 @@
     }
     selectedId = next.id;
     selected = next;
-    activeWorkflow = workflowForTask(next.task);
+    activeWorkflow = workflowForEntry(next);
     workflowSelections = { ...workflowSelections, [activeWorkflow]: next.id };
     modelPath = next.path;
     installed = true;
@@ -1106,6 +1207,7 @@
   }
 
   function chooseModel(id: string) {
+    historyError = '';
     if (!id) {
       clearModelSelection();
       status = 'No model selected. Choose an installed model or download one from the Models tab.';
@@ -1117,7 +1219,7 @@
     selected = next;
     quickStartVoice = '';
     configuredVoices = [];
-    activeWorkflow = workflowForTask(next.task);
+    activeWorkflow = workflowForEntry(next);
     workflowSelections = { ...workflowSelections, [activeWorkflow]: id };
     modelPath = selectedModelPath(next);
     chunkBudget = defaultChunkBudget(next.family);
@@ -1131,15 +1233,15 @@
     const workflow = workflowTabs.find((entry) => entry.id === id);
     if (!workflow) return;
     activeWorkflow = id;
-    if (selectedId && workflow.tasks.some((task) => task === selected?.task)) return;
+    if (selectedId && workflowForEntry(selected) === id) return;
 
     const rememberedId = workflowSelections[id];
     const remembered = rememberedId
       ? activeCatalog.find((entry) => entry.id === rememberedId &&
-          workflow.tasks.some((task) => task === entry.task) && entrySelectable(entry))
+          workflowForEntry(entry) === id && entrySelectable(entry))
       : undefined;
     const next = remembered || activeCatalog.find((entry) =>
-      workflow.tasks.some((task) => task === entry.task) && entrySelectable(entry));
+      workflowForEntry(entry) === id && entrySelectable(entry));
     if (next) {
       chooseModel(next.id);
       return;
@@ -1156,7 +1258,7 @@
   }
 
   async function doLoad(modeOverride?: string) {
-    if (usesYue2Request && loraUploading) return;
+    if (modelPanelUploading) return;
     if (!selectedId) {
       status = 'Choose an installed model before loading.';
       warningStatus = status;
@@ -1175,9 +1277,8 @@
     status = `Loading ${selected.display_name}…`;
     log(status);
     try {
-      const targetPath = comparablePath(modelPath);
       const replaced = loadedModels.filter((model) => model.loaded &&
-        (model.id !== selected.id || comparablePath(model.path) !== targetPath ||
+        (model.id !== selected.id || !catalogPathMatches(modelPath, model.path) ||
           !modelMatchesSelectedPackage(model, selected)));
       for (const model of replaced) {
         log(`Unloading ${loadedModelName(model)} before loading ${selected.display_name}.`);
@@ -1190,7 +1291,7 @@
         family: selected.family,
         task: selected.task,
         mode: modeOverride || selected.mode || 'offline',
-        load_options: selected.load_options || {},
+        load_options: { ...(selected.load_options || {}), ...importedLoadOptions },
         session_options: mergedSessionOptions(selected)
       });
       await refresh();
@@ -1257,14 +1358,21 @@
 
   async function stagedPath(file: File | null): Promise<string | undefined> {
     if (!file) return undefined;
-    const targetSampleRate = selected.task === 'sep'
+    const targetSampleRate = selected.task === 'sep' || selected.family === 'apollo'
       ? 44100
-      : ['asr', 'vad', 'diar', 'align', 'midi'].includes(selected.task) ? 16000 : undefined;
+      : ['asr', 'vad', 'diar', 'align', 'midi', 'wake', 'cls'].includes(selected.task) ? 16000 : undefined;
     const wav = await browserDecodeToWav(file, targetSampleRate);
     return uploadWav(wav, aborter?.signal);
   }
 
   async function vibeVoiceSamplePaths(): Promise<string | undefined> {
+    if (selected.family === 'moss_ttsd') {
+      const last = vibeVoiceSpeakerFiles.map(Boolean).lastIndexOf(true);
+      if (last < 0) return undefined;
+      const paths = await Promise.all(vibeVoiceSpeakerFiles.slice(0, Math.max(2, last + 1))
+        .map(async (file) => file ? (await stagedPath(file) || '') : ''));
+      return paths.join(',');
+    }
     const firstEmpty = vibeVoiceSpeakerFiles.findIndex((file) => !file);
     const hasLaterFile = firstEmpty >= 0 && vibeVoiceSpeakerFiles.slice(firstEmpty + 1).some(Boolean);
     if (hasLaterFile) {
@@ -1289,6 +1397,9 @@
       .filter(([name, value]) => {
         const spec = paramSpecs.find((candidate) => candidate.name === name);
         if (spec?.scope === 'session') return false;
+        if (selected?.family === 'canary_asr' && name === 'target_language' && value === '') return false;
+        if (selected?.family === 'universr' && name === 'input_sample_rate' && value === '') return false;
+        if (selected?.family === 'auk' && typeof value === 'string' && value.trim().length === 0) return false;
         if (usesYue2Request && typeof value === 'string' && value.trim().length === 0) return false;
         return true;
       }));
@@ -1296,10 +1407,15 @@
   }
 
   function sessionParameterOptions() {
-    return Object.fromEntries(paramSpecs
+    const options = Object.fromEntries(paramSpecs
       .filter((spec) => spec.scope === 'session')
       .map((spec) => [spec.session_option || spec.name, String(advancedValues[spec.name] ?? spec.default ?? '')])
       .filter(([, value]) => value.length > 0));
+    if (selected?.family === 'auk') {
+      const generator = String(advancedValues.model_gguf || 'auk-base-f32.gguf');
+      options['auk.variant'] = generator.startsWith('auk-flash-') ? 'flash' : 'base';
+    }
+    return options;
   }
 
   function base64Text(value: string): string {
@@ -1371,27 +1487,234 @@
   }
 
   function clearOutput() {
-    for (const output of outputAudio) URL.revokeObjectURL(output.url);
+    if (selectedGenerationId === null) {
+      for (const output of outputAudio) URL.revokeObjectURL(output.url);
+      for (const artifact of outputArtifacts) URL.revokeObjectURL(artifact.url);
+      if (outputSettings) URL.revokeObjectURL(outputSettings.url);
+    }
     outputAudio = [];
     outputArtifacts = [];
     outputText = '';
     outputJson = '';
+    outputSettings = null;
+    selectedGenerationId = null;
+    outputModelId = '';
   }
+
+  function releaseGeneration(entry: GenerationHistoryEntry) {
+    for (const audio of entry.audio) URL.revokeObjectURL(audio.url);
+    for (const artifact of entry.artifacts) URL.revokeObjectURL(artifact.url);
+    URL.revokeObjectURL(entry.settings.url);
+  }
+
+  async function selectGeneration(entry: GenerationHistoryEntry, restoreParameters = false): Promise<void> {
+    if (entry.modelId !== selectedId || entry.task !== selected.task) {
+      historyError = `Cannot open history for ${entry.label}: the current model is ${selected.display_name}.`;
+      log(historyError);
+      return;
+    }
+    if (restoreParameters) {
+      if (running || loadingModel || restoringHistory) {
+        historyError = 'Wait for the current request or settings restore to finish.';
+        return;
+      }
+      restoringHistory = true;
+      try {
+        await restoreSettingsJson(entry.settingsJson);
+      } catch (error) {
+        historyError = error instanceof Error ? error.message : String(error);
+        log(`History settings restore failed: ${historyError}`);
+        return;
+      } finally {
+        restoringHistory = false;
+      }
+      return selectGeneration(entry);
+    }
+    historyError = '';
+    clearOutput();
+    selectedGenerationId = entry.id;
+    outputModelId = entry.modelId;
+    outputAudio = entry.audio;
+    outputArtifacts = entry.artifacts;
+    outputText = entry.text;
+    outputJson = entry.json;
+    outputSettings = entry.settings;
+  }
+
+  function deleteGeneration(id: number) {
+    const entry = generationHistory.find((candidate) => candidate.id === id);
+    if (!entry) return;
+    const wasSelected = selectedGenerationId === id;
+    if (wasSelected) clearOutput();
+    generationHistory = generationHistory.filter((candidate) => candidate.id !== id);
+    releaseGeneration(entry);
+    if (wasSelected) {
+      const next = generationHistory.find((candidate) => candidate.modelId === selectedId && candidate.task === selected.task);
+      if (next) selectGeneration(next);
+    }
+  }
+
+  function clearGenerationHistory() {
+    if (selectedGenerationId !== null) clearOutput();
+    for (const entry of generationHistory) releaseGeneration(entry);
+    generationHistory = [];
+    historyError = '';
+  }
+
+  function trimGenerationHistory(limit: number) {
+    const expired = generationHistory.slice(limit);
+    if (!expired.length) return;
+    const wasSelected = expired.some((entry) => entry.id === selectedGenerationId);
+    if (wasSelected) clearOutput();
+    generationHistory = generationHistory.slice(0, limit);
+    for (const entry of expired) releaseGeneration(entry);
+    if (wasSelected) {
+      const next = generationHistory.find((entry) => entry.modelId === selectedId && entry.task === selected.task);
+      if (next) selectGeneration(next);
+    }
+  }
+
+  $: trimGenerationHistory($uiConfiguration.historyLimit);
 
   async function ensureLoaded() {
     if (!server?.ui_management) {
+      if (settingsReloadRequired) {
+        throw new Error('The imported model settings require a reload through the server configuration.');
+      }
       if (!loadedModels.some((model) => model.id === selectedId)) {
         throw new Error('Configured model is not registered by this server.');
       }
       return;
     }
-    if (!isLoaded) {
+    if (!isLoaded || settingsReloadRequired) {
+      if (settingsReloadRequired && loadedModels.some((model) => model.id === selectedId && model.loaded)) {
+        await unloadModel(selectedId);
+        await refresh();
+      }
       await doLoad();
       await refresh();
       if (!loadedModels.some((model) => model.id === selectedId && model.loaded &&
         modelMatchesSelectedPackage(model, selected))) {
         throw new Error('Model did not load.');
       }
+      settingsReloadRequired = false;
+    }
+  }
+
+  async function restoreSettingsJson(json: string) {
+    const settings = JSON.parse(json);
+    if (settings.schema_version !== 1 || typeof settings.model?.id !== 'string' ||
+        !Array.isArray(settings.requests) || !settings.requests.length ||
+        !settings.requests.every((request: { body?: unknown }) =>
+          request && request.body && typeof request.body === 'object' && !Array.isArray(request.body))) {
+      throw new Error('Choose an audio.cpp settings JSON exported with Save settings JSON.');
+    }
+    const entry = activeCatalog.find((candidate) => candidate.id === settings.model.id);
+    if (!entry || entry.family !== settings.model.family || entry.task !== settings.model.task) {
+      throw new Error(`The exported model is not available in this UI: ${settings.model.id}`);
+    }
+    if (!entrySelectable(entry)) throw new Error(`Install ${entry.display_name} before importing its settings.`);
+    const choice = settings.model.package_id
+      ? entry.install_packages?.find((candidate) => candidate.id === settings.model.package_id)
+      : undefined;
+    if (settings.model.package_id && !choice) {
+      throw new Error(`The exported package is not available: ${settings.model.package_id}`);
+    }
+    if (choice && !packageIsAvailable(entry, choice, loadedModels, packageSizes)) {
+      throw new Error(`Install ${choice.label} before importing its settings.`);
+    }
+    const body = settings.requests[0].body;
+    const request = body.request || body;
+    const ui = settings.ui;
+    const importedSeed = settings.resolved_seed;
+    if (!Number.isInteger(importedSeed) || importedSeed < 0 || importedSeed > 0xffffffff) {
+      throw new Error('The settings JSON has an invalid resolved seed.');
+    }
+    const previousLoadOptions = { ...(entry.load_options || {}),
+      ...(entry.id === selectedId ? importedLoadOptions : {}) };
+    chooseModel(entry.id);
+    if (choice) {
+      selectedPackageIds = { ...selectedPackageIds, [entry.id]: choice.id };
+      localStorage.setItem('audiocpp.ui.packageIds', JSON.stringify(selectedPackageIds));
+    }
+    modelPath = choice ? selectedModelPath(entry) : settings.model.path;
+    importedSessionOptions = { ...(settings.model.session_options || {}) };
+    importedLoadOptions = { ...(settings.model.load_options || {}) };
+    advancedValues = { ...advancedValues, ...(ui?.advanced_values || Object.fromEntries(
+      Object.entries(request.options || {}).filter(([name]) => paramSpecs.some((spec) => spec.name === name)))) };
+    for (const spec of paramSpecs.filter((spec) => spec.scope === 'session')) {
+      const value = importedSessionOptions[spec.session_option || spec.name];
+      if (value === undefined) continue;
+      if (spec.type === 'bool' && !['true', 'false'].includes(value)) {
+        throw new Error(`Invalid boolean setting: ${spec.name}`);
+      }
+      if (['number', 'slider'].includes(spec.type) && !Number.isFinite(Number(value))) {
+        throw new Error(`Invalid numeric setting: ${spec.name}`);
+      }
+      advancedValues[spec.name] = spec.type === 'bool' ? value === 'true'
+        : ['number', 'slider'].includes(spec.type) ? Number(value) : value;
+    }
+    text = ui?.text ?? (settings.requests[0].endpoint === '/v1/audio/speech'
+      ? settings.requests.map((item: { body: { input: string } }) => item.body.input).join('\n\n')
+      : request.text || '');
+    lyrics = ui?.lyrics ?? request.lyrics ?? '';
+    language = ui?.language ?? request.language ?? '';
+    mossLanguage = ui?.moss_language ?? request.language ?? 'English';
+    context = ui?.context ?? (entry.task === 'asr' ? request.text || '' : '');
+    referenceText = ui?.reference_text ?? request.reference_text ?? '';
+    instructions = ui?.instructions ?? request.instructions ?? '';
+    duration = ui?.duration ?? request.duration_seconds ?? request.options?.duration_sec ?? duration;
+    maxTokens = ui?.max_tokens ?? request.max_tokens ?? maxTokens;
+    asrMaxTokens = ui?.asr_max_tokens ?? request.options?.max_tokens ?? asrMaxTokens;
+    longText = ui?.long_text ?? settings.requests.length > 1;
+    chunkBudget = ui?.text_chunk_size ?? chunkBudget;
+    quickStartVoice = ui?.voice ?? request.voice ?? '';
+    advancedJson = ui?.advanced_json ?? JSON.stringify(Object.fromEntries(
+      Object.entries(request.options || {}).filter(([name]) => !paramSpecs.some((spec) => spec.name === name))), null, 2);
+    seed = importedSeed;
+    sourceFile = null;
+    voiceFile = null;
+    videoFile = null;
+    vibeVoiceSpeakerFiles = [null, null, null, null];
+    savedVoiceId = '';
+    referenceTextFile = null;
+    if (sourceInput) sourceInput.value = '';
+    if (voiceInput) voiceInput.value = '';
+    if (videoInput) videoInput.value = '';
+    if (referenceTextInput) referenceTextInput.value = '';
+    for (const input of vibeVoiceSpeakerInputs) if (input) input.value = '';
+    const resident = loadedModels.find((model) => model.id === entry.id && model.loaded);
+    settingsReloadRequired = Boolean(resident && (
+      !catalogPathMatches(modelPath, resident.path) ||
+      Object.entries(mergedSessionOptions(entry)).some(([key, value]) => resident.session_options?.[key] !== value) ||
+      JSON.stringify(previousLoadOptions) !== JSON.stringify(importedLoadOptions)));
+    await inspectPath();
+    const files = Object.values(settings.input_files || {}).flat().filter((name) => typeof name === 'string' && name);
+    status = `Imported settings for ${entry.display_name}.`;
+    if (files.length) status += ` Reselect the referenced files: ${files.join(', ')}.`;
+    if (settings.backend && settings.backend !== server?.backend) {
+      status += ` Exported backend: ${settings.backend}; current backend: ${server?.backend}.`;
+    }
+    warningStatus = files.length ? status : '';
+    errorStatus = '';
+    log(status);
+    if (settingsReloadRequired && server?.ui_management &&
+        window.confirm('The imported model settings differ from the loaded model. Reload now?')) {
+      await ensureLoaded();
+    }
+  }
+
+  async function loadSettingsFile(file: File | null) {
+    if (!file || running || loadingModel || restoringHistory) return;
+    try {
+      await restoreSettingsJson(await file.text());
+    } catch (error) {
+      status = error instanceof Error ? error.message : String(error);
+      errorStatus = status;
+      warningStatus = '';
+      log(`Settings import failed: ${status}`);
+    } finally {
+      if (settingsInput) settingsInput.value = '';
     }
   }
 
@@ -1620,8 +1943,69 @@
     status = liveChunkNumber ? `Live transcription stopped after ${liveChunkNumber} chunks.` : 'Live transcription stopped.';
   }
 
+  function registerPanelRunner(runner: PanelRunner) {
+    panelRunner = runner;
+    return () => {
+      if (panelRunner === runner) panelRunner = null;
+    };
+  }
+
+  // ensureLoaded for a panel's request, in the mode given. After each wait
+  // it stops once the request's entry is no longer selected, so that it
+  // does not load the entry the user selected meanwhile.
+  async function ensurePanelLoaded(modelId: string, mode: string) {
+    if (!server?.ui_management) return ensureLoaded();
+    const stillSelected = () => {
+      if (selectedId !== modelId) throw new Error('The model changed while it loaded; press Run again.');
+    };
+    if (!isLoaded || settingsReloadRequired) {
+      if (settingsReloadRequired && loadedModels.some((model) => model.id === selectedId && model.loaded)) {
+        await unloadModel(selectedId);
+        await refresh();
+        stillSelected();
+      }
+      await doLoad(mode);
+      await refresh();
+      stillSelected();
+      settingsReloadRequired = false;
+    }
+    await ensureLoadedMode(mode).finally(stillSelected);
+  }
+
+  // A panel with requestMode 'panel' runs the request itself. It is called
+  // before anything is awaited, so that it still runs inside the Run click
+  // or key press, which a browser asks for before it plays audio.
+  async function runPanelRequest(resolvedSeed: number, started: number, signal: AbortSignal) {
+    const runner = panelRunner;
+    const modelId = selected.id;
+    if (!runner) {
+      if (tab !== 'studio') throw new StatusWarning('Open the Studio tab to run this entry.');
+      throw new Error(`${selected.display_name} is not ready.`);
+    }
+    const outcome = await runner({
+      modelId,
+      seed: resolvedSeed,
+      maxTokens: supportsMaxTokens(selected) ? maxTokens : undefined,
+      language: language.trim(),
+      options: requestOptions(),
+      signal,
+      setStatus: (text) => { status = text; },
+      warning: (text) => new StatusWarning(text),
+      ensureLoaded: (mode) => ensurePanelLoaded(modelId, mode)
+    });
+    clearOutput();
+    if (outcome.audio) outputAudio = [{ id: 'reply', url: URL.createObjectURL(outcome.audio) }];
+    outputText = outcome.text;
+    outputJson = outcome.json;
+    outputModelId = modelId;
+    warningStatus = '';
+    errorStatus = '';
+    status = tr('status.completeIn', { seconds: ((performance.now() - started) / 1000).toFixed(2) });
+    log(status);
+  }
+
   async function run() {
-    if (running || (usesYue2Request && loraUploading)) return;
+    if (running || modelPanelUploading || restoringHistory) return;
     if (!selectedId) {
       status = 'Choose an installed model before running a request.';
       warningStatus = status;
@@ -1634,16 +2018,30 @@
       errorStatus = '';
       return;
     }
-    clearOutput();
     running = true;
     aborter = new AbortController();
     const started = performance.now();
+    generationElapsedSeconds = 0;
+    generationTimer = window.setInterval(() => {
+      generationElapsedSeconds = (performance.now() - started) / 1000;
+    }, 250);
+    let nextAudio: AudioOutput[] = [];
+    let nextArtifacts: typeof outputArtifacts = [];
+    let nextText = '';
+    let nextJson = '';
+    let outputCommitted = false;
+    const submittedRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
     warningStatus = '';
     errorStatus = '';
     status = tr('status.runningTask', { task: localizedTaskLabel(selected.task) });
     log(status);
+    const liveAvatarDrivingAudio = selected.family === 'liveavatar' ? sourceFile : null;
     try {
       const resolvedSeed = resolveRequestSeed(seed);
+      if (usesPanelRequest) {
+        await runPanelRequest(resolvedSeed, started, aborter.signal);
+        return;
+      }
       if (referenceVoiceRequired && !voiceFile) {
         throw new StatusWarning(`${selected.display_name_en || selected.display_name} requires a reference voice.`);
       }
@@ -1654,7 +2052,44 @@
       if (lyricsRequired && !lyrics.trim()) {
         throw new StatusWarning(`${selected.display_name_en || selected.display_name} requires lyrics.`);
       }
+      if (selected.family === 'liveavatar') {
+        if (!sourceFile) throw new StatusWarning('LiveAvatar requires driving audio.');
+        if (!String(advancedValues.reference_image_path || '').trim()) {
+          throw new StatusWarning('LiveAvatar requires a reference image.');
+        }
+      }
       await ensureLoaded();
+      const resident = loadedModels.find((model) => model.id === selected.id);
+      const submittedSettings = {
+        schema_version: 1,
+        created_at: new Date().toISOString(),
+        backend: server?.backend,
+        resolved_seed: resolvedSeed,
+        model: {
+          id: selected.id,
+          display_name: selected.display_name,
+          family: selected.family,
+          task: selected.task,
+          mode: resident?.mode || selected.mode || 'offline',
+          path: resident?.path || modelPath,
+          package_id: selectedPackageChoice(selected)?.id,
+          load_options: { ...(selected.load_options || {}), ...importedLoadOptions },
+          session_options: resident?.session_options || mergedSessionOptions(selected)
+        },
+        ui: {
+          text, lyrics, language, moss_language: mossLanguage, context,
+          reference_text: referenceText, instructions, duration, max_tokens: maxTokens,
+          asr_max_tokens: asrMaxTokens, long_text: longText, text_chunk_size: chunkBudget,
+          voice: quickStartVoice, advanced_values: { ...advancedValues }, advanced_json: advancedJson
+        },
+        input_files: {
+          source: sourceFile?.name,
+          voice_reference: voiceFile?.name,
+          video: videoFile?.name,
+          speaker_references: vibeVoiceSpeakerFiles.map((file) => file?.name || null)
+        },
+        requests: submittedRequests
+      };
         const options = requestOptions();
         if (usesVibeVoiceSpeakerFiles) {
           const samples = await vibeVoiceSamplePaths();
@@ -1670,7 +2105,7 @@
         if (!text.trim()) throw new StatusWarning('Enter text to generate.');
         const effectiveChunkBudget = Math.max(40, chunkBudget);
         if (selected.family === 'voxcpm2') options.text_chunk_size = effectiveChunkBudget;
-        const chunks = longText && selected.task !== 'vdes'
+        const chunks = longText && selected.task !== 'vdes' && selected.family !== 'moss_ttsd'
           ? splitTtsChunks(text, effectiveChunkBudget)
           : [text];
         const audioChunks: Blob[] = [];
@@ -1682,11 +2117,11 @@
           const body: Record<string, unknown> = {
             model: selected.id,
             input: chunks[index],
-            language,
+            language: ['moss_ttsd', 'moss_voicegen'].includes(selected.family) ? mossLanguage : language,
             seed: chunkSeed(resolvedSeed, index),
             options
           };
-          if (supportsMaxTokens(selected)) body.max_tokens = maxTokens;
+          if (supportsMaxTokens(selected) && selected.family !== 'kugelaudio') body.max_tokens = maxTokens;
           if (voiceRef) body.voice_ref = voiceRef;
           else if (quickStartVoice) body.voice = demoVoiceSources[quickStartVoice] || quickStartVoice;
           else if (selected.default_voice) body.voice = selected.default_voice;
@@ -1694,6 +2129,7 @@
             body.reference_text = referenceText;
           }
           if (selected.task === 'vdes' && instructions.trim()) body.instructions = instructions;
+          submittedRequests.push({ endpoint: '/v1/audio/speech', body: JSON.parse(JSON.stringify(body)) });
           const result = await speech(body, aborter.signal);
           audioChunks.push(result.blob);
           timings.push({
@@ -1704,8 +2140,8 @@
           });
         }
         const merged = await concatenateAudioBlobs(audioChunks);
-        outputAudio = [{ id: chunks.length > 1 ? 'merged' : 'output', url: URL.createObjectURL(merged) }];
-        outputJson = JSON.stringify({
+        nextAudio = [{ id: chunks.length > 1 ? 'merged' : 'output', url: URL.createObjectURL(merged) }];
+        nextJson = JSON.stringify({
           seed: resolvedSeed,
           chunks: chunks.length,
           characters: text.length,
@@ -1714,20 +2150,27 @@
         }, null, 2);
       } else if (selected.task === 'asr') {
         if (!audio) throw new StatusWarning('Choose an audio file.');
-        const result = await transcription({
+        if (selected.family in asrTokenDefaults) options.max_tokens = asrMaxTokens;
+        const body = {
           model: selected.id,
           audio,
           language,
           text: context,
           options
-        }, aborter.signal);
-        outputText = String(result.text || '');
-        outputJson = JSON.stringify(result, null, 2);
+        };
+        const detail = ['owsm', 'crisperwhisper'].includes(selected.family) && options.return_timestamps === true;
+        submittedRequests.push({
+          endpoint: detail ? '/v1/audio/transcriptions/details' : '/v1/audio/transcriptions',
+          body: JSON.parse(JSON.stringify(body))
+        });
+        const result = await transcription(body, aborter.signal, detail);
+        nextText = String(result.text || '');
+        nextJson = JSON.stringify(result, null, 2);
       } else {
         if (needsSource && !audio) throw new StatusWarning('Choose a source audio file.');
         const request: Record<string, unknown> = { options };
-        if (['gen', 's2s', 'align'].includes(selected.task) && text.trim() && !usesYue2Request) request.text = text;
-        if (['gen', 's2s', 'align'].includes(selected.task) && language.trim() && !usesYue2Request) request.language = language;
+        if (['gen', 's2s', 'align'].includes(selected.task) && text.trim() && !usesYue2Request && !usesFixedChatPrompt && !['apollo', 'universr', 'reuse', 'sidon'].includes(selected.family)) request.text = text;
+        if (['gen', 's2s', 'align'].includes(selected.task) && language.trim() && !usesYue2Request && !['apollo', 'universr', 'reuse', 'sidon'].includes(selected.family)) request.language = language;
         if (selected.task === 'gen') {
           if (usesYue2Request) {
             request.lyrics = lyrics.trim();
@@ -1735,7 +2178,7 @@
             const resolvedText = requestText();
             if (resolvedText) request.text = resolvedText;
             if (lyrics.trim()) request.lyrics = lyrics;
-            if (!isFireRedAudioEdit) {
+            if (!isFireRedAudioEdit && selected.family !== 'auk') {
               if (usesDurationSecOption) options.duration_sec = duration;
               else request.duration_seconds = duration;
             }
@@ -1743,7 +2186,7 @@
           request.seed = resolvedSeed;
           if (supportsMaxTokens(selected)) request.max_tokens = maxTokens;
         } else if (selected.task === 's2s') {
-          request.seed = resolvedSeed;
+          if (!['apollo', 'reuse', 'sidon'].includes(selected.family)) request.seed = resolvedSeed;
           if (supportsMaxTokens(selected)) request.max_tokens = maxTokens;
         }
         if (audio) request.audio = audio;
@@ -1751,31 +2194,74 @@
         if (referenceText.trim() && supportsRequestOption(selected, 'reference_text')) {
           request.reference_text = referenceText;
         }
-        const result = await runTask({ model: selected.id, request }, aborter.signal);
+        const body = { model: selected.id, request };
+        submittedRequests.push({ endpoint: '/v1/tasks/run', body: JSON.parse(JSON.stringify(body)) });
+        const result = await runTask(body, aborter.signal);
+        nextText = typeof result.text === 'string' ? result.text : '';
+        nextJson = JSON.stringify(result, (key, value) =>
+          (key === 'audio' || key === 'payload') && typeof value === 'string'
+            ? `<base64 data: ${value.length} chars>` : value, 2);
         if (typeof result.audio === 'string') {
-          outputAudio = [{ id: 'output', url: base64AudioUrl(result.audio) }];
+          nextAudio = [{ id: 'output', url: base64AudioUrl(result.audio) }];
         }
         if (Array.isArray(result.named_audio_outputs)) {
-          outputAudio = result.named_audio_outputs
+          for (const output of nextAudio) URL.revokeObjectURL(output.url);
+          nextAudio = result.named_audio_outputs
             .filter((entry): entry is { id: string; audio: string } =>
               typeof entry?.id === 'string' && typeof entry?.audio === 'string')
             .map((entry) => ({ id: entry.id, url: base64AudioUrl(entry.audio) }));
         }
         if (Array.isArray(result.artifacts)) {
-          outputArtifacts = result.artifacts
-            .filter((entry): entry is { id: string; payload: string; meta?: Record<string, string> } =>
-              typeof entry?.id === 'string' && typeof entry?.payload === 'string')
-            .map((entry) => ({
+          if (selected.family === 'liveavatar') {
+            status = 'Encoding LiveAvatar MP4 in browser…';
+            const prepared = await prepareLiveAvatarOutput(result, liveAvatarDrivingAudio);
+            nextArtifacts = prepared.artifacts;
+            if (prepared.warning) log(prepared.warning);
+          } else {
+            nextArtifacts = result.artifacts
+              .filter((entry): entry is { id: string; payload: string; meta?: Record<string, string> } =>
+                typeof entry?.id === 'string' && typeof entry?.payload === 'string')
+              .map((entry) => ({
               id: entry.id,
               extension: entry.meta?.extension || (entry.meta?.format === 'midi' ? 'mid' : 'bin'),
+              mime: entry.meta?.mime || 'application/octet-stream',
               url: `data:${entry.meta?.mime || 'application/octet-stream'};base64,${entry.payload}`
             }));
+          }
         }
-        outputText = typeof result.text === 'string' ? result.text : '';
-        outputJson = JSON.stringify(result, (key, value) =>
-          (key === 'audio' || key === 'payload') && typeof value === 'string'
-            ? `<base64 data: ${value.length} chars>` : value, 2);
       }
+      const settingsJson = JSON.stringify(submittedSettings, null, 2);
+      const settingsUrl = URL.createObjectURL(new Blob([settingsJson], {
+        type: 'application/json'
+      }));
+      clearOutput();
+      outputAudio = nextAudio;
+      outputArtifacts = nextArtifacts;
+      outputText = nextText;
+      outputJson = nextJson;
+      outputSettings = { url: settingsUrl, filename: `${submittedSettings.model.id}-${Date.now()}.settings.json` };
+      outputModelId = submittedSettings.model.id;
+      {
+        const entry: GenerationHistoryEntry = {
+          id: nextGenerationId++,
+          modelId: outputModelId,
+          task: submittedSettings.model.task,
+          label: submittedSettings.model.display_name,
+          createdAt: new Date().toISOString(),
+          seed: resolvedSeed,
+          audio: nextAudio,
+          artifacts: nextArtifacts,
+          text: nextText,
+          json: nextJson,
+          settings: outputSettings,
+          settingsJson
+        };
+        generationHistory = [entry, ...generationHistory];
+        selectedGenerationId = entry.id;
+        trimGenerationHistory($uiConfiguration.historyLimit);
+      }
+      historyError = '';
+      outputCommitted = true;
       const elapsed = ((performance.now() - started) / 1000).toFixed(2);
       warningStatus = '';
       errorStatus = '';
@@ -1793,6 +2279,12 @@
         log(`Request failed: ${status}`);
       }
     } finally {
+      if (generationTimer !== null) window.clearInterval(generationTimer);
+      generationTimer = null;
+      if (!outputCommitted) {
+        for (const output of nextAudio) URL.revokeObjectURL(output.url);
+        for (const artifact of nextArtifacts) URL.revokeObjectURL(artifact.url);
+      }
       running = false;
       aborter = null;
     }
@@ -2044,6 +2536,12 @@
   }
 
   onMount(async () => {
+    try {
+      loadUiConfiguration();
+    } catch (error) {
+      uiConfigurationError.set(error instanceof Error ? error.message : String(error));
+      log(`Configuration could not be loaded: ${error instanceof Error ? error.message : error}`);
+    }
     await clearLegacyUiCaches();
     themePreferenceQuery = window.matchMedia('(prefers-color-scheme: dark)');
     systemPrefersDark = themePreferenceQuery.matches;
@@ -2070,7 +2568,7 @@
     selected = activeCatalog.find((entry) => entry.id === selectedId) || activeCatalog[0] || catalog[0];
     quickStartVoice = '';
     configuredVoices = [];
-    activeWorkflow = workflowForTask(selected.task);
+    activeWorkflow = workflowForEntry(selected);
     if (selectedId) workflowSelections = { ...workflowSelections, [activeWorkflow]: selectedId };
     resetParams();
     await refresh();
@@ -2105,13 +2603,15 @@
   });
 
   onDestroy(() => {
+    if (generationTimer !== null) window.clearInterval(generationTimer);
+    clearOutput();
+    for (const entry of generationHistory) releaseGeneration(entry);
     aborter?.abort();
     recorder?.state === 'recording' && recorder.stop();
     liveStopRequested = true;
     liveRecorder?.state === 'recording' && liveRecorder.stop();
     recordingStream?.getTracks().forEach((track) => track.stop());
     liveStream?.getTracks().forEach((track) => track.stop());
-    for (const output of outputAudio) URL.revokeObjectURL(output.url);
     if (installPoll !== null) window.clearInterval(installPoll);
     if (packageSizePoll !== null) window.clearInterval(packageSizePoll);
     if (themePreferenceQuery && themePreferenceListener) {
@@ -2120,7 +2620,7 @@
   });
 </script>
 
-<svelte:head><title>audio.cpp · Native Studio</title></svelte:head>
+<svelte:head><title>{running ? `${generationElapsedSeconds.toFixed(1)} s · audio.cpp · Native Studio` : 'audio.cpp · Native Studio'}</title></svelte:head>
 <svelte:window on:keydown={handleShortcut} />
 
 <header class="topbar">
@@ -2138,6 +2638,8 @@
       <button class:active={tab === 'models'} on:click={openModelsPage}>{tr('nav.models')}</button>
     {/if}
     <button class:active={tab === 'logs'} on:click={() => tab = 'logs'}>{tr('nav.runtime')}</button>
+    <button class:active={tab === 'configuration'} disabled={restoringHistory}
+      on:click={() => tab = 'configuration'}>Configuration</button>
   </nav>
   <label class="language-picker">
     <span>{tr('language.label')}</span>
@@ -2167,9 +2669,10 @@
     <nav class="workflow-tabs" aria-label={tr('nav.workflows')}>
       {#each workflowTabs as workflow}
         <button class:active={activeWorkflow === workflow.id}
+          disabled={restoringHistory}
           on:click={() => chooseWorkflow(workflow.id)}>
           {workflowLabel(workflow.id, workflow.label, tr)}
-          <small>{activeCatalog.filter((entry) => workflow.tasks.some((task) => task === entry.task)).length}</small>
+          <small>{activeCatalog.filter((entry) => workflowForEntry(entry) === workflow.id).length}</small>
         </button>
       {/each}
     </nav>
@@ -2177,8 +2680,8 @@
     <section class="hero">
       <div>
         <p class="eyebrow">{tr('studio.eyebrow')}</p>
-        <h1>{selectedId ? localizedTaskLabel(selected?.task, tr) : tr('studio.title')}</h1>
-        <p>{tr(`studio.subtitle.${activeWorkflow}`)}</p>
+        <h1>{selectedId ? localizedTaskLabel(selected?.task, tr, selected) : tr('studio.title')}</h1>
+        <p>{tr(`studio.subtitle.${activeWorkflow === 'conversion' ? 'vc' : activeWorkflow === 'separation' ? 'sep' : activeWorkflow}`)}</p>
       </div>
       <div class="hero-stat">
         <span>{tr('studio.model')}</span>
@@ -2190,7 +2693,7 @@
     <div class="studio-grid">
       <aside class="panel model-rail">
         <label for="model">{tr('studio.model')}</label>
-        <select id="model" bind:value={selectedId} disabled={modelInventoryLoading}
+        <select id="model" bind:value={selectedId} disabled={modelInventoryLoading || restoringHistory}
           on:change={(event) => chooseModel(event.currentTarget.value)}>
           <option value="">{tr('studio.noModel')}</option>
           {#each activeWorkflowSpec.tasks as task}
@@ -2214,6 +2717,12 @@
           <span>{selectedId ? tr('studio.estimatedVram', { value: selected?.min_vram_gb || '?' }) : tr('studio.vram')}</span>
         </div>
 
+        {#if selected.family === 'builtin_audio_utils' && server?.ui_management}
+          <label for="utility-weights">Weights path on server</label>
+          <input id="utility-weights" bind:value={modelPath} on:change={inspectPath} disabled={isLoaded || loadingModel || running} />
+          <a class="utility-weights-link" href={selected.weights_url} target="_blank" rel="noreferrer">Download SafeTensors weights</a>
+        {/if}
+
         {#if selectedId && (selected.install_packages || []).length && !replacesGenericControls.packageButtons}
           <div class="studio-package-buttons" aria-label="Model format">
             {#each studioPackageSlots(selected) as slot}
@@ -2232,11 +2741,11 @@
           </div>
         {:else}
           <button class="single-model-toggle" class:resident={isLoaded}
-            disabled={!selectedId || loadingModel || (usesYue2Request && loraUploading) || installed === false || !server?.ui_management}
+            disabled={!selectedId || loadingModel || modelPanelUploading || installed === false || !server?.ui_management}
             title={!server?.ui_management ? 'Configured by server config' : isLoaded ? tr('studio.unload') : tr('studio.load')}
             on:click={toggleSingleModel}>
             {!server?.ui_management ? (isLoaded ? tr('studio.bundledLoaded') : 'Configured') :
-              loadingModel ? tr('studio.working') : isLoaded ? tr('studio.bundledLoaded') : tr('studio.load')}
+              loadingModel ? tr('studio.working') : isLoaded ? tr(selected.family === 'builtin_audio_utils' ? 'studio.unload' : 'studio.bundledLoaded') : tr('studio.load')}
           </button>
         {/if}
 
@@ -2251,6 +2760,10 @@
           <div><span>{tr('request.label')}</span><h2>{tr('request.title')}</h2></div>
           <span class="task-chip">{selected?.task}</span>
         </div>
+        <input type="file" accept=".json,application/json" bind:this={settingsInput} hidden
+          on:change={(event) => loadSettingsFile(event.currentTarget.files?.[0] || null)} />
+        <button type="button" class="settings-import" disabled={running || loadingModel || restoringHistory}
+          on:click={() => settingsInput?.click()}>Load settings JSON</button>
 
         {#if showsText}
           <label for="text">{selected.task === 'gen' ? tr('request.prompt') : selected.task === 'align' ? tr('request.alignmentText') : tr('request.text')}</label>
@@ -2258,7 +2771,7 @@
             placeholder={selected.task === 'gen' ? tr('request.soundPlaceholder') : tr('request.textPlaceholder')}></textarea>
         {/if}
 
-        {#if ['tts', 'clon'].includes(selected.task)}
+        {#if ['tts', 'clon'].includes(selected.task) && selected.family !== 'moss_ttsd'}
           <div class="long-text-row">
             <label class="toggle">
               <input type="checkbox" bind:checked={longText} />
@@ -2272,10 +2785,10 @@
           </div>
         {/if}
 
-        {#if selected.task === 'gen'}
-          {#if modelStudioPanel}
-            <svelte:component
+        {#if modelStudioPanel}
+          <svelte:component
               this={modelStudioPanel}
+              task={selected.task}
               bind:lyrics
               bind:seed
               bind:loraUploading
@@ -2285,6 +2798,8 @@
               catalogEntries={activeCatalog}
               {loadedModels}
               {server}
+              modelId={selected.id}
+              setPanelRunner={registerPanelRunner}
               modelPathFor={selectedModelPath}
               sessionOptionsFor={mergedSessionOptions}
               refreshModels={selected.family === 'yue2' && !server?.ui_management
@@ -2293,12 +2808,20 @@
               {log}
               {tr}
               {localizedParameterText}
-              {setParameterValue} />
-          {:else}
-            <label for="lyrics">{tr('request.lyrics')} <span>{lyricsRequired ? tr('voice.required') : tr('request.optional')}</span></label>
-            <textarea id="lyrics" rows="3" bind:value={lyrics} required={lyricsRequired}
-              aria-required={lyricsRequired} placeholder="[Verse]…"></textarea>
-          {/if}
+              {setParameterValue}
+              {sourceFile}
+              clearSource={clearSourceFile}
+              sourceRecording={recordingTarget === 'source'}
+              sourceRecordingBlocked={Boolean(recorder) || liveRecording}
+              setSourceFile={(file: File | null) => sourceFile = file}
+              startSourceRecording={() => startRecording('source')}
+              stopSourceRecording={stopRecording} />
+        {:else if selected.task === 'gen'}
+          <label for="lyrics">{tr('request.lyrics')} <span>{lyricsRequired ? tr('voice.required') : tr('request.optional')}</span></label>
+          <textarea id="lyrics" rows="3" bind:value={lyrics} required={lyricsRequired}
+            aria-required={lyricsRequired} placeholder="[Verse]…"></textarea>
+        {/if}
+        {#if selected.task === 'gen'}
           {#if selected.family === 'ace_step'}
             <div class="media-actions">
               <button type="button" disabled={running || rewritingCaption || (!text.trim() && !lyrics.trim())}
@@ -2309,7 +2832,7 @@
           {/if}
         {/if}
 
-        {#if selected.task === 'asr'}
+        {#if selected.task === 'asr' && !['samsone', 'audio_flamingo', 'index_echo'].includes(selected.family)}
           <label for="context">{tr('request.context')} <span>{tr('request.contextHint')}</span></label>
           <textarea id="context" rows="2" bind:value={context}></textarea>
         {/if}
@@ -2321,22 +2844,36 @@
         {/if}
 
         <div class="field-grid">
-          {#if ['tts', 'clon', 'asr', 'gen', 's2s', 'align', 'vdes'].includes(selected.task) && !replacesGenericControls.language}
+          {#if ['tts', 'clon', 'asr', 'gen', 's2s', 'align', 'vdes'].includes(selected.task) && !replacesGenericControls.language && !['apollo', 'universr', 'moss_transcribe_diarize', 'builtin_audio_utils', 'sam_audio', 'samsone', 'gigaam_asr', 'maya1', 'owsm', 'owsm_ctc', 'index_echo', 'audio_flamingo', 'kugelaudio', 'reuse', 'sidon'].includes(selected.family)}
             <div>
-              <label for="language">{tr('request.language')} <span>{tr('request.autoLanguage')}</span></label>
-              <input id="language" bind:value={language} placeholder="auto" />
+              <label for="language">{tr('request.language')} {#if !asrLanguages[selected.family]}<span>{tr('request.autoLanguage')}</span>{/if}</label>
+              {#if ['moss_ttsd', 'moss_voicegen'].includes(selected.family)}
+                <input id="language" bind:value={mossLanguage} placeholder="English" />
+              {:else if asrLanguages[selected.family]}
+                <select id="language" bind:value={language}>
+                  {#each asrLanguages[selected.family] as code}<option value={code}>{code}</option>{/each}
+                </select>
+              {:else}
+                <input id="language" bind:value={language} placeholder="auto" />
+              {/if}
             </div>
           {/if}
-          {#if ['tts', 'clon', 'gen', 's2s', 'vdes'].includes(selected.task) && !replacesGenericControls.seed}
+          {#if ['tts', 'clon', 'gen', 's2s', 'vdes'].includes(selected.task) && !replacesGenericControls.seed && !['apollo', 'builtin_audio_utils', 'reuse', 'sidon'].includes(selected.family)}
             <div>
               <label for="seed">{tr('request.seed')} <span>{tr('request.randomSeed')}</span></label>
               <input id="seed" type="number" min="-1" max="4294967295" step="1" bind:value={seed} />
             </div>
           {/if}
-          {#if supportsMaxTokens(selected)}
+          {#if supportsMaxTokens(selected) && !['kugelaudio', 'crisperwhisper', 'audio_flamingo', 'owsm'].includes(selected.family)}
             <div>
               <label for="tokens">{tr('request.maxTokens')}</label>
-              <input id="tokens" type="number" min="1" bind:value={maxTokens} />
+              {#if selected.family in asrTokenDefaults}
+                <input id="tokens" type="number" min={selected.family === 'canary_asr' ? 0 : 1}
+                  max={selected.family === 'canary_asr' ? 1015 : selected.family === 'cohere_asr' ? 1014 : undefined}
+                  bind:value={asrMaxTokens} />
+              {:else}
+                <input id="tokens" type="number" min="1" bind:value={maxTokens} />
+              {/if}
             </div>
           {/if}
           {#if selected.task === 'gen' && !replacesGenericControls.duration}
@@ -2351,7 +2888,7 @@
           {/if}
         </div>
 
-            {#if acceptsSource}
+            {#if acceptsSource && selected.family !== 'liveavatar'}
               <label for="source">{tr('request.sourceAudio')} {needsSource ? '' : `(${tr('request.optional')})`}</label>
               <input id="source" class="file file-native" type="file" accept="audio/*"
                 bind:this={sourceInput}
@@ -2398,18 +2935,18 @@
               <MediaPreview file={videoFile} kind="video" label={tr('file.preview')} />
             {/if}
 
-            {#if needsVoice && !usesVibeVoiceSpeakerFiles}
+            {#if (needsVoice || selected.family === 'kugelaudio') && !usesVibeVoiceSpeakerFiles}
           {#if allowsQuickStartVoice && quickStartVoices.length}
-            <label for="quick-start-voice">{server?.ui_management === false ? tr('voice.configured') : tr('voice.quickStart')}</label>
+            <label for="quick-start-voice">{selected.family === 'kugelaudio' ? 'Voice preset' : server?.ui_management === false ? tr('voice.configured') : tr('voice.quickStart')}</label>
             <select id="quick-start-voice" value={quickStartVoice}
               on:change={(event) => chooseQuickStartVoice(event.currentTarget.value)}>
-              <option value="">{tr('voice.useReference')}</option>
+              {#if selected.family !== 'kugelaudio'}<option value="">{tr('voice.useReference')}</option>{/if}
               {#each quickStartVoices as voice}<option value={voice}>{voice}</option>{/each}
             </select>
             {#if quickStartVoice}
-              <div class="quick-voice-note">
+              {#if selected.family !== 'kugelaudio'}<div class="quick-voice-note">
                 {tr('voice.bundledNote')}
-              </div>
+              </div>{/if}
               {#if quickStartVoicePreview}
                 <MediaPreview src={quickStartVoicePreview} name={quickStartVoice} kind="audio" label={tr('file.preview')} />
               {/if}
@@ -2424,13 +2961,15 @@
                   on:change={(event) => chooseVoiceReference(event.currentTarget.files?.[0] || null)} />
                 <label class="file-picker" for="voice"><strong>{tr('file.choose')}</strong><span>{voiceFile?.name || tr('file.none')}</span></label>
               </div>
-              <div>
-                <label for="reference-file">{tr('voice.referenceText')} <span>.txt</span></label>
-                <input id="reference-file" class="file file-native" type="file" accept=".txt,text/plain"
-                  bind:this={referenceTextInput}
-                  on:change={(event) => chooseReferenceText(event.currentTarget.files?.[0] || null)} />
-                <label class="file-picker" for="reference-file"><strong>{tr('file.choose')}</strong><span>{referenceTextFile?.name || tr('file.none')}</span></label>
-              </div>
+              {#if selected.family !== 'auk'}
+                <div>
+                  <label for="reference-file">{tr('voice.referenceText')} <span>.txt</span></label>
+                  <input id="reference-file" class="file file-native" type="file" accept=".txt,text/plain"
+                    bind:this={referenceTextInput}
+                    on:change={(event) => chooseReferenceText(event.currentTarget.files?.[0] || null)} />
+                  <label class="file-picker" for="reference-file"><strong>{tr('file.choose')}</strong><span>{referenceTextFile?.name || tr('file.none')}</span></label>
+                </div>
+              {/if}
             </div>
           {/if}
           {#if !usesBuiltInVoiceSelector || !quickStartVoice}
@@ -2450,11 +2989,13 @@
           {/if}
           {#if !usesBuiltInVoiceSelector || !quickStartVoice}
             <MediaPreview file={voiceFile} kind="audio" label={tr('file.preview')} />
-            <label for="reference">{tr('voice.transcript')}
-              <span>{referenceTextRequired ? tr('voice.requiredClone') : tr('voice.recommendedClone')}</span>
-            </label>
-            <textarea id="reference" rows="2" bind:value={referenceText}
-              placeholder={tr('voice.transcriptPlaceholder')}></textarea>
+            {#if selected.family !== 'auk'}
+              <label for="reference">{tr('voice.transcript')}
+                <span>{referenceTextRequired ? tr('voice.requiredClone') : tr('voice.recommendedClone')}</span>
+              </label>
+              <textarea id="reference" rows="2" bind:value={referenceText}
+                placeholder={tr('voice.transcriptPlaceholder')}></textarea>
+            {/if}
           {/if}
           <!--
             Saved voices keep a named reference recording and transcript for reuse. They are persisted only
@@ -2506,6 +3047,11 @@
                 </div>
               {/each}
             </div>
+            {#if selected.family === 'moss_ttsd'}
+              <label for="dialogue-reference">Reference transcript</label>
+              <textarea id="dialogue-reference" rows="2" bind:value={referenceText}
+                placeholder="[S1] Words spoken in Speaker 1's reference. [S2] Words spoken in Speaker 2's reference."></textarea>
+            {/if}
           </div>
         {/if}
 
@@ -2558,7 +3104,7 @@
         {/if}
 
         <div class="runbar">
-          <button class="run" disabled={!selectedId || running || (usesYue2Request && loraUploading) || (!isLoaded && installed === false)} on:click={run}
+          <button class="run" disabled={!selectedId || running || restoringHistory || modelPanelUploading || (!isLoaded && installed === false)} on:click={run}
             title={!selectedId ? 'Choose an installed model first' : !isLoaded && installed === false ? 'Install this model from the Models tab first' : ''}>
             <span>{running ? tr('run.working') : tr('run.run')}</span>
             <kbd>Ctrl ↵</kbd>
@@ -2566,7 +3112,10 @@
           <button disabled={!running} on:click={cancel}>{tr('run.cancel')}</button>
           <div class="status" class:busy={running}
             class:warning={!running && status === warningStatus}
-            class:error={!running && status === errorStatus}>{localizedStatus(status, tr)}</div>
+            class:error={!running && status === errorStatus}>
+            {#if running}<strong style="font-variant-numeric: tabular-nums" aria-label="Elapsed generation time">{generationElapsedSeconds.toFixed(1)} s · </strong>{/if}
+            {localizedStatus(status, tr)}
+          </div>
         </div>
         {:else}
           <div class="section-title">
@@ -2581,13 +3130,35 @@
       <section class="panel output">
         <div class="section-title">
           <div><span>{tr('result.label')}</span><h2>{tr('result.title')}</h2></div>
+          {#if outputSettings}<a class="settings-download" href={outputSettings.url} download={outputSettings.filename}>Save settings JSON</a>{/if}
           {#if outputAudio.length}<span class="task-chip">{outputAudio.length} {outputAudio.length === 1 ? tr('result.track') : tr('result.tracks')}</span>{/if}
         </div>
+        {#if generationHistory.length}
+          <details class="generation-history">
+            <summary>Run history (Experimental) <span>{generationHistory.length}/{$uiConfiguration.historyLimit}</span></summary>
+            {#if historyError}<div class="history-error" role="alert">{historyError}</div>{/if}
+            <div class="history-actions"><button type="button" disabled={restoringHistory} on:click={clearGenerationHistory}>Clear history</button></div>
+            <ul>
+              {#each generationHistory as entry (entry.id)}
+                <li class:active={selectedGenerationId === entry.id}>
+                  <button type="button" class="history-select" aria-pressed={selectedGenerationId === entry.id}
+                    disabled={restoringHistory} on:click={() => selectGeneration(entry, true)}>
+                    <strong>{entry.label}</strong>
+                    <small>{new Date(entry.createdAt).toLocaleTimeString()} · {localizedTaskLabel(entry.task)}{#if ['gen', 'tts', 'clon', 'vdes'].includes(entry.task)} · Seed {entry.seed}{/if}</small>
+                  </button>
+                  <button type="button" title={`Delete generation ${entry.id}`}
+                    disabled={restoringHistory}
+                    aria-label={`Delete generation ${entry.id}`} on:click={() => deleteGeneration(entry.id)}>Delete</button>
+                </li>
+              {/each}
+            </ul>
+          </details>
+        {/if}
         {#if outputAudio.length}
           <div class="audio-list">
             {#each outputAudio as output}
               <article>
-                <div><strong>{output.id}</strong><a href={output.url} download={`${selected.id}-${output.id}.wav`}>{tr('result.saveWav')}</a></div>
+                <div><strong>{output.id}</strong><a href={output.url} download={`${outputModelId}-${selectedGenerationId || 'output'}-${output.id}.wav`}>{tr('result.saveWav')}</a></div>
                 <audio controls src={output.url}></audio>
               </article>
             {/each}
@@ -2597,7 +3168,11 @@
           <div class="audio-list">
             {#each outputArtifacts as artifact}
               <article>
-                <div><strong>{artifact.id}</strong><a href={artifact.url} download={`${selected.id}-${artifact.id}.${artifact.extension}`}>Save {artifact.extension.toUpperCase()}</a></div>
+                <div><strong>{artifact.id}</strong><a href={artifact.url} download={`${outputModelId}-${selectedGenerationId || 'output'}-${artifact.id}.${artifact.extension}`}>Save {artifact.extension.toUpperCase()}</a></div>
+                {#if artifact.mime.startsWith('video/')}
+                  <MediaPreview src={artifact.url} name={`${selected.id}-${artifact.id}.${artifact.extension}`}
+                    kind="video" label="Video preview" />
+                {/if}
               </article>
             {/each}
           </div>
@@ -2669,9 +3244,9 @@
           class:selected={group.entries.some((entry) => entry.id === selectedId)}>
           <div class="model-icon">{group.entries[0].task.toUpperCase()}</div>
           <div class="model-copy family-copy">
-            <span>{group.entries.length} {group.entries.length === 1 ? tr('models.model') : tr('models.variants')}</span>
+            <span>{group.entries.length} {group.family === 'builtin_audio_utils' ? tr('models.tools') : group.entries.length === 1 ? tr('models.model') : tr('models.variants')}</span>
             <h3>{group.label}</h3>
-            <p>{group.entries.map((entry) => localizedTaskLabel(entry.task, tr)).filter((value, index, all) => all.indexOf(value) === index).join(' · ')}</p>
+            <p>{group.entries.map((entry) => localizedTaskLabel(entry.task, tr, entry)).filter((value, index, all) => all.indexOf(value) === index).join(' · ')}</p>
           </div>
           <div class="model-variant-list">
             {#each group.entries as entry}
@@ -2680,7 +3255,7 @@
               <section class="model-variant" class:selected-variant={entry.id === selectedId}>
                 <div class="variant-copy">
                   <strong>{entry.display_name}</strong>
-                  <span>{localizedTaskLabel(entry.task, tr)} · VRAM ~{entry.min_vram_gb || '?'} GB</span>
+                  <span>{localizedTaskLabel(entry.task, tr, entry)} · VRAM ~{entry.min_vram_gb || '?'} GB</span>
                 </div>
                 <div class="model-actions">
                   {#if packageChoices.length}
@@ -2750,6 +3325,8 @@
                         </div>
                       </div>
                     {/if}
+                  {:else if entry.weights_url}
+                    <a class="utility-weights-link" href={entry.weights_url} target="_blank" rel="noreferrer">Download SafeTensors weights</a>
                   {:else if (entry.install_packages || []).length}
                     <div class="shared-package-note">{tr('models.sharedPackage', { name: group.label })}</div>
                   {/if}
@@ -2763,6 +3340,8 @@
         </div>
       {/each}
     </section>
+  {:else if tab === 'configuration'}
+    <Configuration />
   {:else}
     <section class="page-head"><p class="eyebrow">{tr('runtime.eyebrow')}</p><h1>{tr('runtime.title')}</h1><p>{tr('runtime.subtitle')}</p></section>
     <section class="panel log-panel">

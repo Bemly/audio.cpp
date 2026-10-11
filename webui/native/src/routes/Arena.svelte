@@ -93,12 +93,12 @@
     demo_4_woman: 'demo_4_woman'
   };
 
-  $: arenaCatalog = activeCatalog.filter((entry) =>
+  $: arenaCatalog = activeCatalog.filter((entry) => entry.arena !== false && (
     arenaMode === 'tts'
       ? ['tts', 'clon'].includes(entry.task)
       : arenaMode === 'vc'
         ? entry.task === 'vc'
-        : entry.task === 'asr');
+        : entry.task === 'asr'));
   $: if (!arenaModelId || !arenaCatalog.some((entry) => entry.id === arenaModelId)) {
     arenaModelId = arenaCatalog[0]?.id || '';
   }
@@ -166,6 +166,13 @@
 
   function comparablePath(path: string) {
     return path.replace(/\\/g, '/').replace(/\/$/, '').toLowerCase();
+  }
+
+  // The server reports an absolute path. A bundled model has a relative catalog path.
+  function loadedPathMatches(requestedPath: string, loadedPath: string) {
+    const actual = comparablePath(loadedPath);
+    const expected = comparablePath(requestedPath);
+    return actual === expected || actual.endsWith(`/${expected}`);
   }
 
   function modelPathForChoice(entry: CatalogEntry, choice?: InstallPackageChoice) {
@@ -396,12 +403,12 @@
     }
     const path = modelPathForChoice(entry, choice);
     const resident = loadedModels.find((model) => model.id === entry.id && model.loaded &&
-      comparablePath(model.path) === comparablePath(path) &&
+      loadedPathMatches(path, model.path) &&
       (!choice || packageSessionOptionsMatch(entry, choice, model)));
     if (resident) return;
 
     const replaced = loadedModels.filter((model) => model.loaded &&
-      (model.id !== entry.id || comparablePath(model.path) !== comparablePath(path)));
+      (model.id !== entry.id || !loadedPathMatches(path, model.path)));
     for (const model of replaced) {
       await unloadModel(model.id);
     }
@@ -417,7 +424,7 @@
     });
     await refresh();
     if (!loadedModels.some((model) => model.id === entry.id && model.loaded &&
-      comparablePath(model.path) === comparablePath(path) &&
+      loadedPathMatches(path, model.path) &&
       (!choice || packageSessionOptionsMatch(entry, choice, model)))) {
       throw new Error(tr('arena.error.loadFailed'));
     }

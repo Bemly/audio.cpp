@@ -2,7 +2,7 @@
 
 #include "engine/framework/core/execution_context.h"
 #include "engine/framework/tokenizers/llama_bpe.h"
-#include "engine/models/chatterbox/s3gen_inference.h"
+#include "engine/framework/codecs/s3gen_runtime.h"
 #include "engine/community_models/chatterbox_turbo/assets.h"
 #include "engine/community_models/chatterbox_turbo/s3gen_turbo.h"
 #include "engine/community_models/chatterbox_turbo/t3_turbo_component.h"
@@ -28,13 +28,13 @@ struct ChatterboxTurboGenerateConfig {
 
 // Orchestrates the full Turbo TTS pipeline (T3 GPT2 backbone -> S3Gen meanflow decoder -> HiFT
 // vocoder) using only the built-in default voice baked into the T3 GGUF's `conds.*` tensors.
-class ChatterboxTurboTtsComponent {
+class ChatterboxTurboTTSComponent {
 public:
-    ChatterboxTurboTtsComponent(
+    ChatterboxTurboTTSComponent(
         std::shared_ptr<const ChatterboxTurboAssets> assets,
         const engine::core::ExecutionContext & execution_context);
 
-    engine::models::chatterbox::S3GenInferenceOutputs generate(
+    engine::codecs::s3gen::S3GenInferenceOutputs generate(
         const std::string & text,
         const ChatterboxTurboGenerateConfig & config) const;
 
@@ -45,7 +45,7 @@ private:
     std::shared_ptr<ChatterboxTurboS3Gen> s3gen_;
     std::vector<float> builtin_speaker_embedding_;
     std::vector<int32_t> builtin_cond_prompt_speech_tokens_;
-    engine::models::chatterbox::EmbedReferenceOutputs builtin_ref_dict_;
+    engine::codecs::s3gen::S3GenConditioning builtin_ref_dict_;
 };
 
 }  // namespace engine::community_models::chatterbox_turbo

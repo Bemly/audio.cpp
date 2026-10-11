@@ -1,6 +1,8 @@
 #include "file_sink.h"
 
 #include "engine/framework/audio/output.h"
+#include "engine/framework/core/host_memory.h"
+#include "engine/framework/io/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -22,15 +24,7 @@ struct MetricsAudioView {
 };
 
 std::string quote_json(const std::string & value) {
-    std::string out = "\"";
-    for (char ch : value) {
-        if (ch == '\\' || ch == '"') {
-            out.push_back('\\');
-        }
-        out.push_back(ch);
-    }
-    out.push_back('"');
-    return out;
+    return engine::io::json::stringify_string(value);
 }
 
 std::string speech_segments_to_json(const std::vector<engine::runtime::SpeechSegment> & segments) {
@@ -167,15 +161,43 @@ std::optional<std::filesystem::path> suffixed_json_path(
     return base->parent_path() / (base->stem().string() + "_" + request_id + base->extension().string());
 }
 
+// FIFOs, /dev/stdout and other char/socket special files can't go through
+// the temp-file + rename dance below: rename() would unlink the special
+// file and replace it with a plain regular file, so nothing ever reaches
+// whatever has the other end open (e.g. `aplay` reading from a pipe).
+// WavSink::write() itself is a single sequential pass with no seeking
+// (the RIFF/data sizes are computed up front from the in-memory buffer),
+// so it's safe to write straight to a special file.
+bool is_special_output_target(const std::filesystem::path & path) {
+    std::error_code ec;
+    const auto status = std::filesystem::status(path, ec);
+    if (ec) {
+        return false;
+    }
+    switch (status.type()) {
+        case std::filesystem::file_type::fifo:
+        case std::filesystem::file_type::character:
+        case std::filesystem::file_type::socket:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void write_wav_output(
     const std::filesystem::path & path,
-    const engine::audio::AudioBuffer & audio) {
+    const engine::audio::AudioBuffer & audio,
+    const engine::audio::WavWriteOptions & wav_options) {
+    if (is_special_output_target(path)) {
+        engine::audio::WavSink(wav_options).write(path, audio);
+        return;
+    }
     if (!path.parent_path().empty()) {
         std::filesystem::create_directories(path.parent_path());
     }
     const auto tmp = path.parent_path() / (path.filename().string() + ".tmp");
     std::filesystem::remove(tmp);
-    engine::audio::WavPcm16Sink().write(tmp, audio);
+    engine::audio::WavSink(wav_options).write(tmp, audio);
     if (std::filesystem::exists(path)) {
         std::filesystem::remove(path);
     }
@@ -239,6 +261,10 @@ std::string batch_manifest_to_json(const AppBatchResult & batch) {
         }
         const auto & item = batch.results[i];
         out << "{\"id\":" << quote_json(item.id);
+        if (item.result.custom_schema_output.has_value()) {
+            out << ",\"custom_schema_output\":{\"schema\":" << quote_json(item.result.custom_schema_output->schema)
+                << ",\"data\":" << engine::io::json::stringify(item.result.custom_schema_output->data) << "}";
+        }
         if (item.result.audio_output.has_value()) {
             out << ",\"sample_rate\":" << item.result.audio_output->sample_rate
                 << ",\"channels\":" << item.result.audio_output->channels
@@ -295,6 +321,16 @@ void emit_task_metrics(
     double wall_ms,
     const std::string & prefix) {
     std::cout << prefix << ".wall_ms=" << wall_ms << "\n";
+    // Process-wide high-water marks, so in a batch every item reports the
+    // peak reached so far, not its own.
+    const auto peak = engine::core::process_memory_peak();
+    if (peak.rss_bytes > 0) {
+        std::cout << prefix << ".memory.peak_rss_mb=" << (peak.rss_bytes >> 20) << "\n";
+    }
+    if (peak.footprint_bytes > 0) {
+        std::cout << prefix << ".memory.peak_footprint_mb=" << (peak.footprint_bytes >> 20) << "\n";
+        std::cout << prefix << ".memory.peak_footprint_source=" << peak.footprint_source << "\n";
+    }
     const auto audio = select_metrics_audio(result, input_audio);
     if (!audio.has_value()) {
         return;
@@ -320,13 +356,14 @@ void emit_task_result(
     const std::optional<std::filesystem::path> & artifact_out_dir,
     const std::optional<std::filesystem::path> & segments_out,
     const std::optional<std::filesystem::path> & turns_out,
-    const std::optional<std::filesystem::path> & words_out) {
+    const std::optional<std::filesystem::path> & words_out,
+    const engine::audio::WavWriteOptions & wav_options) {
     if (result.audio_output.has_value() && audio_out.has_value()) {
         write_wav_output(*audio_out, engine::audio::AudioBuffer{
             result.audio_output->sample_rate,
             result.audio_output->channels,
             result.audio_output->samples,
-        });
+        }, wav_options);
         std::cout << "audio_out=" << audio_out->string() << "\n";
     } else if (!result.named_audio_outputs.empty() && audio_out.has_value()) {
         if (result.named_audio_outputs.size() != 1) {
@@ -337,7 +374,7 @@ void emit_task_result(
             audio.sample_rate,
             audio.channels,
             audio.samples,
-        });
+        }, wav_options);
         std::cout << "audio_out=" << audio_out->string() << "\n";
     } else if (result.artifact_output.has_value() && audio_out.has_value()) {
         write_artifact_output(*audio_out, *result.artifact_output);
@@ -353,7 +390,7 @@ void emit_task_result(
                     output.audio.sample_rate,
                     output.audio.channels,
                     output.audio.samples,
-                });
+                }, wav_options);
                 std::cout << "audio_out[" << output.id << "]=" << path.string() << "\n";
             }
         } else {
@@ -409,6 +446,11 @@ void emit_task_result(
 
     if (result.text_output.has_value()) {
         std::cout << "text_output=" << result.text_output->text << "\n";
+    }
+    if (result.custom_schema_output.has_value()) {
+        std::cout << "custom_schema_output={\"schema\":" << quote_json(result.custom_schema_output->schema)
+                  << ",\"data\":" << engine::io::json::stringify(result.custom_schema_output->data)
+                  << "}\n";
     }
     if (result.artifact_output.has_value()) {
         const auto & artifact = *result.artifact_output;
@@ -466,7 +508,7 @@ void emit_batch_summary(
             batch.merged_audio->sample_rate,
             batch.merged_audio->channels,
             batch.merged_audio->samples,
-        });
+        }, policy.wav_options);
         std::cout << "merged_audio_out=" << policy.audio_out->string() << "\n";
     }
 
@@ -512,7 +554,8 @@ void emit_batch_item_result(
         artifact_out_dir,
         suffixed_json_path(policy.segments_base, request_id),
         suffixed_json_path(policy.turns_base, request_id),
-        suffixed_json_path(policy.words_base, request_id));
+        suffixed_json_path(policy.words_base, request_id),
+        policy.wav_options);
 }
 
 }  // namespace minitts::app

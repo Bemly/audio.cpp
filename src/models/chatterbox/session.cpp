@@ -5,7 +5,7 @@
 #include "engine/framework/runtime/options.h"
 #include "engine/framework/text/chunking.h"
 #include "engine/models/chatterbox/components.h"
-#include "engine/models/chatterbox/s3gen_flow.h"
+#include "engine/framework/codecs/s3gen_runtime.h"
 
 #include <chrono>
 #include <cmath>
@@ -150,7 +150,7 @@ ChatterboxPromptPrepConfig make_prompt_prep_config(const runtime::SessionOptions
     return config;
 }
 
-std::unique_ptr<ChatterboxTtsComponent> make_chatterbox_component_for_language(
+std::unique_ptr<ChatterboxTTSComponent> make_chatterbox_component_for_language(
     const ChatterboxAssets & assets,
     const runtime::SessionOptions & options,
     const engine::core::ExecutionContext & execution_context,
@@ -179,38 +179,28 @@ std::unique_ptr<ChatterboxTtsComponent> make_chatterbox_component_for_language(
         *assets.s3gen_weights,
         execution_context,
         component_weight_storage_type);
-    auto flow_encoder = load_s3_flow_encoder_weights(
-        *assets.s3gen_weights,
-        execution_context,
-        component_weight_storage_type);
-    auto flow_decoder = load_s3_flow_decoder_weights(
-        *assets.s3gen_weights,
-        execution_context,
-        component_weight_storage_type);
-    auto hift = HiFTVocoderComponent::load_from_source(
-        assets.s3gen_weights,
-        execution_context,
-        component_weight_storage_type);
+    engine::codecs::s3gen::S3GenConfig s3gen_config;
+    auto s3gen = std::make_unique<engine::codecs::s3gen::S3GenRuntime>(
+        assets.s3gen_weights, execution_context, s3gen_config,
+        engine::codecs::s3gen::S3GenRuntimeOptions{component_weight_storage_type});
     auto campplus_encoder = CAMPPlusEncoderComponent::load_from_source(
         assets.s3gen_weights,
         execution_context,
         component_weight_storage_type);
     release_tensor_storage(assets);
-    return std::make_unique<ChatterboxTtsComponent>(
+    return std::make_unique<ChatterboxTTSComponent>(
         std::move(t3_weights),
         std::move(tokenizer),
         std::move(voice_encoder),
         std::move(s3_tokenizer),
         std::move(campplus_encoder),
-        std::move(flow_encoder),
-        std::move(flow_decoder),
-        std::move(hift),
+        std::move(s3gen),
         make_prompt_prep_config(options),
         execution_context,
         mem_saver);
 }
 
-std::unique_ptr<ChatterboxVcComponent> make_chatterbox_vc_component(
+std::unique_ptr<ChatterboxVCComponent> make_chatterbox_vc_component(
     const ChatterboxAssets & assets,
     const runtime::SessionOptions & options,
     const engine::core::ExecutionContext & execution_context,
@@ -220,31 +210,20 @@ std::unique_ptr<ChatterboxVcComponent> make_chatterbox_vc_component(
         *assets.s3gen_weights,
         execution_context,
         component_weight_storage_type);
-    auto flow_encoder = load_s3_flow_encoder_weights(
-        *assets.s3gen_weights,
-        execution_context,
-        component_weight_storage_type);
-    auto flow_decoder = load_s3_flow_decoder_weights(
-        *assets.s3gen_weights,
-        execution_context,
-        component_weight_storage_type);
-    auto hift = HiFTVocoderComponent::load_from_source(
-        assets.s3gen_weights,
-        execution_context,
-        component_weight_storage_type);
+    engine::codecs::s3gen::S3GenConfig s3gen_config;
+    auto s3gen = std::make_unique<engine::codecs::s3gen::S3GenRuntime>(
+        assets.s3gen_weights, execution_context, s3gen_config,
+        engine::codecs::s3gen::S3GenRuntimeOptions{component_weight_storage_type});
     auto campplus_encoder = CAMPPlusEncoderComponent::load_from_source(
         assets.s3gen_weights,
         execution_context,
         component_weight_storage_type);
     release_tensor_storage(assets);
-    return std::make_unique<ChatterboxVcComponent>(
+    return std::make_unique<ChatterboxVCComponent>(
         std::move(s3_tokenizer),
         std::move(campplus_encoder),
-        std::move(flow_encoder),
-        std::move(flow_decoder),
-        std::move(hift),
+        std::move(s3gen),
         make_prompt_prep_config(options),
-        execution_context,
         mem_saver);
 }
 

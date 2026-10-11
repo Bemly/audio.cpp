@@ -2,14 +2,19 @@
 
 | Model | Family | Task | Quick Start |
 |---|---|---|---|
+| AST AudioSet | `ast_audioset` | `cls` | [Model guide](models/ast_audioset.md) |
+| microWakeWord | `micro_wake_word` | `wake` | [Model guide](models/micro_wake_word.md) |
+| sherpa-onnx Zipformer KWS | `sherpa_kws` | `wake` | [Model guide](models/sherpa_kws.md) |
 | Silero VAD | `silero_vad` | `vad` | [Silero VAD](#silero-vad) |
 | MarbleNet VAD | `marblenet_vad` | `vad` | [MarbleNet VAD](#marblenet-vad) |
+| PulseVAD | `pulsevad` | `vad` | [PulseVAD](models/pulsevad.md) |
 | Sortformer Diarization | `sortformer_diar` | `diar` | [Sortformer Diarization](#sortformer-diarization) |
 | Sortformer Diarization v2.1 | `sortformer_diar_v2` | `diar` | [Sortformer Diarization v2.1](#sortformer-diarization-v21) |
+| Nemotron 3 Diarization | `nemotron_3_diar` | `diar` | [Model guide](models/nemotron_3_diar.md) |
 | MMS Forced Aligner | `mms_forced_aligner` | `align` | [MMS Forced Aligner](#mms-forced-aligner) |
 | Qwen3 Forced Aligner | `qwen3_forced_aligner` | `align` | [Qwen3 Forced Aligner](models/qwen3.md#qwen3-forced-aligner) |
 
-This page covers VAD, diarization, and forced-aligner models. ASR models are documented in [ASR models](asr.md).
+This page covers audio classification, VAD, diarization, and forced-aligner models. ASR models are documented in [ASR models](asr.md).
 
 Common CLI shape:
 

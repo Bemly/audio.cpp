@@ -26,6 +26,9 @@ constexpr TaskVocabularyEntry kVocabulary[] = {
     {VoiceTaskKind::SpeakerRecognition, "spk", {"speaker"}, 1},
     {VoiceTaskKind::Svc, "svc", {"svc"}, 1},
     {VoiceTaskKind::Midi, "midi", {"midi"}, 1},
+    {VoiceTaskKind::TurnDetection, "turn", {"turn"}, 1},
+    {VoiceTaskKind::WakeWord, "wake", {"wake_word"}, 1},
+    {VoiceTaskKind::AudioClassification, "cls", {"classify"}, 1},
 };
 
 /// Compile-time exhaustiveness, kept deliberately.
@@ -55,6 +58,9 @@ constexpr bool vocabulary_is_exhaustive(VoiceTaskKind kind) {
     case VoiceTaskKind::SpeakerRecognition:
     case VoiceTaskKind::Svc:
     case VoiceTaskKind::Midi:
+    case VoiceTaskKind::TurnDetection:
+    case VoiceTaskKind::WakeWord:
+    case VoiceTaskKind::AudioClassification:
         return true;
     }
     return false;

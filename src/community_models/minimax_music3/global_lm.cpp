@@ -25,20 +25,20 @@ void validate_storage_type(assets::TensorStorageType storage_type) {
     }
 }
 
-modules::QwenDecoderActivationCastPolicy activation_cast_policy(core::BackendType backend_type) {
-    modules::QwenDecoderActivationCastPolicy policy;
+modules::DecoderActivationCastPolicy activation_cast_policy(core::BackendType backend_type) {
+    modules::DecoderActivationCastPolicy policy;
     (void)backend_type;
     return policy;
 }
 
-modules::QwenDecoderLayerWeights load_qwen_layer(
+modules::DecoderLayerWeights load_qwen_layer(
     core::BackendWeightStore & store,
     const assets::TensorSource & source,
     const MiniMaxMusic3QwenConfig & config,
     assets::TensorStorageType storage_type,
     int64_t layer) {
     const std::string prefix = "model.layers." + std::to_string(layer);
-    modules::QwenDecoderLayerWeights out;
+    modules::DecoderLayerWeights out;
     out.input_norm = binding::norm_weight_from_source(store, source, prefix + ".input_layernorm", config.hidden_size);
     out.self_attention.q_weight = store.load_tensor(
         source,
@@ -122,13 +122,13 @@ int64_t minimax_music3_lm_head_output_size(
     return vocab_size;
 }
 
-modules::QwenCausalDecodeRuntimeConfig make_minimax_music3_global_lm_runtime_config(
+modules::CausalDecoderRuntimeConfig make_minimax_music3_global_lm_runtime_config(
     const MiniMaxMusic3Config & config,
     MiniMaxMusic3LmHeadLayout lm_head_layout,
     core::BackendType backend_type,
     size_t prefill_graph_arena_bytes,
     size_t decode_graph_arena_bytes) {
-    modules::QwenCausalDecodeRuntimeConfig out;
+    modules::CausalDecoderRuntimeConfig out;
     out.trace_name = "minimax_music3.ar";
     out.prefill_graph_arena_bytes = prefill_graph_arena_bytes;
     out.decode_graph_arena_bytes = decode_graph_arena_bytes;
@@ -148,13 +148,13 @@ modules::QwenCausalDecodeRuntimeConfig make_minimax_music3_global_lm_runtime_con
     // Metal without the FA-RDNA2 kernels has no flash kernel: fall back to
     // the manual path instead of emitting an unsupported op.
     const auto attn_mode = (backend_type == core::BackendType::Metal && !core::metal_fa_rdna2_enabled())
-        ? modules::QwenDecoderAttentionMode::ManualRepeat
-        : modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+        ? modules::DecoderAttentionMode::ManualRepeat
+        : modules::DecoderAttentionMode::FlashGroupedViewKV;
     out.decoder.stack.runtime.attention.prefill_mode = attn_mode;
     out.decoder.stack.runtime.attention.static_mode = attn_mode;
-    out.decoder.stack.runtime.static_cache.update_mode = modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
+    out.decoder.stack.runtime.static_cache.update_mode = modules::DecoderStaticCacheUpdateMode::DirectSetRows;
     out.decoder.stack.runtime.static_cache.set_rows_mode =
-        modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;
+        modules::DecoderStaticCacheSetRowsMode::BackendViewOptimized;
     if (backend_type == core::BackendType::Cuda || backend_type == core::BackendType::Hip ||
         backend_type == core::BackendType::Vulkan || backend_type == core::BackendType::Metal) {
         // Metal joins the F16 side: FA-RDNA2 reads F16 KV directly (Q stays
@@ -162,7 +162,7 @@ modules::QwenCausalDecodeRuntimeConfig make_minimax_music3_global_lm_runtime_con
         out.decoder.static_cache_type = GGML_TYPE_F16;
     }
     out.decoder.logits_size = minimax_music3_lm_head_output_size(lm_head_layout, config.qwen.vocab_size);
-    out.decoder.logits_mode = modules::QwenCausalDecoderLogitsMode::LastStep;
+    out.decoder.logits_mode = modules::CausalDecoderLogitsMode::LastStep;
     out.decoder.lm_head_precision = GGML_PREC_DEFAULT;
     out.readback_round_type = GGML_TYPE_BF16;
     if (backend_type == core::BackendType::Metal) {
@@ -175,7 +175,7 @@ modules::QwenCausalDecodeRuntimeConfig make_minimax_music3_global_lm_runtime_con
     return out;
 }
 
-MiniMaxMusic3GlobalLMWeights load_minimax_music3_global_lm_weights(
+MiniMaxMusic3Qwen3GlobalLMWeights load_minimax_music3_global_lm_weights(
     const MiniMaxMusic3Assets & assets,
     core::ExecutionContext & execution,
     size_t weight_context_bytes,
@@ -183,7 +183,7 @@ MiniMaxMusic3GlobalLMWeights load_minimax_music3_global_lm_weights(
     validate_storage_type(storage_type);
     const auto & config = assets.config.qwen;
     const auto & source = *assets.language_model_weights;
-    MiniMaxMusic3GlobalLMWeights out;
+    MiniMaxMusic3Qwen3GlobalLMWeights out;
     out.lm_head_layout = classify_minimax_music3_lm_head_shape(
         source.require_metadata("lm_head.weight").shape,
         config.vocab_size,

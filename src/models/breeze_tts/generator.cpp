@@ -4,7 +4,7 @@
 #include "engine/framework/core/backend_weight_store.h"
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/modules/linear_module.h"
-#include "engine/framework/modules/transformers/qwen_causal_decode_runtime.h"
+#include "engine/framework/modules/transformers/causal_decoder_runtime.h"
 #include "engine/framework/modules/weight_binding.h"
 #include "engine/framework/sampling/hf_sampler.h"
 #include "engine/framework/sampling/torch_random.h"
@@ -51,18 +51,36 @@ struct GgmlContextDeleter {
 // The official Breeze-TTS 2 inference runs the backbone and depth decoder with
 // bf16 activations and a bf16 KV cache. Pure fp32 activations measurably drift
 // into degenerate trajectories on some prompts (mispronunciations, repetition
-// collapse), so match the reference bf16 behavior on GPU backends.
-modules::QwenDecoderActivationCastPolicy breeze_bf16_activation_policy(core::BackendType backend_type) {
-    modules::QwenDecoderActivationCastPolicy policy;
-    if (backend_type != core::BackendType::Cuda && backend_type != core::BackendType::Hip &&
-        backend_type != core::BackendType::Vulkan) {
+// collapse), which is why CUDA/HIP/Vulkan match the reference bf16 behavior by
+// default. Metal needs the fused round-to-bf16 unary op to make that affordable,
+// and even with it the casts cost a visible share of the AR loop there, so on
+// Metal the reference path stays opt-in (`bf16_activations=on`).
+bool bf16_reference_enabled(Bf16ActivationMode mode, core::BackendType backend_type) {
+    switch (mode) {
+        case Bf16ActivationMode::On:
+            return true;
+        case Bf16ActivationMode::Off:
+            return false;
+        case Bf16ActivationMode::Auto:
+            break;
+    }
+    return backend_type != core::BackendType::Metal;
+}
+
+bool gpu_bf16_capable(core::BackendType backend_type) {
+    return backend_type == core::BackendType::Cuda || backend_type == core::BackendType::Hip ||
+           backend_type == core::BackendType::Vulkan || backend_type == core::BackendType::Metal;
+}
+
+modules::DecoderActivationCastPolicy breeze_bf16_activation_policy(core::BackendType backend_type) {
+    modules::DecoderActivationCastPolicy policy;
+    if (!gpu_bf16_capable(backend_type)) {
         return policy;
     }
     policy.enabled = true;
     policy.type = GGML_TYPE_BF16;
-    // CUDA/HIP/Vulkan implement the fused round-to-bf16 unary op.
-    policy.fused_round = backend_type == core::BackendType::Cuda || backend_type == core::BackendType::Hip ||
-        backend_type == core::BackendType::Vulkan;
+    // CUDA/HIP/Vulkan/Metal all implement the fused round-to-bf16 unary op.
+    policy.fused_round = true;
     policy.after_input_norm = true;
     policy.after_qkv_projection = true;
     policy.after_qk_norm = true;
@@ -79,12 +97,13 @@ modules::QwenDecoderActivationCastPolicy breeze_bf16_activation_policy(core::Bac
     return policy;
 }
 
-modules::QwenCausalDecodeRuntimeConfig backbone_config(
+modules::CausalDecoderRuntimeConfig backbone_config(
     const BreezeTTSConfig & config,
     core::BackendType backend_type,
     size_t graph_arena_bytes,
-    bool allow_flash_attention = true) {
-    modules::QwenCausalDecodeRuntimeConfig out;
+    bool allow_flash_attention = true,
+    bool bf16_reference = true) {
+    modules::CausalDecoderRuntimeConfig out;
     out.trace_name = "breeze_tts.backbone";
     out.prefill_graph_arena_bytes = graph_arena_bytes;
     out.decode_graph_arena_bytes = graph_arena_bytes;
@@ -98,33 +117,37 @@ modules::QwenCausalDecodeRuntimeConfig backbone_config(
     out.decoder.stack.rope_theta = config.rope_theta;
     out.decoder.stack.rope_type = GGML_ROPE_TYPE_NEOX;
     out.decoder.stack.use_qk_norm = true;
-    out.decoder.stack.qkv_layout = modules::QwenDecoderQKVLayout::PackedQKV;
-    out.decoder.stack.runtime.mlp.mode = modules::QwenDecoderMLPMode::PackedGateUp;
+    out.decoder.stack.qkv_layout = modules::DecoderQKVLayout::PackedQKV;
+    out.decoder.stack.runtime.mlp.mode = modules::DecoderMLPMode::PackedGateUp;
     out.decoder.stack.attention_precision = GGML_PREC_F32;
     out.decoder.stack.projection_precision = GGML_PREC_DEFAULT;
     // Eager graph for GPUs without a flash kernel (e.g. sm70).
     out.decoder.stack.runtime.attention.allow_flash_attention = allow_flash_attention;
     if (allow_flash_attention) {
-        out.decoder.stack.runtime.attention.prefill_mode = modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
-        out.decoder.stack.runtime.attention.static_mode = modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+        out.decoder.stack.runtime.attention.prefill_mode = modules::DecoderAttentionMode::FlashGroupedViewKV;
+        out.decoder.stack.runtime.attention.static_mode = modules::DecoderAttentionMode::FlashGroupedViewKV;
     } else {
-        out.decoder.stack.runtime.attention.prefill_mode = modules::QwenDecoderAttentionMode::ManualRepeat;
-        out.decoder.stack.runtime.attention.static_mode = modules::QwenDecoderAttentionMode::ManualRepeat;
+        out.decoder.stack.runtime.attention.prefill_mode = modules::DecoderAttentionMode::ManualRepeat;
+        out.decoder.stack.runtime.attention.static_mode = modules::DecoderAttentionMode::ManualRepeat;
     }
-    out.decoder.stack.runtime.static_cache.update_mode = modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
-    out.decoder.stack.runtime.static_cache.set_rows_mode = modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;
-    if (backend_type == core::BackendType::Cuda || backend_type == core::BackendType::Hip ||
-        backend_type == core::BackendType::Vulkan) {
+    out.decoder.stack.runtime.static_cache.update_mode = modules::DecoderStaticCacheUpdateMode::DirectSetRows;
+    out.decoder.stack.runtime.static_cache.set_rows_mode = modules::DecoderStaticCacheSetRowsMode::BackendViewOptimized;
+    if (gpu_bf16_capable(backend_type)) {
         // BF16 KV cache matches the reference implementation, but flash
         // attention only accelerates bf16 cache with native bf16 MMA
-        // (sm_80+); on older parts it is ~3x slower, so only HIP uses it.
+        // (sm_80+); on older parts it is ~3x slower, so only HIP always uses it.
+        // Metal uses bf16 only on the reference bf16 path (bf16_activations=on).
         out.decoder.static_cache_type =
-            backend_type == core::BackendType::Hip ? GGML_TYPE_BF16 : GGML_TYPE_F16;
-        out.decoder.stack.activation_cast = breeze_bf16_activation_policy(backend_type);
+            (backend_type == core::BackendType::Hip ||
+             (backend_type == core::BackendType::Metal && bf16_reference))
+                ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+        if (bf16_reference) {
+            out.decoder.stack.activation_cast = breeze_bf16_activation_policy(backend_type);
+        }
     }
     out.decoder.logits_size = config.lm_head_size;
-    out.decoder.logits_mode = modules::QwenCausalDecoderLogitsMode::LastStep;
-    out.output_mode = modules::QwenCausalDecodeOutputMode::Logits;
+    out.decoder.logits_mode = modules::CausalDecoderLogitsMode::LastStep;
+    out.output_mode = modules::CausalDecoderOutputMode::Logits;
     out.return_hidden = true;
     out.logits_readback_token_ids.reserve(static_cast<size_t>(config.lm_head_size));
     for (int32_t token = 0; token < static_cast<int32_t>(config.lm_head_size); ++token) {
@@ -134,12 +157,13 @@ modules::QwenCausalDecodeRuntimeConfig backbone_config(
     return out;
 }
 
-modules::QwenCausalDecodeRuntimeConfig depth_config(
+modules::CausalDecoderRuntimeConfig depth_config(
     const BreezeTTSConfig & config,
     core::BackendType backend_type,
     size_t graph_arena_bytes,
-    bool allow_flash_attention = true) {
-    modules::QwenCausalDecodeRuntimeConfig out;
+    bool allow_flash_attention = true,
+    bool bf16_reference = true) {
+    modules::CausalDecoderRuntimeConfig out;
     out.trace_name = "breeze_tts.depth_decoder";
     out.prefill_graph_arena_bytes = graph_arena_bytes;
     out.decode_graph_arena_bytes = graph_arena_bytes;
@@ -153,30 +177,33 @@ modules::QwenCausalDecodeRuntimeConfig depth_config(
     out.decoder.stack.rope_theta = config.depth_rope_theta;
     out.decoder.stack.rope_type = GGML_ROPE_TYPE_NEOX;
     out.decoder.stack.use_qk_norm = false;
-    out.decoder.stack.qkv_layout = modules::QwenDecoderQKVLayout::PackedQKV;
-    out.decoder.stack.runtime.mlp.mode = modules::QwenDecoderMLPMode::PackedGateUp;
+    out.decoder.stack.qkv_layout = modules::DecoderQKVLayout::PackedQKV;
+    out.decoder.stack.runtime.mlp.mode = modules::DecoderMLPMode::PackedGateUp;
     out.decoder.stack.attention_precision = GGML_PREC_F32;
     out.decoder.stack.projection_precision = GGML_PREC_DEFAULT;
     out.decoder.stack.runtime.attention.allow_flash_attention = allow_flash_attention;
     if (allow_flash_attention) {
-        out.decoder.stack.runtime.attention.prefill_mode = modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
-        out.decoder.stack.runtime.attention.static_mode = modules::QwenDecoderAttentionMode::FlashGroupedViewKV;
+        out.decoder.stack.runtime.attention.prefill_mode = modules::DecoderAttentionMode::FlashGroupedViewKV;
+        out.decoder.stack.runtime.attention.static_mode = modules::DecoderAttentionMode::FlashGroupedViewKV;
     } else {
-        out.decoder.stack.runtime.attention.prefill_mode = modules::QwenDecoderAttentionMode::ManualRepeat;
-        out.decoder.stack.runtime.attention.static_mode = modules::QwenDecoderAttentionMode::ManualRepeat;
+        out.decoder.stack.runtime.attention.prefill_mode = modules::DecoderAttentionMode::ManualRepeat;
+        out.decoder.stack.runtime.attention.static_mode = modules::DecoderAttentionMode::ManualRepeat;
     }
-    out.decoder.stack.runtime.static_cache.update_mode = modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
-    out.decoder.stack.runtime.static_cache.set_rows_mode = modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;
-    if (backend_type == core::BackendType::Cuda || backend_type == core::BackendType::Hip ||
-        backend_type == core::BackendType::Vulkan) {
-        // See backbone_config: only HIP uses a bf16 KV cache; CUDA and Vulkan
-        // keep F16.
+    out.decoder.stack.runtime.static_cache.update_mode = modules::DecoderStaticCacheUpdateMode::DirectSetRows;
+    out.decoder.stack.runtime.static_cache.set_rows_mode = modules::DecoderStaticCacheSetRowsMode::BackendViewOptimized;
+    if (gpu_bf16_capable(backend_type)) {
+        // See backbone_config: only HIP always uses a bf16 KV cache; Metal joins
+        // it on the reference bf16 path, CUDA and Vulkan keep F16.
         out.decoder.static_cache_type =
-            backend_type == core::BackendType::Hip ? GGML_TYPE_BF16 : GGML_TYPE_F16;
-        out.decoder.stack.activation_cast = breeze_bf16_activation_policy(backend_type);
+            (backend_type == core::BackendType::Hip ||
+             (backend_type == core::BackendType::Metal && bf16_reference))
+                ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+        if (bf16_reference) {
+            out.decoder.stack.activation_cast = breeze_bf16_activation_policy(backend_type);
+        }
     }
-    out.decoder.logits_mode = modules::QwenCausalDecoderLogitsMode::LastStep;
-    out.output_mode = modules::QwenCausalDecodeOutputMode::Hidden;
+    out.decoder.logits_mode = modules::CausalDecoderLogitsMode::LastStep;
+    out.output_mode = modules::CausalDecoderOutputMode::Hidden;
     out.return_hidden = true;
     return out;
 }
@@ -248,7 +275,7 @@ core::TensorValue pack_projection_rows(
         packed.size());
 }
 
-modules::QwenDecoderLayerWeights load_backbone_layer(
+modules::DecoderLayerWeights load_backbone_layer(
     core::BackendWeightStore & store,
     const assets::TensorSource & source,
     const BreezeTTSConfig & config,
@@ -258,7 +285,7 @@ modules::QwenDecoderLayerWeights load_backbone_layer(
     const std::string prefix = "backbone_model.layers." + std::to_string(layer);
     const int64_t q_out = config.heads * config.head_dim;
     const int64_t kv_out = config.kv_heads * config.head_dim;
-    modules::QwenDecoderLayerWeights out;
+    modules::DecoderLayerWeights out;
     out.input_norm = binding::norm_weight_from_source(store, source, prefix + ".input_layernorm", config.hidden_size);
     // Packed layout is [q; k; v] with row counts q_out, kv_out, kv_out.
     out.self_attention.qkv_weight = pack_projection_rows(
@@ -288,7 +315,7 @@ modules::QwenDecoderLayerWeights load_backbone_layer(
     return out;
 }
 
-modules::QwenDecoderLayerWeights load_depth_layer(
+modules::DecoderLayerWeights load_depth_layer(
     core::BackendWeightStore & store,
     const assets::TensorSource & source,
     const BreezeTTSConfig & config,
@@ -298,7 +325,7 @@ modules::QwenDecoderLayerWeights load_depth_layer(
     const std::string prefix = "depth_decoder.model.layers." + std::to_string(layer);
     const int64_t q_out = config.depth_heads * config.depth_head_dim;
     const int64_t kv_out = config.depth_kv_heads * config.depth_head_dim;
-    modules::QwenDecoderLayerWeights out;
+    modules::DecoderLayerWeights out;
     out.input_norm = binding::norm_weight_from_source(store, source, prefix + ".input_layernorm", config.depth_hidden_size);
     // Packed layout is [q; k; v] with row counts q_out, kv_out, kv_out.
     out.self_attention.qkv_weight = pack_projection_rows(
@@ -383,8 +410,8 @@ int32_t sample_logits(
 
 struct BreezeWeights {
     std::shared_ptr<core::BackendWeightStore> store;
-    modules::QwenCausalDecodeRuntimeWeights backbone;
-    modules::QwenCausalDecodeRuntimeWeights depth;
+    modules::CausalDecoderRuntimeWeights backbone;
+    modules::CausalDecoderRuntimeWeights depth;
     std::vector<float> audio_embedding;
     modules::LinearWeights depth_projector;
     core::TensorValue depth_heads;
@@ -395,7 +422,7 @@ std::shared_ptr<const BreezeWeights> load_weights(
     core::ExecutionContext & execution,
     size_t weight_context_bytes,
     assets::TensorStorageType storage_type,
-    const modules::QwenCausalDecodeRuntimeConfig & backbone_runtime_config) {
+    const modules::CausalDecoderRuntimeConfig & backbone_runtime_config) {
     auto out = std::make_shared<BreezeWeights>();
     out->store = std::make_shared<core::BackendWeightStore>(
         execution.backend(),
@@ -736,7 +763,8 @@ struct BreezeGeneratorRuntime::Impl {
         size_t graph_arena_bytes,
         size_t weight_context_bytes,
         assets::TensorStorageType storage_type,
-        core::AttentionPreference attention_preference = core::AttentionPreference::Auto)
+        core::AttentionPreference attention_preference = core::AttentionPreference::Auto,
+        Bf16ActivationMode bf16_activations = Bf16ActivationMode::Auto)
         : assets(std::move(assets)),
           execution(execution),
           tokenizer(this->assets),
@@ -757,12 +785,16 @@ struct BreezeGeneratorRuntime::Impl {
             execution.backend(), config.depth_head_dim, attention_preference);
         engine::debug::trace_log_scalar("breeze_tts.attention.allow_backbone_flash", allow_backbone_flash);
         engine::debug::trace_log_scalar("breeze_tts.attention.allow_depth_flash", allow_depth_flash);
-        backbone_runtime_config = backbone_config(config, execution.backend_type(), graph_arena_bytes, allow_backbone_flash);
-        depth_runtime_config = depth_config(config, execution.backend_type(), graph_arena_bytes, allow_depth_flash);
+        const bool bf16_reference = bf16_reference_enabled(bf16_activations, execution.backend_type());
+        engine::debug::trace_log_scalar("breeze_tts.bf16_activations", bf16_reference);
+        backbone_runtime_config = backbone_config(
+            config, execution.backend_type(), graph_arena_bytes, allow_backbone_flash, bf16_reference);
+        depth_runtime_config = depth_config(
+            config, execution.backend_type(), graph_arena_bytes, allow_depth_flash, bf16_reference);
         weights = load_weights(*this->assets, execution, weight_context_bytes, storage_type, backbone_runtime_config);
-        backbone_cond = std::make_unique<modules::QwenCausalDecodeRuntime>(execution, backbone_runtime_config, weights->backbone);
-        backbone_uncond = std::make_unique<modules::QwenCausalDecodeRuntime>(execution, backbone_runtime_config, weights->backbone);
-        depth_pair = std::make_unique<modules::QwenCausalDecodeRuntime>(execution, depth_runtime_config, weights->depth);
+        backbone_cond = std::make_unique<modules::CausalDecoderRuntime>(execution, backbone_runtime_config, weights->backbone);
+        backbone_uncond = std::make_unique<modules::CausalDecoderRuntime>(execution, backbone_runtime_config, weights->backbone);
+        depth_pair = std::make_unique<modules::CausalDecoderRuntime>(execution, depth_runtime_config, weights->depth);
         depth_projection = std::make_unique<BreezeDepthProjectionRuntime>(
             execution.backend(),
             execution.backend_type(),
@@ -867,7 +899,8 @@ struct BreezeGeneratorRuntime::Impl {
         sampling::HfSamplerScratch & scratch,
         std::mt19937 & fallback_rng,
         uint64_t & call_index,
-        uint64_t & offset_blocks) {
+        uint64_t & offset_blocks,
+        bool paired_depth = true) {
         const auto & config = assets->config;
         std::vector<int32_t> frame;
         frame.reserve(static_cast<size_t>(config.num_codebooks));
@@ -875,6 +908,9 @@ struct BreezeGeneratorRuntime::Impl {
 
         const size_t depth_hidden_size = static_cast<size_t>(config.depth_hidden_size);
         const size_t depth_hidden_bytes = depth_hidden_size * sizeof(float);
+        const int64_t depth_batch = paired_depth ? 2 : 1;
+        depth_prefill_staging_.resize(static_cast<size_t>(2 * depth_batch) * depth_hidden_size);
+        depth_next_pair_staging_.resize(static_cast<size_t>(depth_batch) * depth_hidden_size);
 
         const auto project_audio_embedding_row = [&](int64_t row, float * out) {
             const int64_t rows = config.num_codebooks * config.vocab_size;
@@ -888,10 +924,12 @@ struct BreezeGeneratorRuntime::Impl {
         };
 
         project_audio_embedding_row(first_token, depth_first_embed_staging_.data());
-        depth_projection->project_pair(
-            cond_hidden.data(),
-            uncond_hidden.data(),
-            depth_projected_pair_staging_.data());
+        if (paired_depth) {
+            depth_projection->project_pair(
+                cond_hidden.data(), uncond_hidden.data(), depth_projected_pair_staging_.data());
+        } else {
+            depth_projection->project_single(cond_hidden.data(), depth_projected_pair_staging_.data());
+        }
 
         std::memcpy(depth_prefill_staging_.data(),
                     depth_projected_pair_staging_.data(),
@@ -899,23 +937,25 @@ struct BreezeGeneratorRuntime::Impl {
         std::memcpy(depth_prefill_staging_.data() + depth_hidden_size,
                     depth_first_embed_staging_.data(),
                     depth_hidden_bytes);
-        std::memcpy(depth_prefill_staging_.data() + 2 * depth_hidden_size,
-                    depth_projected_pair_staging_.data() + depth_hidden_size,
-                    depth_hidden_bytes);
-        std::memcpy(depth_prefill_staging_.data() + 3 * depth_hidden_size,
-                    depth_first_embed_staging_.data(),
-                    depth_hidden_bytes);
+        if (paired_depth) {
+            std::memcpy(depth_prefill_staging_.data() + 2 * depth_hidden_size,
+                        depth_projected_pair_staging_.data() + depth_hidden_size,
+                        depth_hidden_bytes);
+            std::memcpy(depth_prefill_staging_.data() + 3 * depth_hidden_size,
+                        depth_first_embed_staging_.data(), depth_hidden_bytes);
+        }
 
-        auto depth = depth_pair->prefill_embeddings_batched(depth_prefill_staging_, 2, 2);
-        if (static_cast<int64_t>(depth.hidden.size()) != 2 * config.depth_hidden_size) {
+        auto depth = depth_pair->prefill_embeddings_batched(depth_prefill_staging_, depth_batch, 2);
+        if (static_cast<int64_t>(depth.hidden.size()) != depth_batch * config.depth_hidden_size) {
             throw std::runtime_error("BreezeTTS batched depth prefill hidden size mismatch");
         }
         std::memcpy(depth_cond_hidden_now_.data(),
                     depth.hidden.data(),
                     depth_hidden_bytes);
-        std::memcpy(depth_uncond_hidden_now_.data(),
-                    depth.hidden.data() + depth_hidden_size,
-                    depth_hidden_bytes);
+        if (paired_depth) {
+            std::memcpy(depth_uncond_hidden_now_.data(),
+                        depth.hidden.data() + depth_hidden_size, depth_hidden_bytes);
+        }
         depth_pair->start_decode_embeddings_batched(depth.state, config.num_codebooks + 1);
 
         sampling::HfSamplingOptions options;
@@ -927,7 +967,7 @@ struct BreezeGeneratorRuntime::Impl {
         for (int64_t codebook = 1; codebook < config.num_codebooks; ++codebook) {
             depth_projection->logits_cfg(
                 depth_cond_hidden_now_.data(),
-                depth_uncond_hidden_now_.data(),
+                paired_depth ? depth_uncond_hidden_now_.data() : depth_cond_hidden_now_.data(),
                 codebook,
                 request.guidance_scale,
                 depth_logits_staging_.data());
@@ -949,19 +989,21 @@ struct BreezeGeneratorRuntime::Impl {
                 std::memcpy(depth_next_pair_staging_.data(),
                             depth_next_embed_staging_.data(),
                             depth_hidden_bytes);
-                std::memcpy(depth_next_pair_staging_.data() + depth_hidden_size,
-                            depth_next_embed_staging_.data(),
-                            depth_hidden_bytes);
-                const auto step = depth_pair->decode_embeddings_batched(depth_next_pair_staging_, 2);
-                if (static_cast<int64_t>(step.hidden.size()) != 2 * config.depth_hidden_size) {
+                if (paired_depth) {
+                    std::memcpy(depth_next_pair_staging_.data() + depth_hidden_size,
+                                depth_next_embed_staging_.data(), depth_hidden_bytes);
+                }
+                const auto step = depth_pair->decode_embeddings_batched(depth_next_pair_staging_, depth_batch);
+                if (static_cast<int64_t>(step.hidden.size()) != depth_batch * config.depth_hidden_size) {
                     throw std::runtime_error("BreezeTTS batched depth decode hidden size mismatch");
                 }
                 std::memcpy(depth_cond_hidden_now_.data(),
                             step.hidden.data(),
                             depth_hidden_bytes);
-                std::memcpy(depth_uncond_hidden_now_.data(),
-                            step.hidden.data() + depth_hidden_size,
-                            depth_hidden_bytes);
+                if (paired_depth) {
+                    std::memcpy(depth_uncond_hidden_now_.data(),
+                                step.hidden.data() + depth_hidden_size, depth_hidden_bytes);
+                }
             }
         }
         return frame;
@@ -969,13 +1011,14 @@ struct BreezeGeneratorRuntime::Impl {
 
     struct StreamState {
         BreezeGenerationRequest request;
-        modules::QwenCausalPrefillResult cond;
-        std::optional<modules::QwenCausalPrefillResult> uncond;
+        modules::CausalDecoderPrefillIntoDecodeResult cond;
+        std::optional<modules::CausalDecoderPrefillIntoDecodeResult> uncond;
         sampling::HfSamplerScratch scratch;
         std::mt19937 fallback_rng;
         sampling::HfSamplingOptions first_options;
         std::vector<int32_t> first_codebook_history;
         std::vector<int32_t> codes;
+        std::vector<float> pending_embedding;
         int64_t steps_taken = 0;
         bool done = false;
         bool use_cfg = false;
@@ -985,6 +1028,7 @@ struct BreezeGeneratorRuntime::Impl {
         double backbone_uncond_prefill_ms = 0.0;
         double backbone_cond_decode_ms = 0.0;
         double backbone_uncond_decode_ms = 0.0;
+        double depth_ms = 0.0;
         uint64_t sample_call_index = 0;
         uint64_t offset_blocks = 0;
     };
@@ -1049,12 +1093,11 @@ struct BreezeGeneratorRuntime::Impl {
             }
         });
         engine::debug::timing_log_scalar("breeze_tts.generate.prompt_ms", prompt_ms);
-        text_encoder.release_runtime_graphs();
 
         auto state = std::make_unique<StreamState>();
         state->request = request;
         state->use_cfg = use_cfg;
-        state->codes.reserve(static_cast<size_t>(request.max_tokens * config.num_codebooks));
+        state->codes.reserve(static_cast<size_t>(config.num_codebooks));
         state->scratch.reserve_vocab(static_cast<size_t>(config.lm_head_size));
         state->fallback_rng = std::mt19937(static_cast<uint32_t>(request.seed));
         state->first_options.do_sample = true;
@@ -1063,20 +1106,17 @@ struct BreezeGeneratorRuntime::Impl {
         state->first_options.top_p = request.top_p;
         state->first_options.repetition_penalty = kRepetitionPenalty;
         state->first_options.min_tokens_to_keep = 1;
-        speech_decoder->reset_streaming_state();
         state->ar_total_ms += engine::debug::measure_ms([&] {
             state->backbone_cond_prefill_ms = engine::debug::measure_ms([&] {
-                state->cond = backbone_cond->prefill_embeddings(cond_embeddings, cond_steps);
+                state->cond = backbone_cond->prefill_embeddings_into_decode_cache(
+                    cond_embeddings, cond_steps, cond_steps + request.max_tokens);
             });
             if (use_cfg) {
                 state->uncond.emplace();
                 state->backbone_uncond_prefill_ms = engine::debug::measure_ms([&] {
-                    *state->uncond = backbone_uncond->prefill_embeddings(uncond_embeddings, uncond_steps);
+                    *state->uncond = backbone_uncond->prefill_embeddings_into_decode_cache(
+                        uncond_embeddings, uncond_steps, uncond_steps + request.max_tokens);
                 });
-            }
-            backbone_cond->start_decode_embeddings(state->cond.state, cond_steps + request.max_tokens);
-            if (use_cfg) {
-                backbone_uncond->start_decode_embeddings(state->uncond->state, uncond_steps + request.max_tokens);
             }
         });
         stream_ = std::move(state);
@@ -1092,6 +1132,22 @@ struct BreezeGeneratorRuntime::Impl {
         if (state.done || state.steps_taken >= request.max_tokens) {
             state.done = true;
             return 2;
+        }
+        if (!state.pending_embedding.empty()) {
+            modules::CausalDecoderStepResult step;
+            state.backbone_cond_decode_ms += engine::debug::measure_ms([&] {
+                step = backbone_cond->decode_embedding(state.pending_embedding);
+            });
+            state.cond.logits = std::move(step.logits);
+            state.cond.hidden = std::move(step.hidden);
+            if (state.use_cfg) {
+                state.backbone_uncond_decode_ms += engine::debug::measure_ms([&] {
+                    step = backbone_uncond->decode_embedding(state.pending_embedding);
+                });
+                state.uncond->logits = std::move(step.logits);
+                state.uncond->hidden = std::move(step.hidden);
+            }
+            state.pending_embedding.clear();
         }
         ++state.steps_taken;
         if (state.use_cfg) {
@@ -1128,6 +1184,7 @@ struct BreezeGeneratorRuntime::Impl {
         if (first_token == config.codebook_pad_token_id) {
             return 1;
         }
+        const auto depth_start = Clock::now();
         const auto frame = generate_frame(
             state.cond.hidden,
             state.use_cfg ? state.uncond->hidden : state.cond.hidden,
@@ -1136,76 +1193,71 @@ struct BreezeGeneratorRuntime::Impl {
             state.scratch,
             state.fallback_rng,
             state.sample_call_index,
-            state.offset_blocks);
+            state.offset_blocks,
+            state.use_cfg);
+        state.depth_ms += engine::debug::elapsed_ms(depth_start);
         state.first_codebook_history.push_back(first_token);
-        state.codes.insert(state.codes.end(), frame.begin(), frame.end());
-        const auto embedded = frame_embedding(
+        state.codes = frame;
+        state.pending_embedding = frame_embedding(
             weights->audio_embedding,
             config.num_codebooks * config.vocab_size,
             config.hidden_size,
             config.vocab_size,
             frame);
-        modules::QwenCausalDecodeStepResult cond_step;
-        state.backbone_cond_decode_ms += engine::debug::measure_ms([&] {
-            cond_step = backbone_cond->decode_embedding(embedded);
-        });
-        state.cond.logits = cond_step.logits;
-        state.cond.hidden = cond_step.hidden;
-        if (state.use_cfg) {
-            modules::QwenCausalDecodeStepResult uncond_step;
-            state.backbone_uncond_decode_ms += engine::debug::measure_ms([&] {
-                uncond_step = backbone_uncond->decode_embedding(embedded);
-            });
-            state.uncond->logits = uncond_step.logits;
-            state.uncond->hidden = uncond_step.hidden;
-        }
         return 0;
     }
 
-    BreezeStreamEvent next_stream_audio(size_t max_new_frames, int64_t lookahead_margin) {
-        if (max_new_frames == 0) {
-            throw std::runtime_error("BreezeTTS stream step size must be positive");
-        }
-        if (stream_ == nullptr) {
-            throw std::runtime_error("BreezeTTS stream has not been started");
-        }
-        const auto & config = assets->config;
-        BreezeStreamEvent out;
-        int64_t new_frames = 0;
-        const size_t code_begin = stream_->codes.size();
-        stream_->ar_total_ms += engine::debug::measure_ms([&] {
-            while (new_frames < static_cast<int64_t>(max_new_frames)) {
-                const int status = step_frame_once();
+    runtime::AudioBuffer generate_stream(
+        const BreezeGenerationRequest & request,
+        runtime::StreamingAudioConfig config,
+        runtime::StreamEventCallback sink,
+        BreezeSpeechCodes * generated_codes) {
+        BreezeSpeechCodes captured;
+        captured.code_groups = assets->config.num_codebooks;
+        try {
+            begin_stream(request);
+            config.frame_width = static_cast<size_t>(assets->config.num_codebooks);
+            config.left_context_frames = BreezeSpeechDecoderRuntime::kLeftContextFrames;
+            stream_audio_.begin(config,
+                [this, config](const runtime::StreamingAudioWindow<int32_t> & window) {
+                    BreezeSpeechCodes codes;
+                    codes.frames = static_cast<int64_t>(window.frames());
+                    codes.code_groups = static_cast<int64_t>(window.frame_width);
+                    codes.codes.assign(window.data, window.data + window.frames() * window.frame_width);
+                    auto audio = speech_decoder->decode_stream_chunk(
+                        codes, window.left_frames, window.new_frames,
+                        config.frames_per_chunk + config.right_context_frames);
+                    for (float & sample : audio.samples) {
+                        sample = std::clamp(sample, -1.0F, 1.0F);
+                    }
+                    return audio;
+                }, std::move(sink));
+            while (!stream_->done) {
+                int status;
+                stream_->ar_total_ms += engine::debug::measure_ms([&] { status = step_frame_once(); });
                 if (status == 0) {
-                    ++new_frames;
-                } else if (status == 2) {
-                    out.done = true;
-                    break;
+                    stream_audio_.push(stream_->codes);
+                    if (generated_codes != nullptr) {
+                        captured.codes.insert(captured.codes.end(), stream_->codes.begin(), stream_->codes.end());
+                        ++captured.frames;
+                    }
                 }
             }
-        });
-        BreezeSpeechCodes speech_codes;
-        speech_codes.codes.assign(
-            stream_->codes.begin() + static_cast<std::ptrdiff_t>(code_begin),
-            stream_->codes.end());
-        speech_codes.code_groups = config.num_codebooks;
-        speech_codes.frames = new_frames;
-        if (new_frames * config.num_codebooks != static_cast<int64_t>(speech_codes.codes.size())) {
-            throw std::runtime_error("BreezeTTS stream generated code shape mismatch");
+            auto audio = stream_audio_.finish();
+            stream_->codec_decode_ms = stream_audio_.decode_ms();
+            end_stream();
+            if (generated_codes != nullptr) {
+                *generated_codes = std::move(captured);
+            }
+            return audio;
+        } catch (...) {
+            end_stream();
+            throw;
         }
-        if (stream_->done) {
-            out.done = true;
-        }
-        stream_->codec_decode_ms += engine::debug::measure_ms([&] {
-            out.audio = speech_decoder->decode_streaming_step(speech_codes, lookahead_margin, out.done);
-        });
-        for (float & sample : out.audio.samples) {
-            sample = std::clamp(sample, -1.0F, 1.0F);
-        }
-        return out;
     }
 
     void end_stream() {
+        stream_audio_.reset();
         if (stream_ == nullptr) {
             return;
         }
@@ -1214,14 +1266,12 @@ struct BreezeGeneratorRuntime::Impl {
         engine::debug::timing_log_scalar("breeze_tts.ar.backbone_uncond_prefill_ms", stream_->backbone_uncond_prefill_ms);
         engine::debug::timing_log_scalar("breeze_tts.ar.backbone_cond_decode_ms", stream_->backbone_cond_decode_ms);
         engine::debug::timing_log_scalar("breeze_tts.ar.backbone_uncond_decode_ms", stream_->backbone_uncond_decode_ms);
+        engine::debug::timing_log_scalar("breeze_tts.ar.depth_ms", stream_->depth_ms);
         engine::debug::timing_log_scalar("breeze_tts.speech_decoder.streaming_total_ms", stream_->codec_decode_ms);
         stream_.reset();
-        backbone_cond->release_runtime_graphs();
-        backbone_uncond->release_runtime_graphs();
-        depth_pair->release_runtime_graphs();
     }
 
-    runtime::AudioBuffer generate(const BreezeGenerationRequest & request) {
+    runtime::AudioBuffer generate(const BreezeGenerationRequest & request, BreezeSpeechCodes * generated_codes) {
         if (request.text.empty()) {
             throw std::runtime_error("BreezeTTS requires text");
         }
@@ -1280,16 +1330,17 @@ struct BreezeGeneratorRuntime::Impl {
         text_encoder.release_runtime_graphs();
         double backbone_cond_decode_ms = 0.0;
         double backbone_uncond_decode_ms = 0.0;
+        double depth_ms = 0.0;
         std::vector<int32_t> first_codebook_history;
         std::vector<int32_t> codes;
         double backbone_cond_prefill_ms = 0.0;
         double backbone_uncond_prefill_ms = 0.0;
         const double ar_ms = engine::debug::measure_ms([&] {
-            modules::QwenCausalPrefillResult cond;
+            modules::CausalDecoderPrefillResult cond;
             backbone_cond_prefill_ms = engine::debug::measure_ms([&] {
                 cond = backbone_cond->prefill_embeddings(cond_embeddings, cond_steps);
             });
-            std::optional<modules::QwenCausalPrefillResult> uncond;
+            std::optional<modules::CausalDecoderPrefillResult> uncond;
             if (use_cfg) {
                 uncond.emplace();
                 backbone_uncond_prefill_ms = engine::debug::measure_ms([&] {
@@ -1346,6 +1397,7 @@ struct BreezeGeneratorRuntime::Impl {
                 if (first_token == config.codebook_pad_token_id) {
                     continue;
                 }
+                const auto depth_start = Clock::now();
                 const auto frame = generate_frame(
                     cond.hidden,
                     use_cfg ? uncond->hidden : cond.hidden,
@@ -1354,7 +1406,9 @@ struct BreezeGeneratorRuntime::Impl {
                     scratch,
                     fallback_rng,
                     sample_call_index,
-                    offset_blocks);
+                    offset_blocks,
+                    use_cfg);
+                depth_ms += engine::debug::elapsed_ms(depth_start);
                 first_codebook_history.push_back(first_token);
                 codes.insert(codes.end(), frame.begin(), frame.end());
                 const auto embedded = frame_embedding(
@@ -1363,14 +1417,14 @@ struct BreezeGeneratorRuntime::Impl {
                     config.hidden_size,
                     config.vocab_size,
                     frame);
-                modules::QwenCausalDecodeStepResult cond_step;
+                modules::CausalDecoderStepResult cond_step;
                 backbone_cond_decode_ms += engine::debug::measure_ms([&] {
                     cond_step = backbone_cond->decode_embedding(embedded);
                 });
                 cond.logits = cond_step.logits;
                 cond.hidden = cond_step.hidden;
                 if (use_cfg) {
-                    modules::QwenCausalDecodeStepResult uncond_step;
+                    modules::CausalDecoderStepResult uncond_step;
                     backbone_uncond_decode_ms += engine::debug::measure_ms([&] {
                         uncond_step = backbone_uncond->decode_embedding(embedded);
                     });
@@ -1380,6 +1434,7 @@ struct BreezeGeneratorRuntime::Impl {
             }
         });
         engine::debug::timing_log_scalar("breeze_tts.ar.total_ms", ar_ms);
+        engine::debug::timing_log_scalar("breeze_tts.ar.depth_ms", depth_ms);
         engine::debug::timing_log_scalar("breeze_tts.ar.backbone_cond_prefill_ms", backbone_cond_prefill_ms);
         engine::debug::timing_log_scalar("breeze_tts.ar.backbone_uncond_prefill_ms", backbone_uncond_prefill_ms);
         engine::debug::timing_log_scalar("breeze_tts.ar.backbone_cond_decode_ms", backbone_cond_decode_ms);
@@ -1404,23 +1459,27 @@ struct BreezeGeneratorRuntime::Impl {
         for (float & sample : audio.samples) {
             sample = std::clamp(sample, -1.0F, 1.0F);
         }
+        if (generated_codes != nullptr) {
+            *generated_codes = std::move(speech_codes);
+        }
         return audio;
     }
 
     std::shared_ptr<const BreezeTTSAssets> assets;
     core::ExecutionContext & execution;
     BreezeTextTokenizer tokenizer;
-    BreezeTextEncoderRuntime text_encoder;
+    BreezeT5Gemma2TextEncoderRuntime text_encoder;
     sampling::TorchCudaSamplingPolicy sampling_policy;
-    modules::QwenCausalDecodeRuntimeConfig backbone_runtime_config;
-    modules::QwenCausalDecodeRuntimeConfig depth_runtime_config;
+    modules::CausalDecoderRuntimeConfig backbone_runtime_config;
+    modules::CausalDecoderRuntimeConfig depth_runtime_config;
     std::shared_ptr<const BreezeWeights> weights;
-    std::unique_ptr<modules::QwenCausalDecodeRuntime> backbone_cond;
-    std::unique_ptr<modules::QwenCausalDecodeRuntime> backbone_uncond;
-    std::unique_ptr<modules::QwenCausalDecodeRuntime> depth_pair;
+    std::unique_ptr<modules::CausalDecoderRuntime> backbone_cond;
+    std::unique_ptr<modules::CausalDecoderRuntime> backbone_uncond;
+    std::unique_ptr<modules::CausalDecoderRuntime> depth_pair;
     std::unique_ptr<BreezeDepthProjectionRuntime> depth_projection;
     std::unique_ptr<BreezeSpeechEncoderRuntime> speech_encoder;
     std::unique_ptr<BreezeSpeechDecoderRuntime> speech_decoder;
+    runtime::StreamingAudioController<int32_t> stream_audio_;
     std::vector<float> depth_first_embed_staging_;
     std::vector<float> depth_projected_pair_staging_;
     std::vector<float> depth_prefill_staging_;
@@ -1437,15 +1496,23 @@ BreezeGeneratorRuntime::BreezeGeneratorRuntime(
     size_t graph_arena_bytes,
     size_t weight_context_bytes,
     engine::assets::TensorStorageType storage_type,
-    engine::core::AttentionPreference attention_preference)
+    engine::core::AttentionPreference attention_preference,
+    Bf16ActivationMode bf16_activations)
     : impl_(std::make_unique<Impl>(
-          std::move(assets), execution, graph_arena_bytes, weight_context_bytes, storage_type, attention_preference)) {}
+          std::move(assets),
+          execution,
+          graph_arena_bytes,
+          weight_context_bytes,
+          storage_type,
+          attention_preference,
+          bf16_activations)) {}
 
 BreezeGeneratorRuntime::~BreezeGeneratorRuntime() = default;
 
-engine::runtime::AudioBuffer BreezeGeneratorRuntime::generate(const BreezeGenerationRequest & request) {
+engine::runtime::AudioBuffer BreezeGeneratorRuntime::generate(
+    const BreezeGenerationRequest & request, BreezeSpeechCodes * generated_codes) {
     const auto start = Clock::now();
-    auto audio = impl_->generate(request);
+    auto audio = impl_->generate(request, generated_codes);
     engine::debug::timing_log_scalar("breeze_tts.generate.total_ms", engine::debug::elapsed_ms(start));
     return audio;
 }
@@ -1454,12 +1521,12 @@ BreezeSpeechCodes BreezeGeneratorRuntime::encode_reference(const engine::runtime
     return impl_->speech_encoder->encode(audio);
 }
 
-void BreezeGeneratorRuntime::begin_stream(const BreezeGenerationRequest & request) {
-    impl_->begin_stream(request);
-}
-
-BreezeStreamEvent BreezeGeneratorRuntime::next_stream_audio(size_t max_new_frames, int64_t lookahead_margin) {
-    return impl_->next_stream_audio(max_new_frames, lookahead_margin);
+engine::runtime::AudioBuffer BreezeGeneratorRuntime::generate_stream(
+    const BreezeGenerationRequest & request,
+    engine::runtime::StreamingAudioConfig config,
+    engine::runtime::StreamEventCallback sink,
+    BreezeSpeechCodes * generated_codes) {
+    return impl_->generate_stream(request, config, std::move(sink), generated_codes);
 }
 
 void BreezeGeneratorRuntime::end_stream() {

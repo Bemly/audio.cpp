@@ -2,6 +2,8 @@
 
 `audiocpp_server` is an HTTP adapter over the framework runtime registry. It keeps one loaded model and one offline task session per active model id, so repeated HTTP requests reuse the same framework session and model-owned graph/cache state.
 
+`POST /v1/audio/speech` accepts top-level `speed` (or `speaking_rate`) as a positive speech-rate multiplier when the model spec declares support. Explicit values, including `1`, override configured request defaults. For models without declared speed support, `1` is accepted as omitted; other values are rejected. For Kokoro, use the [GGUF version published on Hugging Face on September 22, 2026 (UTC)](https://huggingface.co/audio-cpp/audio.cpp-gguf/commit/406756ee8e3b16e902ce40112986c1010775f888) or a later published version.
+
 ## Build
 
 ```bash
@@ -157,7 +159,65 @@ or in `server.json`:
 > [!WARNING]
 > CORS support is experimental and intended for trusted local web apps only. Do not expose a server with CORS enabled on an untrusted network. With CORS enabled, any browser page can send requests to the local server and consume local CPU/GPU resources.
 
-Set top-level `"busy_timeout_ms"` to bound how long a request waits for a model that is already running. Each model serializes its requests on an internal lock, so a second request normally queues behind the first. A GPU call that wedges cannot be cancelled from userspace, so without a bound every subsequent request would park a worker thread forever. When the current inference has held the lock past this timeout, a new request fails fast with HTTP 503 (`server_busy`) instead of queuing; streaming requests that have already sent headers surface the same condition as a `{"type":"error"}` stream event. The value must exceed the slowest legitimate single inference (music generation can take minutes). Defaults to `300000` (5 minutes); set `0` to disable the guard and restore unbounded waiting. The `--busy-timeout-ms <ms>` command-line flag overrides the config value.
+### Experimental parallel model slots
+
+The single authoritative
+[Parallel Server Behavior Contract](../../docs/maintainers/parallel_server_behavior_contract.md)
+defines operation/state matrices, linked tests, validation by area and known
+limitations. Enabling the feature prints a warning with the tested and untested
+scope. Controlled session tests do not admit real catalogue models to multi-slot
+execution; GPU streaming, full lifecycle coverage and hard backend cancellation
+remain unverified. The descriptions below are a usage summary.
+
+The existing implementation remains the default. Opt into the separate parallel
+runtime at process startup:
+
+```bash
+audiocpp_server --config server.json --parallel-jobs
+```
+
+Without `--parallel-jobs`, **any explicit `slots` field** in a model entry or
+dynamic registration is rejected, including `"slots": 1` and `"slots": null`.
+Existing configurations without the field use the original `ServerState`.
+
+With `--parallel-jobs`, every model uses `ParallelServerState`. Omitted slots
+means capacity one; otherwise `"slots"` must be an integer from 1 to 16. Capacity
+one also uses the new scheduler and session pool. Slot count never selects the
+runtime. The requested count must fit the model's advertised parallel capacity.
+The default HTTP listener in this mode owns its request workers, interrupts
+socket I/O on shutdown, and joins workers before destroying the runtime. Active
+GPU work must still finish. Custom frontend listeners own their shutdown/drain
+behavior through the existing frontend interface.
+The common framework retains capacity one for existing models; model adapters
+and validated admission entries belong to the separate PR #706 follow-up.
+
+`GET /v1/models` on the parallel runtime reports configured `slots`, `active_slots`,
+`queued_requests` and loaded `max_parallel_slots` (`null` when unloaded). Legacy
+model responses retain upstream's schema and do not gain synthetic slots fields.
+Parallel requests and management share FIFO admission; unload, eviction and
+reconfiguration drain active leases. Counts can be resized across one under an
+exclusive lease, but registration never changes the process's selected runtime.
+The inference CLI has no new flag and retains its existing behavior.
+
+Each slot needs private execution contexts, graphs, KV/reference caches,
+stream state and sampling state. Immutable assets/weights can be shared.
+More slots can improve throughput but increase latency and working memory.
+This is concurrent session execution; continuous token batching is not included.
+See [the adapter guide](../../docs/maintainers/parallel_sessions.md).
+
+The [validation procedure](../../docs/maintainers/parallel_model_validation.md)
+keeps model quality/recovery/memory checks separate from shared framework
+ownership tests and performance measurements. Shared evidence is referenced once
+per applicable revision/backend; every admitted count still needs repeated
+quality testing. Optional separate-server benchmarks do not determine admission.
+
+Set top-level `"busy_timeout_ms"` to bound how long a request waits for a model that is already running. By default each model runs one request at a time. With multiple slots, requests queue when every slot is occupied or a management operation blocks admission. A GPU call that wedges cannot be cancelled from userspace, so without a bound every subsequent request would park a worker thread forever. When every occupied request slot has exceeded this timeout, a new request fails fast with HTTP 503 (`server_busy`) instead of queuing; streaming requests that have already sent headers surface the same condition as a `{"type":"error"}` stream event. The value must exceed the slowest legitimate single inference (music generation can take minutes). Defaults to `300000` (5 minutes); set `0` to disable the guard and restore unbounded waiting. The `--busy-timeout-ms <ms>` command-line flag overrides the config value.
+
+Waiting unload/reconfiguration operations keep priority over new inference, but
+do not suppress this overdue check. If admission is blocked by management and
+all occupied inference slots are overdue, a new request fails immediately even
+when the pool has spare slots. A healthy occupied slot still permits bounded
+waiting; a timeout of `0` disables the overdue check and wait bound.
 
 The bound is resolved in three layers, since model runtimes differ by orders of magnitude (a short TTS clip versus minutes of music generation):
 
@@ -308,6 +368,22 @@ Returns server readiness and the number of configured models.
 
 Returns OpenAI-style model entries for the configured audio.cpp model ids.
 
+Two opt-in query flags add to each entry:
+
+- `include_session_options=true` echoes the model's configured `session_options`.
+- `include_params=true` adds `params`: the request options the model's spec
+  declares under `options.request`, as the spec writes them (`name`, `type`,
+  `required`, `description`, and `default`/`min`/`max` where given). An enum row
+  that names a `preset` also carries the preset's `values`. A model whose spec
+  declares no request options returns `"params": []`.
+
+```bash
+curl 'http://127.0.0.1:8080/v1/models?include_params=true'
+```
+
+The list describes options; it does not validate them. Requests are still checked
+per model as before.
+
 ### `POST /v1/audio/speech`
 
 OpenAI-style text-to-audio. The response is `audio/wav` by default.
@@ -371,7 +447,20 @@ curl -N http://127.0.0.1:8080/v1/audio/speech \
 
 The SSE stream emits `speech.audio.delta` events with base64 PCM chunks, then `speech.audio.done`, then `data: [DONE]`. VoxCPM2 streaming requires `retry_badcase=false` because retrying a completed bad case is an offline-only behavior. Set `"stream_format": "audio"` with `"response_format": "pcm"` to receive raw PCM bytes over chunked transfer encoding instead.
 
-`POST /v1/audio/speech/live` is the live-ingest variant for speech-to-speech models: the request body is raw PCM sent with `Transfer-Encoding: chunked`, and the response can emit audio while the input stream is still open. Its `speech.audio.done` timing reports `ttft_ms` only when first output audio occurs after the input stream ends. If output audio starts before the input stream closes, `ttft_ms` is `null`, `first_audio_before_input_end=true`, and `overlap_ms` reports how much earlier the first output arrived. `request_start_to_first_audio_ms` is also included for transport diagnostics.
+`POST /v1/audio/speech/live` is the live-ingest variant for speech-to-speech models: the request body is raw PCM sent with `Transfer-Encoding: chunked`, and the response can emit audio while the input stream is still open. `input` is the text a text-to-speech model speaks and is required for it. A speech-to-speech or voice-conversion entry (task `s2s`, `vc` or `svc`) takes it as an optional prompt, such as PersonaPlex's persona prompt or LFM2.5-Audio's system prompt, and without it the model uses its default. The route's `speech.audio.done` timing reports `ttft_ms` only when first output audio occurs after the input stream ends. If output audio starts before the input stream closes, `ttft_ms` is `null`, `first_audio_before_input_end=true`, and `overlap_ms` reports how much earlier the first output arrived. `request_start_to_first_audio_ms` is also included for transport diagnostics.
+
+With `return_text=true` (or `1`), the stream also carries the text the model writes as it speaks, such as a spoken reply's words. `speech.text.delta` events carry the text written since the previous event, in order with the audio deltas (an event's text comes before its audio), and `speech.text.done` carries the whole text before `speech.audio.done`:
+
+```text
+data: {"type":"speech.text.delta","delta":"Sure! How about"}
+data: {"type":"speech.audio.delta","audio":"<base64 PCM>"}
+...
+data: {"type":"speech.text.done","text":"Sure! How about ..."}
+data: {"type":"speech.audio.done","timing":{...}}
+data: [DONE]
+```
+
+Without `return_text` the stream is audio only. `return_text` needs `stream_format=sse`; a model that writes no text ends the stream with an error event after its audio.
 
 ### `POST /v1/audio/transcriptions`
 
@@ -408,6 +497,12 @@ curl -N http://127.0.0.1:8080/v1/audio/transcriptions \
 ```
 
 The stream emits `transcript.text.delta` events, one final `transcript.text.done` event containing the full transcript, then `data: [DONE]`.
+
+Models with revisable hypotheses, currently Phonon-2, may additionally emit
+`{"type":"transcript.text.partial","text":"..."}`. This is a whole provisional
+transcript to replace in the display, never append to the committed deltas.
+For these models, deltas contain finalized segments only. Other models retain
+their existing event behavior. See [Phonon-2](../../docs/community_models/phonon2.md).
 
 Note that `stream=true` streams the *output* of an already-uploaded file: the whole recording is sent first, and the deltas describe decoding it. It shortens time-to-first-token on long audio, but nothing can appear while the speaker is still talking. For that, use the live endpoint below.
 
@@ -449,6 +544,38 @@ Spans are sample offsets rather than seconds because that is what the models rep
 
 `stream=true` is rejected with a 400 on this route: the SSE response carries transcript deltas only, so it has nowhere to put the detail arrays. Use `/v1/audio/transcriptions` for a streamed transcript.
 
+### `POST /v1/batches/transcriptions`
+
+Runs multiple uploaded WAV files through one native offline model batch. This is
+an audio.cpp extension, not an OpenAI API endpoint. The selected model must
+implement native batching; the server rejects unsupported models instead of
+silently running each file separately.
+
+Supply `file` more than once in one multipart request:
+
+```bash
+curl -N http://127.0.0.1:8080/v1/batches/transcriptions \
+  -F model=nemotron-3-diar \
+  -F file=@/path/to/meeting-a.wav \
+  -F file=@/path/to/meeting-b.wav
+```
+
+`model` and at least one `file` are required. `language`, `prompt`,
+`busy_timeout_ms`, and a JSON object in `options` are optional and apply to every
+file. The response is an SSE stream. Each file is published as soon as the model
+finishes it; `index` maps the result back to its upload position. The final event
+contains aggregate batch timing measured against the combined audio duration.
+
+```text
+data: {"type":"batch.transcription.result","index":0,"filename":"meeting-a.wav","text":"","speaker_turns":[{"start_sample":0,"end_sample":32000,"speaker_id":"speaker_0","confidence":1.0}],"sample_rate":16000}
+
+data: {"type":"batch.transcription.result","index":1,"filename":"meeting-b.wav","text":"","speaker_turns":[...],"sample_rate":16000}
+
+data: {"type":"batch.transcription.done","result_count":2,"timing":{"wall_ms":145.5,"audio_duration_ms":70000.0,"rtf":0.0021}}
+
+data: [DONE]
+```
+
 ### `POST /v1/audio/alignments`
 
 Multipart forced-alignment request using uploaded audio bytes and a known transcript. Use this when the server cannot see the client's local audio path, for example when the server is remote or running in Docker.
@@ -461,13 +588,13 @@ curl http://127.0.0.1:8080/v1/audio/alignments \
   -F file=@/path/to/input.wav
 ```
 
-`file`, `model`, and `text` are required; `language` is optional. The selected model must be configured with `task: "align"` and `mode: "offline"`. Uploaded WAV bytes are decoded in memory and are not written to a temporary file. The response includes word timestamps in seconds plus sample offsets.
+`file`, `model`, and `text` are required. `language` is model-dependent: Qwen3 Forced Aligner requires it (for example, `English` or `Chinese`). The selected model must be configured with `task: "align"` and `mode: "offline"`. Uploaded WAV bytes are decoded in memory and are not written to a temporary file. The response includes word timestamps in seconds plus sample offsets.
 
 ### `POST /v1/audio/transcriptions/live`
 
 Streams raw PCM **as it is captured** and returns transcript deltas on the same connection, so partial text can appear while the user is still speaking.
 
-The request body is raw interleaved PCM sent with `Transfer-Encoding: chunked`; the response is the same SSE event shape as `stream=true` above, so a client can share one reader. There is no multipart form and no file — the audio never has to exist on disk, and the transport hands each chunk to the model as it arrives rather than assembling the recording first. Whether the *model* then keeps the whole utterance in memory is its own business: `nemotron_asr`, for instance, accumulates internally regardless of how the audio reaches it.
+The request body is raw interleaved PCM sent with `Transfer-Encoding: chunked`; the response is the same SSE event shape as `stream=true` above, so a client can share one reader. There is no multipart form and no file — the audio never has to exist on disk, and the transport hands each chunk to the model as it arrives rather than assembling the recording first.
 
 Because the body carries audio rather than JSON, parameters are query parameters:
 
@@ -478,6 +605,7 @@ Because the body carries audio rather than JSON, parameters are query parameters
 | `channels` | `1` | interleaved channel count |
 | `sample_format` | `s16le` | `s16le` or `f32le` |
 | `language` | unset | passed through to the model |
+| `prompt` | unset | URL-encoded recognition context (hotwords, spellings), same as the multipart `prompt` field |
 | `busy_timeout_ms` | model policy | how long to wait for the model lock, as elsewhere; clamped by the configured ceiling, so a request can shorten its own wait but never weaken the guard |
 
 ```bash
@@ -491,7 +619,24 @@ ffmpeg -f avfoundation -i ":0" -ar 16000 -ac 1 -f s16le - \
 
 A headerless stream carries no format, so the parameters above are a contract the server cannot verify — sending 48 kHz audio while declaring 16 kHz produces a confident, wrong transcript rather than an error.
 
-Whether partial text actually appears *during* capture is a property of the model, not of this endpoint. A model that decodes incrementally (`voxtral_realtime`) emits deltas throughout the utterance; one whose encoder consumes the whole utterance before decoding (`nemotron_asr`) will stream its deltas only after the audio ends. Both work here; only the first feels live.
+Whether partial text actually appears *during* capture is a property of the model, not of this endpoint. Cache-aware streaming models such as `voxtral_realtime` and `nemotron_asr` emit deltas throughout the utterance; buffered models may emit only after enough audio has accumulated.
+
+For a model configured with `task: "diar"`, this route and the file-backed
+`/v1/audio/transcriptions` route with `stream=true` return speaker turns instead
+of text deltas:
+
+```text
+data: {"type":"diarization.delta","speaker_turns":[{"start_sample":5760,"end_sample":52480,"speaker_id":"speaker_0","confidence":0.99}],"sample_rate":16000}
+data: {"type":"diarization.done","speaker_turns":[...],"sample_rate":16000,"timing":{"ttft_ms":3606}}
+data: [DONE]
+```
+
+Each delta contains newly emitted turns. The final event contains the complete
+result, including any turn still open when input ended; do not append it to the
+deltas. TTFT measures the first speaker-turn result, not the first internal
+probability prediction. A model that emits only completed turns waits for a turn
+to end. If no turns are detected, the final array is empty and `ttft_ms` is `null`.
+ASR responses keep their `transcript.text.delta` / `transcript.text.done` format.
 
 The request ends when the client sends the terminating chunk. Closing the connection without one is an error, not an end of speech — a truncated transcript that arrives as a normal `transcript.text.done` would be indistinguishable from the speaker stopping, so the endpoint refuses to produce one. The same applies to a stall past the idle timeout, an oversized chunk, or a malformed frame: each surfaces as an SSE `error` event.
 
@@ -549,6 +694,23 @@ curl 'http://127.0.0.1:8080/v1/audio/voices?model=pocket-tts'
 
 ### `POST /v1/tasks/run`
 
+For audio input, `request.audio` is a server-local WAV path. Alternatively,
+`request.audio_base64` accepts a Base64-encoded WAV or a
+`data:audio/wav;base64,...` URI:
+
+```json
+{
+  "model": "mel_band_roformer",
+  "request": {"audio_base64": "<Base64-encoded WAV>"}
+}
+```
+
+Provide only one of `audio` and `audio_base64`. Invalid inline audio returns
+HTTP 400. The existing `max_request_body_bytes` limit applies to the entire
+JSON body, including Base64 expansion. The WAV must meet the model's input
+sample-rate and channel requirements. Inline audio is supported on this endpoint;
+batch and stream endpoints retain their existing input formats.
+
 Generic framework request route. The `request` object uses the same JSON fields as the `audiocpp_cli` request sequence format.
 
 ```bash
@@ -564,6 +726,143 @@ curl http://127.0.0.1:8080/v1/tasks/run \
     }
   }'
 ```
+
+A result's artifacts (opaque payloads such as speaker embeddings or acoustic
+tokens) come back in an `artifacts` array. A request takes artifacts in the
+same shape, so a client can send what one result returned in a later request:
+
+```json
+{
+  "model": "my-model",
+  "request": {
+    "audio": "/path/to/input.wav",
+    "artifacts": [
+      {"id": "example.state", "kind": "custom", "payload": "<Base64 bytes>", "meta": {"format": "example/1"}},
+      {"id": "example.tokens", "kind": "acoustic_tokens", "path": "/path/to/tokens.bin"}
+    ]
+  }
+}
+```
+
+| field | meaning |
+| --- | --- |
+| `id` | non-empty string; ids may repeat |
+| `kind` | `speaker_embedding`, `style_embedding`, `prompt_embedding`, `acoustic_tokens`, `midi`, `transcript_alignment`, `diarization_state`, `vad_state` or `custom` |
+| `payload` | the bytes as Base64; a `data:...;base64,` URI is also accepted |
+| `path` | instead of `payload`: a server-local file whose bytes are the payload; a relative path resolves against the server's working directory |
+| `meta` | optional object of strings; a number or boolean value becomes text as in `options` (`12`, `true`; `1.0` becomes `1`) |
+
+The model gets the artifacts in array order. Which ids and kinds it reads is up
+to its family; see the model's docs. Most families that read none ignore them,
+while AuK, HeartMuLa, VibeVoice, VoxCPM1, VoxCPM2 and YuE2 turn away a request
+that carries any with HTTP 400. The same field works in `/v1/tasks/stream`
+requests and in each `/v1/tasks/batch` entry. A malformed entry returns HTTP 400
+naming it, for example `artifacts[1] (example.tokens): unknown kind 'tokens'`.
+`max_request_body_bytes` bounds inline payloads, as it does `audio_base64`; a
+`path` must name a regular file, and the payloads of one request, or of one
+`/v1/tasks/batch` entry, may total at most 2 GiB. A batch reads all its entries
+before it runs, so with `path` artifacts it can hold up to 2 GiB per entry.
+
+### `POST /v1/tasks/stream`
+
+Runs one generic request through the model's streaming interface and returns
+the events it produced with the result. The body is the one `/v1/tasks/run`
+takes, artifacts included, except that `audio_base64` is not read here: it is
+ignored, not rejected, so audio input goes in `audio` as a server-local path.
+
+By default the response is one JSON body, sent once the run is over:
+
+```text
+{"events":[{"partial_text":{"text":"Sure","language":"en"},"audio":"<Base64 WAV>","is_final":false},
+           {"audio":"<Base64 WAV>","is_final":false},...],
+ "result":{"text":"Sure! ...","language":"en","audio":"<Base64 WAV>","sample_rate":24000,"channels":1,
+           "timing":{"ttft_ms":<ms>}}}
+```
+
+An event has the fields it carries: `partial_text`, `audio` (a WAV of that
+event's samples), `named_audio_outputs`, `word_timestamps` and, for a
+diarization model, `speaker_turns`, and always `is_final`. Events do not carry
+voice activity or artifacts, so an event can be just `{"is_final":false}`.
+`result` has the fields of the `/v1/tasks/run` result, except that its `timing`
+holds only `ttft_ms`: the time from the start of the run, after the model is
+free and loaded, to its first output (`null` for a diarization run that found
+no speaker).
+
+With `"stream_format": "sse"` at the top level of the body, the response is
+server-sent events instead, each written as the model produces it:
+
+```bash
+curl -N http://127.0.0.1:8080/v1/tasks/stream \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "lfm2-audio-s2s-stream",
+    "stream_format": "sse",
+    "request": {"audio": "/path/to/question.wav", "options": {"return_codes": true}}
+  }'
+```
+
+```text
+data: {"type":"task.stream.event","event":{"partial_text":{"text":"Sure","language":"en"},"audio":"<Base64 WAV>","is_final":false}}
+data: {"type":"task.stream.event","event":{"audio":"<Base64 WAV>","is_final":false}}
+...
+data: {"type":"task.stream.done","result":{"text":"Sure! ...","language":"en","audio":"<Base64 WAV>",...,"timing":{"ttft_ms":<ms>}}}
+data: [DONE]
+```
+
+Each `event` is the object the JSON response puts in `events`, in the same
+order, and `result` is the object it puts under `result`, artifacts included.
+`task.stream.done` carries the whole result on one line, so for a spoken reply
+it repeats all of the reply's audio, about 640 KB of Base64 per 10 s of 24 kHz
+audio; a client that reads lines with a fixed size limit has to allow for that.
+A client that closes the stream before `task.stream.done` gets no result.
+
+Only the string `"sse"` streams. Without the field, or with `null`, the
+response is the JSON body, and any other value is answered with HTTP 400. This
+differs from `/v1/audio/speech`, which streams whenever `stream_format` is
+present. The `Accept` header is not consulted.
+
+A request that fails before the stream starts gets the status it gets without
+`stream_format`: an unknown model, a malformed artifact, an unreadable `audio`
+path and, with `--parallel-jobs`, a model that stays busy past the busy timeout
+(503). Once the stream has started, a failure ends it with
+`data: {"type":"error","error":{"message":"..."}}`, without `task.stream.done`
+or `[DONE]`; the event has no error type or status. That covers a model that
+fails to load, a request the model turns away when it runs (HTTP 400 without
+`stream_format`) and, without `--parallel-jobs`, a busy model, as on streamed
+`/v1/audio/speech`. A client knows the run succeeded when it gets
+`task.stream.done`.
+
+An SSE client that disconnects stops the run within the next event or two; a
+JSON client that disconnects leaves its run to finish. An SSE client that stops
+reading keeps the model, or with `--parallel-jobs` its slot, busy until it
+reads or disconnects, as on streamed `/v1/audio/speech` and
+`/v1/audio/transcriptions`; `live_ingest.send_timeout_ms` applies only to the
+live routes. The SSE response carries `X-Accel-Buffering: no`; a proxy in front
+of the server must not buffer it.
+
+### `POST /v1/tasks/batch`
+
+Runs multiple generic requests through a model's native offline batch path. The
+selected model must implement native batching; unsupported models are rejected
+instead of being run sequentially. Each entry uses the same fields as the
+`request` object accepted by `/v1/tasks/run`.
+
+```bash
+curl -N http://127.0.0.1:8080/v1/tasks/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "reuse",
+    "requests": [
+      {"audio": "/path/to/first.wav"},
+      {"audio": "/path/to/second.wav"}
+    ]
+  }'
+```
+
+The SSE response emits `task.batch.result` events with the original request
+index as results become available, followed by `task.batch.done` with aggregate
+batch timing. Per-result `timing` is `null` because fused execution does not
+produce an independent wall time for each request.
 
 ### `POST /v1/tasks/unload_models`
 
@@ -603,3 +902,13 @@ Response:
   "unloaded": ["pocket-tts", "qwen3-asr"]
 }
 ```
+
+With `--parallel-jobs`, all models (including capacity one) use FIFO admission.
+Earlier queued requests drain before a later unload/reconfiguration, and later
+arrivals cannot overtake a reserved waiter. A request binds model configuration
+before preparation and retains its lease through any deferred stream/native
+batch response. Bulk unload releases ready idle pools before waiting on busy
+ones. Logical residency ends when teardown starts; unload completes when
+resources have been destroyed, and physical-memory guards still apply.
+Registry lookup/snapshot locks never span model admission or metadata waits.
+See the [behavior contract](../../docs/maintainers/parallel_server_behavior_contract.md).

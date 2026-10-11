@@ -180,7 +180,10 @@ AudioChunkMode parse_audio_chunk_mode(
     if (*mode == "none") {
         return AudioChunkMode::None;
     }
-    throw std::runtime_error("audio_chunk_mode must be auto, fixed, quiet_energy, vad, or none");
+    if (*mode == "silence") {
+        return AudioChunkMode::Silence;
+    }
+    throw std::runtime_error("audio_chunk_mode must be auto, fixed, quiet_energy, vad, none, or silence");
 }
 
 std::optional<float> parse_audio_chunk_seconds_override(
@@ -313,12 +316,71 @@ std::vector<runtime::TimeSpan> plan_vad_audio_chunks(
     }
     runtime::TaskRequest vad_request;
     vad_request.audio_input = audio;
-    vad_session.prepare(runtime::build_preparation_request(vad_request));
-    const auto vad_result = vad_session.run(vad_request);
+    runtime::TaskResult vad_result;
+    try {
+        vad_session.prepare(runtime::build_preparation_request(vad_request));
+        vad_result = vad_session.run(vad_request);
+    } catch (const std::runtime_error & error) {
+        throw std::runtime_error(
+            std::string("VAD audio chunking failed: ") + error.what() +
+            ". If the input sample rate is unsupported, resample to a rate supported by the VAD model, "
+            "or select another audio_chunk_mode supported by the ASR model.");
+    }
     return plan_vad_audio_chunks(
         vad_result.speech_segments,
         static_cast<int64_t>(audio.samples.size() / static_cast<size_t>(audio.channels)),
         options);
+}
+
+std::vector<runtime::TimeSpan> plan_silence_audio_chunks(
+    const std::vector<float> & samples,
+    const SilenceAudioChunkOptions & options) {
+    const auto n = static_cast<int64_t>(samples.size());
+    require_positive(n, "silence input samples");
+    require_positive(options.max_chunk_samples, "silence max chunk samples");
+    require_positive(options.trigger_samples, "silence trigger samples");
+    if (n <= options.trigger_samples) return {{0, n}};
+    // librosa.effects.split defaults: centered 2048-sample RMS, 512-sample hop, top_db=30.
+    std::vector<double> energy(static_cast<size_t>(1 + n / 512));
+    double sum = 0;
+    for (int64_t j = 0; j < std::min<int64_t>(n, 1024); ++j) sum += samples[j] * samples[j];
+    for (size_t i = 0; i < energy.size(); ++i) {
+        energy[i] = sum / 2048;
+        const auto center = static_cast<int64_t>(i) * 512;
+        for (int64_t j = center - 1024; j < center - 512; ++j) {
+            if (j >= 0 && j < n) sum -= samples[j] * samples[j];
+        }
+        for (int64_t j = center + 1024; j < center + 1536; ++j) {
+            if (j < n) sum += samples[j] * samples[j];
+        }
+    }
+    const auto threshold = std::max(1.0e-10, *std::max_element(energy.begin(), energy.end())) * 0.001;
+    std::vector<std::pair<int64_t, int64_t>> voiced;
+    int64_t start = -1;
+    for (size_t i = 0; i <= energy.size(); ++i) {
+        const bool active = i < energy.size() && std::max(1.0e-10, energy[i]) > threshold;
+        if (active && start < 0) start = i * 512;
+        if (!active && start >= 0) {
+            voiced.emplace_back(start, std::min<int64_t>(n, i * 512));
+            start = -1;
+        }
+    }
+    std::vector<int64_t> cuts{0};
+    for (size_t i = 1; i < voiced.size(); ++i) cuts.push_back((voiced[i - 1].second + voiced[i].first) / 2);
+    cuts.push_back(n);
+    std::vector<runtime::TimeSpan> spans;
+    start = 0;
+    for (size_t i = 1; i < cuts.size(); ++i) {
+        while (cuts[i] - start > options.max_chunk_samples) {
+            const auto limit = start + options.max_chunk_samples;
+            const auto upper = std::upper_bound(cuts.begin(), cuts.end(), limit);
+            const auto cut = upper != cuts.begin() && *std::prev(upper) > start ? *std::prev(upper) : limit;
+            spans.push_back({start, cut});
+            start = cut;
+        }
+    }
+    if (start < n) spans.push_back({start, n});
+    return spans;
 }
 
 std::vector<runtime::TimeSpan> plan_quiet_energy_audio_chunks(
