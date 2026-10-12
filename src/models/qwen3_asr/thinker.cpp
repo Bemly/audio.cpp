@@ -90,7 +90,8 @@ modules::DecoderLayerWeights to_qwen3_layer_weights(const TextLayerWeights & wei
 
 modules::CausalDecoderConfig make_qwen3_decoder_config(
     const Qwen3ASRTextDecoderConfig & config,
-    modules::CausalDecoderLogitsMode logits_mode) {
+    modules::CausalDecoderLogitsMode logits_mode,
+    core::BackendType backend_type) {
     modules::CausalDecoderConfig out;
     out.stack.hidden_size = config.hidden_size;
     out.stack.num_attention_heads = config.num_attention_heads;
@@ -102,6 +103,13 @@ modules::CausalDecoderConfig make_qwen3_decoder_config(
     out.stack.rope_theta = config.rope_theta;
     out.stack.use_qk_norm = true;
     out.stack.runtime.static_cache.update_mode = modules::DecoderStaticCacheUpdateMode::DirectSetRows;
+    if (backend_type == core::BackendType::Metal && !core::metal_fa_rdna2_enabled()) {
+        // Metal without the FA-RDNA2 kernels has no flash kernel for the
+        // static-cache decode tail (default static_mode is flash): fall back
+        // to the manual path instead of emitting an unsupported op.
+        out.stack.runtime.attention.prefill_mode = modules::DecoderAttentionMode::ManualRepeat;
+        out.stack.runtime.attention.static_mode = modules::DecoderAttentionMode::ManualRepeat;
+    }
     out.logits_size = config.output_size;
     out.logits_mode = logits_mode;
     return out;
@@ -333,7 +341,7 @@ public:
 
         const auto decoder_weights = make_qwen3_decoder_weights(weights);
         auto decoder_out = modules::CausalDecoderModule(
-                               make_qwen3_decoder_config(config, modules::CausalDecoderLogitsMode::LastStep))
+                               make_qwen3_decoder_config(config, modules::CausalDecoderLogitsMode::LastStep, runtime_->backend_type()))
                                .build(ctx, x, positions, decoder_weights);
         for (const auto & layer : decoder_out.state.layers) {
             if (!layer.key.has_value() || !layer.value.has_value()) {
@@ -522,7 +530,7 @@ public:
         auto positions = core::wrap_tensor(positions_, core::TensorShape::from_dims({prompt_steps_}), GGML_TYPE_I32);
 
         auto decoder_out = modules::CausalDecoderModule(
-                               make_qwen3_decoder_config(config, modules::CausalDecoderLogitsMode::AllSteps))
+                               make_qwen3_decoder_config(config, modules::CausalDecoderLogitsMode::AllSteps, runtime_->backend_type()))
                                .build(ctx, x, positions, make_qwen3_decoder_weights(weights));
         auto token_ids = engine::sampling::GreedyDecodeModule().build(ctx, decoder_out.logits);
         token_ids_ = token_ids.tensor;
@@ -647,7 +655,7 @@ public:
             GGML_TYPE_F16);
         graph_ = ggml_new_graph_custom(ctx_.get(), 65536, false);
         auto decoder_out = modules::CausalDecoderModule(
-                               make_qwen3_decoder_config(config, modules::CausalDecoderLogitsMode::LastStep))
+                               make_qwen3_decoder_config(config, modules::CausalDecoderLogitsMode::LastStep, runtime_->backend_type()))
                                .build_static_cache_tail(
                                    ctx,
                                    graph_,
