@@ -1818,7 +1818,7 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
             [encoder fillBuffer:bid_dst.metal
-                          range:NSMakeRange(bid_dst.offs, bid_dst.offs + size)
+                          range:NSMakeRange(bid_dst.offs, size)
                           value:value];
 
             [encoder endEncoding];
@@ -1834,16 +1834,26 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         memcpy((char *) tensor->data + offset, data, size);
         return;
     }
+    if (size == 0) {
+        return;
+    }
 
     @autoreleasepool {
-        // src
-        void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        // src: use a driver-managed shared staging buffer instead of wiring
+        // the caller's pages with newBufferWithBytesNoCopy. On discrete GPUs
+        // the NoCopy path degrades under sustained transfer traffic
+        // (measured: per-transfer upload/download times climbing linearly
+        // request-over-request); driver-managed staging keeps them flat.
+        // The extra memcpy here is negligible next to the blit+wait.
+        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithLength:size
+                                                              options:MTLResourceStorageModeShared];
 
+        if (buf_src == nil) {
+            GGML_LOG_ERROR("%s: error: failed to create staging upload buffer, size = %8.2f MiB\n", __func__, size / 1024.0 / 1024.0);
+        }
         GGML_ASSERT(buf_src);
+
+        memcpy([buf_src contents], data, size);
 
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
@@ -1868,8 +1878,9 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         }
 
         [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-                             // TODO: can check for errors here
-            GGML_UNUSED(cb);
+            if (cb.status == MTLCommandBufferStatusError) {
+                GGML_LOG_ERROR("%s: error: staging upload command buffer failed: %s\n", __func__, [[cb error].localizedDescription UTF8String]);
+            }
 
             dispatch_semaphore_signal(completion_semaphore);
         }];
@@ -1888,18 +1899,23 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         memcpy(data, (const char *) tensor->data + offset, size);
         return;
     }
+    if (size == 0) {
+        return;
+    }
 
     @autoreleasepool {
         // src
         struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
         bid_src.offs += offset;
 
-        // dst
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        // dst: driver-managed shared staging buffer (see set_tensor).
+        // Copy out to the caller's memory after the blit completes.
+        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithLength:size
+                                                              options:MTLResourceStorageModeShared];
 
+        if (buf_dst == nil) {
+            GGML_LOG_ERROR("%s: error: failed to create staging download buffer, size = %8.2f MiB\n", __func__, size / 1024.0 / 1024.0);
+        }
         GGML_ASSERT(buf_dst);
 
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
@@ -1918,6 +1934,10 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+        if (cmd_buf.status == MTLCommandBufferStatusError) {
+            GGML_LOG_ERROR("%s: error: staging download command buffer failed: %s\n", __func__, [[cmd_buf error].localizedDescription UTF8String]);
+        }
+        memcpy(data, [buf_dst contents], size);
     }
 }
 
