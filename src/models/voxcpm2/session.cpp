@@ -191,13 +191,20 @@ void validate_session_options(
     }
     if (key == "voxcpm2.weight_context_mb" ||
         key == "voxcpm2.text_embedding_graph_context_mb" ||
+        key == "voxcpm2.text_embedding_graph_arena_mb" ||
         key == "voxcpm2.lm_step_graph_context_mb" ||
+        key == "voxcpm2.lm_step_graph_arena_mb" ||
         key == "voxcpm2.projection_graph_context_mb" ||
+        key == "voxcpm2.projection_graph_arena_mb" ||
         key == "voxcpm2.local_encoder_graph_context_mb" ||
+        key == "voxcpm2.local_encoder_graph_arena_mb" ||
         key == "voxcpm2.dit_graph_context_mb" ||
+        key == "voxcpm2.dit_graph_arena_mb" ||
         key == "voxcpm2.audiovae_weight_context_mb" ||
         key == "voxcpm2.audiovae_graph_context_mb" ||
+        key == "voxcpm2.audiovae_graph_arena_mb" ||
         key == "voxcpm2.audiovae_encoder_graph_context_mb" ||
+        key == "voxcpm2.audiovae_encoder_graph_arena_mb" ||
         key == "voxcpm2.audiovae_latent_capacity" ||
         key == "voxcpm2.audiovae_encoder_sample_capacity" ||
         key == "voxcpm2.weight_type" ||
@@ -243,8 +250,10 @@ VoxCPM2SessionBase::VoxCPM2SessionBase(runtime::TaskSpec task,
     throw std::runtime_error(
         "VoxCPM2 only supports offline and streaming sessions");
   }
-  if (task_.task != runtime::VoiceTaskKind::Tts) {
-    throw std::runtime_error("VoxCPM2 only supports the Tts task");
+  if (task_.task != runtime::VoiceTaskKind::Tts &&
+      task_.task != runtime::VoiceTaskKind::VoiceCloning &&
+      task_.task != runtime::VoiceTaskKind::VoiceDesign) {
+    throw std::runtime_error("VoxCPM2 supports TTS, voice cloning, and voice design");
   }
 
   reject_enabled_denoise(options.options, {"voxcpm2.denoise"});
@@ -257,31 +266,31 @@ VoxCPM2SessionBase::VoxCPM2SessionBase(runtime::TaskSpec task,
       generator_config_.weight_context_bytes);
   generator_config_.text_embedding_graph_context_bytes =
       runtime::parse_size_mb_option(
-          options.options, {"voxcpm2.text_embedding_graph_context_mb"},
+          options.options, {"voxcpm2.text_embedding_graph_arena_mb", "voxcpm2.text_embedding_graph_context_mb"},
           generator_config_.text_embedding_graph_context_bytes);
   generator_config_.lm_step_graph_context_bytes = runtime::parse_size_mb_option(
-      options.options, {"voxcpm2.lm_step_graph_context_mb"},
+      options.options, {"voxcpm2.lm_step_graph_arena_mb", "voxcpm2.lm_step_graph_context_mb"},
       generator_config_.lm_step_graph_context_bytes);
   generator_config_.projection_graph_context_bytes =
       runtime::parse_size_mb_option(
-          options.options, {"voxcpm2.projection_graph_context_mb"},
+          options.options, {"voxcpm2.projection_graph_arena_mb", "voxcpm2.projection_graph_context_mb"},
           generator_config_.projection_graph_context_bytes);
   generator_config_.local_encoder_graph_context_bytes =
       runtime::parse_size_mb_option(
-          options.options, {"voxcpm2.local_encoder_graph_context_mb"},
+          options.options, {"voxcpm2.local_encoder_graph_arena_mb", "voxcpm2.local_encoder_graph_context_mb"},
           generator_config_.local_encoder_graph_context_bytes);
   generator_config_.dit_graph_context_bytes = runtime::parse_size_mb_option(
-      options.options, {"voxcpm2.dit_graph_context_mb"},
+      options.options, {"voxcpm2.dit_graph_arena_mb", "voxcpm2.dit_graph_context_mb"},
       generator_config_.dit_graph_context_bytes);
   generator_config_.prompt_cache_slots = encoded_prompt_cache_.capacity();
   decoder_config_.weight_context_bytes = runtime::parse_size_mb_option(
       options.options, {"voxcpm2.audiovae_weight_context_mb"},
       decoder_config_.weight_context_bytes);
   decoder_config_.graph_context_bytes = runtime::parse_size_mb_option(
-      options.options, {"voxcpm2.audiovae_graph_context_mb"},
+      options.options, {"voxcpm2.audiovae_graph_arena_mb", "voxcpm2.audiovae_graph_context_mb"},
       decoder_config_.graph_context_bytes);
   decoder_config_.encoder_graph_context_bytes = runtime::parse_size_mb_option(
-      options.options, {"voxcpm2.audiovae_encoder_graph_context_mb"},
+      options.options, {"voxcpm2.audiovae_encoder_graph_arena_mb", "voxcpm2.audiovae_encoder_graph_context_mb"},
       decoder_config_.encoder_graph_context_bytes);
   decoder_config_.latent_frame_capacity = runtime::parse_positive_i64_option(
       options.options, {"voxcpm2.audiovae_latent_capacity"},

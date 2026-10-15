@@ -43,7 +43,7 @@ server-wide value.
 AuK Base and AuK-Flash use separate GGUFs for the generator, Qwen conditioner,
 and VAE, plus config and tokenizer sidecars. F16 and Q8_0 components have smoke
 coverage, but full Python parity was measured only for the earlier combined
-GGUF with FP32 inference. See [AuK](community_models/auk.md) for CLI usage.
+GGUF with FP32 inference. See [AuK](models/auk.md) for CLI usage.
 
 Status labels:
 
@@ -64,13 +64,16 @@ Status labels:
 |---|---|---|---|---|---|
 | `ace_step` | Done | Pass | --- | Pass (drift) | No (planner sampling can fail) |
 | `apollo` | Done | --- | Pass (drift) | --- | --- |
+| `ast_audioset` | Done | --- | Pass (F32) | --- | --- |
 | `audio_flamingo` | Done | Pass | Pass | --- | --- |
 | `bs_roformer` | Done | Pass | --- | --- | Pass |
 | `canary_asr` | Done | Pass | Pass | --- | Pass |
+| `ced` | Done | --- | Pass (F32; Tiny/Mini/Small/Base) | --- | --- |
 | `chatterbox` | Done | Pass | --- | Pass (ASR match, drift) | Pass (ASR match, drift) |
 | `citrinet_asr` | Done | Pass | --- | --- | Pass |
 | `cohere_asr` | Done | Pass | Pass | --- | Pass (drift) |
 | `crisperwhisper` | Done | Pass | Pass | --- | Pass (drift) |
+| `firered_vad` | Done | --- | Pass (F32; VAD + Stream-VAD) | --- | --- |
 | `fish_audio` | Done | Pass | --- | Pass | Pass |
 | `fun_asr_nano` | Done | Pass | --- | Pass | Pass |
 | `gigaam_asr` | Done | --- | Pass | Pass | --- |
@@ -81,25 +84,26 @@ Status labels:
 | `htdemucs` | Done | Pass | --- | Pass | Pass (drift) |
 | `htdemucs_6stems` | Done | Pass | --- | Pass | Pass (drift) |
 | `hviske_asr` | Done | Pass | --- | --- | Pass |
-| `inflect_v2` | Done | Pass | Pass | --- | --- |
+| `hviske_asr_v6` | Done | --- | --- | Pass (BF16) | Pass |
 | `index_tts2` | Done (v2 + v2.5 variant) | Pass | Pass | Pass (drift) | Pass (ASR match, drift) |
+| `inflect_v2` | Done | Pass | Pass | --- | --- |
 | `irodori_tts` | Done | Pass | --- | Pass | Pass (ASR match, drift) |
-| `kroko_asr` | Done | Pass | --- | --- | Pass |
 | `kitten_tts` | Done | --- | Pass (drift) | --- | --- |
+| `kroko_asr` | Done | Pass | --- | --- | Pass |
 | `kugelaudio` | Done | --- | --- | Pass (ASR match, drift) | --- |
 | `magpie_tts` | Done | --- | Pass | --- | Pass |
 | `marblenet_vad` | Bundled (tiny model) | Pass | --- | --- | --- |
 | `maya1` | Done | --- | Pass | --- | --- |
 | `meanvc2` | Done | --- | --- | Pass | --- |
-| `tone_color_vc` | Done | --- | Pass (F32) | Pass (F16, drift) | No (drift) |
 | `mel_band_roformer` | Done | Pass | --- | Pass (drift) | Pass (drift) |
+| `micro_wake_word` | Done | --- | Pass (F32) | --- | --- |
 | `miocodec` | Done | Pass | Pass | Pass (drift) | Pass (drift) |
 | `miotts` | Done | Pass | Pass | Pass (drift) | Pass (ASR match, drift) |
 | `mms_forced_aligner` | Done | Pass | --- | Pass | Pass (bit-identical) |
 | `moonshine_asr` | Done | Pass | --- | --- | Pass |
+| `moss_transcribe_diarize` | Done | --- | Pass | --- | Pass |
 | `moss_tts_local` | Done | Pass | --- | Pass | Pass (ASR match, drift) |
 | `moss_tts_nano` | Done | Pass | --- | Pass | Pass (ASR match, drift) |
-| `moss_transcribe_diarize` | Done | --- | Pass | --- | Pass |
 | `mossformer2` | Done | --- | Pass (F32) | --- | --- |
 | `muscriptor` | Done | Pass | Pass | --- | --- |
 | `nemotron_3_diar` | Done | --- | Pass | --- | --- |
@@ -109,8 +113,8 @@ Status labels:
 | `outetts` | Done | Pass (TTS + clone) | --- | --- | Pass (TTS + clone) |
 | `owsm` | Done | --- | Pass | --- | Pass (drift) |
 | `parakeet_tdt` | Done | Pass | Pass | Pass | Pass |
-| `piper_tts` | Done | Pass | Pass | --- | --- |
 | `personaplex` | Done | --- | --- | --- | Pass |
+| `piper_tts` | Done | Pass | Pass | --- | --- |
 | `pocket_tts` | Done | Pass | --- | Pass | Pass (drift) |
 | `pulsevad` | Done | Pass | Pass | --- | --- |
 | `qwen3_asr` | Done | Pass | --- | Pass | Pass |
@@ -122,17 +126,19 @@ Status labels:
 | `rvc` | Done | --- | --- | Pass | --- |
 | `sam_audio` | Done | --- | Pass | --- | --- |
 | `samsone` | Done | --- | --- | Pass | Pass (drift) |
-| `sidon` | Done | --- | Pass | --- | --- |
 | `seed_vc` | Done | Pass | --- | Pass (drift) | Pass (drift) |
-| `sopro_tts` | Done | Pass | --- | Pass | Pass |
-| `soprano_tts` | Done | Pass | --- | Pass | Pass (drift) |
+| `sherpa_kws` | Done | --- | Pass (F32) | --- | --- |
+| `sidon` | Done | --- | Pass | --- | --- |
 | `silero_vad` | Skip (tiny model) | --- | --- | --- | --- |
 | `smart_turn` | Done | F32 | --- | --- | --- |
+| `soprano_tts` | Done | Pass | --- | Pass | Pass (drift) |
+| `sopro_tts` | Done | Pass | --- | Pass | Pass |
 | `sortformer_diar` | Done | Pass | --- | Pass | Pass |
 | `sortformer_diar_v2` | Done | Pass | Pass | Pass (mixed; output-turn criteria) | No (speaker drift) |
 | `stable_audio` | Done | Pass | --- | Pass (drift) | Pass (drift) |
 | `supertonic` | Done | Pass | Pass | Pass | No (Q8 blockers unresolved) |
 | `tf_gridnet` | Done | --- | Pass (F32) | --- | --- |
+| `tone_color_vc` | Done | --- | Pass (F32) | Pass (F16, drift) | No (drift) |
 | `universr` | Done | --- | Pass | --- | --- |
 | `vevo2` | Done | Pass | Pass | Pass (drift) | No (mixed route drift; speech ASR match) |
 | `vibevoice` | Done | Pass | --- | Pass | Pass (drift) |
@@ -140,6 +146,8 @@ Status labels:
 | `vibevoice_asr_streaming` | Done | --- | --- | Pass | Pass |
 | `voxcpm2` | Done | Pass | Pass | Pass (ASR match, drift) | Pass (ASR match, drift) |
 | `voxtral_realtime` | Done | Pass | --- | Pass | Pass |
+| `voxtral_tts` | Done | --- | --- | Pass (BF16) | Pass |
+| `whistle_asr` | Done | --- | --- | --- | --- |
 
 Additional lower-bit checks:
 

@@ -78,7 +78,7 @@
       {
         "name": "temperature",
         "type": "float",
-        "description": "Main codec sampling temperature; must be positive when sampling, default 0.9.",
+        "description": "Main codec sampling temperature; must be > 0 when do_sample=true. Ignored when do_sample=false; default 0.9.",
         "required": false,
         "min": 0,
         "default": 0.9
@@ -103,7 +103,7 @@
       {
         "name": "repetition_penalty",
         "type": "float",
-        "description": "Positive repetition penalty for the main codec stream; default 1.05.",
+        "description": "Main codec repetition penalty; must be > 0, default 1.05.",
         "required": false,
         "min": 0,
         "default": 1.05
@@ -118,7 +118,7 @@
       {
         "name": "subtalker_temperature",
         "type": "float",
-        "description": "Subtalker sampling temperature; must be positive when sampling, default 0.9.",
+        "description": "Subtalker sampling temperature; must be > 0 when subtalker_do_sample=true. Ignored when subtalker_do_sample=false; default 0.9.",
         "required": false,
         "min": 0,
         "default": 0.9
@@ -151,7 +151,7 @@
       {
         "name": "reference_text",
         "type": "string",
-        "description": "Transcript matching the reference audio for Base voice cloning.",
+        "description": "Transcript matching the reference audio for Base voice cloning; required unless x_vector_only_mode=true.",
         "required": false
       },
       {
@@ -162,15 +162,26 @@
         "default": false
       },
       {
-        "name": "instruction",
+        "name": "instruct",
         "type": "string",
-        "description": "Natural-language voice or style instruction for VoiceDesign and CustomVoice variants.",
+        "description": "Optional natural-language voice or style instruction for VoiceDesign and CustomVoice variants; empty instructions are accepted.",
         "required": false
       },
       {
-        "name": "speaker",
-        "type": "string",
-        "description": "Named preset speaker from the CustomVoice checkpoint, such as Vivian or Ryan.",
+        "name": "voice_id",
+        "type": "enum",
+        "description": "Named preset speaker from the CustomVoice checkpoint. These are the official checkpoint's presets; available names are determined by the loaded checkpoint. Legacy speaker remains accepted.",
+        "values": [
+          "aiden",
+          "dylan",
+          "eric",
+          "ono_anna",
+          "ryan",
+          "serena",
+          "sohee",
+          "uncle_fu",
+          "vivian"
+        ],
         "required": false
       },
       {
@@ -246,6 +257,18 @@
         "preset": "weight_type_conv"
       },
       {
+        "name": "rknn_decoder",
+        "type": "path",
+        "required": false,
+        "description": "Path to a pre-compiled stateful speech-tokenizer decoder .rknn (Rockchip NPU). Requires a build with ENGINE_ENABLE_RKNN. When set, the decoder stage runs on the NPU and its ggml weights are not loaded."
+      },
+      {
+        "name": "rknn_decoder_first",
+        "type": "path",
+        "required": false,
+        "description": "Optional smaller-batch .rknn used for the first token group only, to cut time-to-first-audio in streaming. Requires rknn_decoder."
+      },
+      {
         "name": "talker_graph_arena_mb",
         "type": "int",
         "description": "Talker graph arena size in MiB; default 32.",
@@ -318,7 +341,7 @@
       "GGUF"
     ],
     "docs": [
-      "docs/models/qwen3.md",
+      "docs/models/qwen3_tts.md",
       "docs/tts.md",
       "docs/gguf.md"
     ]

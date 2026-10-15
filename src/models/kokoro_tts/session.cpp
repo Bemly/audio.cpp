@@ -29,6 +29,15 @@ constexpr int64_t kDefaultTextChunkSize = 240;
 constexpr const char * kFamily = "kokoro_tts";
 constexpr const char * kModelName = "Kokoro TTS";
 
+// A published GGUF package embeds its own model spec, so an option added to
+// model_specs/kokoro_tts.json is invisible to a package built before it. The NPU
+// generator option is therefore also accepted by name (piper_tts does the same).
+constexpr const char * kPackageIndependentSessionOptions[] = {
+    "kokoro_tts.rknn_generator",
+    "kokoro_tts.rknn_generator_overlap",
+    "kokoro_tts.rknn_generator_gain",
+};
+
 }  // namespace
 
 KokoroTTSSession::KokoroTTSSession(
@@ -46,7 +55,47 @@ KokoroTTSSession::KokoroTTSSession(
     if (contract_ == nullptr) {
         throw std::runtime_error("Kokoro TTS session requires a model contract");
     }
-    runtime::validate_spec_backed_session_options(RuntimeSessionBase::options(), *contract_, kFamily, kModelName);
+    auto validation_options = RuntimeSessionBase::options();
+    // Arena aliases are parsed below, independently of the embedded spec version.
+    for (const auto * key : {"kokoro_tts.predictor_duration_graph_arena_mb",
+                            "kokoro_tts.predictor_duration_graph_mb",
+                            "kokoro_tts.predictor_text_graph_arena_mb",
+                            "kokoro_tts.predictor_text_graph_mb",
+                            "kokoro_tts.predictor_tail_graph_arena_mb",
+                            "kokoro_tts.predictor_tail_graph_mb"}) {
+        validation_options.options.erase(key);
+    }
+    // The RKNN sidecar options are model-local and opt-in, and a published GGUF package embeds
+    // an older spec that does not declare them, so they are accepted by name below.
+    for (const auto * key : kPackageIndependentSessionOptions) {
+        validation_options.options.erase(key);
+    }
+    runtime::validate_spec_backed_session_options(validation_options, *contract_, kFamily, kModelName);
+    if (const auto found = RuntimeSessionBase::options().options.find("kokoro_tts.rknn_generator");        found != RuntimeSessionBase::options().options.end()) {
+        rknn_generator_path_ = found->second;
+    }
+    if (rknn_generator_path_.empty()) {
+        for (const char * option : {"kokoro_tts.rknn_generator_overlap",
+                                    "kokoro_tts.rknn_generator_gain"}) {
+            if (RuntimeSessionBase::options().options.count(option) != 0) {
+                throw std::runtime_error(
+                    std::string(kModelName) + " session option 'kokoro_tts.rknn_generator' " +
+                    "must name an RKNN engine before '" + option + "' can tune its window walk");
+            }
+        }
+    }
+    if (const auto overlap = runtime::parse_i64_option(
+            RuntimeSessionBase::options().options,
+            {"kokoro_tts.rknn_generator_overlap"});
+        overlap.has_value()) {
+        rknn_generator_overlap_ = *overlap;
+    }
+    if (const auto gain = runtime::find_option(
+            RuntimeSessionBase::options().options,
+            {"kokoro_tts.rknn_generator_gain"});
+        gain.has_value()) {
+        rknn_generator_gain_ = runtime::parse_bool_option(*gain, "kokoro_tts.rknn_generator_gain");
+    }
     if (task_.task != runtime::VoiceTaskKind::Tts) {
         throw std::runtime_error("Kokoro TTS only supports tts tasks");
     }
@@ -71,15 +120,15 @@ KokoroTTSSession::KokoroTTSSession(
         weight_context_bytes_);
     predictor_duration_graph_bytes_ = runtime::parse_size_mb_option(
         session_options,
-        {"kokoro_tts.predictor_duration_graph_mb"},
+        {"kokoro_tts.predictor_duration_graph_arena_mb", "kokoro_tts.predictor_duration_graph_mb"},
         predictor_duration_graph_bytes_);
     predictor_text_graph_bytes_ = runtime::parse_size_mb_option(
         session_options,
-        {"kokoro_tts.predictor_text_graph_mb"},
+        {"kokoro_tts.predictor_text_graph_arena_mb", "kokoro_tts.predictor_text_graph_mb"},
         predictor_text_graph_bytes_);
     predictor_tail_graph_bytes_ = runtime::parse_size_mb_option(
         session_options,
-        {"kokoro_tts.predictor_tail_graph_mb"},
+        {"kokoro_tts.predictor_tail_graph_arena_mb", "kokoro_tts.predictor_tail_graph_mb"},
         predictor_tail_graph_bytes_);
     weights_ = load_kokoro_backend_weights(
         *assets_,
@@ -234,7 +283,10 @@ void KokoroTTSSession::prepare_decoder_graph_capacity(int64_t capacity) {
                 threads,
                 use_device_backend,
                 rng_seed_,
-                decoder_contract);
+                decoder_contract,
+                rknn_generator_path_,
+                rknn_generator_overlap_,
+                rknn_generator_gain_);
         });
     }
     prepared_decoder_capacity_ = capacity;
@@ -338,13 +390,15 @@ void validate_request_options(
     const bool old_speed = contract.request_option_keys.find("speed") == contract.request_option_keys.end();
     const bool old_speaking_rate = contract.request_option_keys.find("speaking_rate") == contract.request_option_keys.end();
     const bool old_timestamps = contract.request_option_keys.find(kTimestampsOption) == contract.request_option_keys.end();
-    if (!old_phonemes && !old_speed && !old_speaking_rate && !old_timestamps) {
+    const bool old_voice_id = contract.request_option_keys.find("voice_id") == contract.request_option_keys.end();
+    if (!old_phonemes && !old_speed && !old_speaking_rate && !old_timestamps && !old_voice_id) {
         runtime::validate_spec_backed_request_options(options, option_arrays, contract, kModelName);
         return;
     }
     std::unordered_map<std::string, std::string> validation_options;
     for (const auto & [key, _] : options) {
         if ((key == "speed" && old_speed) || (key == "speaking_rate" && old_speaking_rate) ||
+            (key == "voice_id" && old_voice_id) ||
             (key == kTimestampsOption && old_timestamps)) continue;
         validation_options.emplace(key, std::string{});
     }
@@ -370,17 +424,30 @@ bool request_return_timestamps(const std::unordered_map<std::string, std::string
     return value.has_value() && runtime::parse_bool_option(*value, kTimestampsOption);
 }
 
-std::optional<runtime::VoiceCondition> voice_with_request_rate(
+std::optional<runtime::VoiceCondition> voice_with_request_options(
     const std::optional<runtime::VoiceCondition> & voice,
+    const std::optional<runtime::Transcript> & text,
     const std::unordered_map<std::string, std::string> & options) {
     const auto rate = runtime::parse_positive_finite_float_option(options, {"speed", "speaking_rate"});
-    if (!rate.has_value() || (voice.has_value() && voice->style.has_value() &&
-                              voice->style->speaking_rate.has_value())) {
+    const auto voice_id = runtime::find_option(options, {"voice_id"});
+    const auto language = runtime::find_option(options, {"language"});
+    if (!rate.has_value() && !voice_id.has_value() && !language.has_value()) {
         return voice;
     }
     auto resolved = voice.value_or(runtime::VoiceCondition{});
-    if (!resolved.style.has_value()) resolved.style = runtime::StyleCondition{};
-    resolved.style->speaking_rate = *rate;
+    if (voice_id.has_value() && (!resolved.speaker.has_value() || !resolved.speaker->cached_voice_id.has_value())) {
+        if (!resolved.speaker.has_value()) resolved.speaker = runtime::VoiceReference{};
+        resolved.speaker->cached_voice_id = *voice_id;
+    }
+    if (rate.has_value() && (!resolved.style.has_value() || !resolved.style->speaking_rate.has_value())) {
+        if (!resolved.style.has_value()) resolved.style = runtime::StyleCondition{};
+        resolved.style->speaking_rate = *rate;
+    }
+    if (language.has_value() && (!text.has_value() || text->language.empty()) &&
+        (!resolved.style.has_value() || !resolved.style->language.has_value())) {
+        if (!resolved.style.has_value()) resolved.style = runtime::StyleCondition{};
+        resolved.style->language = *language;
+    }
     return resolved;
 }
 
@@ -514,15 +581,7 @@ void append_kokoro_word_timings(
 
 void KokoroTTSSession::prepare(const runtime::SessionPreparationRequest & request) {
     validate_request_options(request.options, request.option_arrays, *contract_);
-    const auto voice = voice_with_request_rate(request.voice, request.options);
-    if (const auto seed = runtime::parse_u64_option(request.options, {"seed"})) {
-        if (rng_seed_ != *seed) {
-            rng_seed_ = *seed;
-            prepared_decoder_.reset();
-            prepared_decoder_capacity_ = 0;
-            prepared_decoder_context_ = {};
-        }
-    }
+    const auto voice = voice_with_request_options(request.voice, request.text, request.options);
     auto adapter = make_graph_capacity_adapter();
     int64_t request_size = 0;
     const auto & prepare_phonemes = require_phoneme_chunks(request.option_arrays);
@@ -582,7 +641,11 @@ runtime::TaskResult KokoroTTSSession::synthesize(const runtime::TaskRequest & re
         throw std::runtime_error("Kokoro TTS run requires text_input");
     }
     validate_request_options(request.options, request.option_arrays, *contract_);
-    const auto voice = voice_with_request_rate(request.voice, request.options);
+    const auto voice = voice_with_request_options(request.voice, request.text_input, request.options);
+
+    rng_seed_ = runtime::parse_u64_option(request.options, {"seed"}).value_or(runtime::random_u64_seed());
+    if (prepared_decoder_) prepared_decoder_->set_seed(rng_seed_);
+    engine::debug::trace_log_scalar("kokoro.generation.seed", rng_seed_);
 
     const int64_t text_chunk_size =
         engine::text::parse_text_chunk_size_override(request.options).value_or(kDefaultTextChunkSize);

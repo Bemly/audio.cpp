@@ -59,7 +59,8 @@
         "description": "Non-negative generation seed.",
         "required": false,
         "min": 0,
-        "default": 1234
+        "default": 1234,
+        "max": 4294967295
       },
       {
         "name": "text_chunk_mode",
@@ -94,6 +95,12 @@
         "name": "espeak_data_path",
         "type": "path",
         "description": "Optional explicit path to espeak-ng-data.",
+        "required": false
+      },
+      {
+        "name": "rknn_decoder",
+        "type": "path",
+        "description": "Path to a pre-compiled RKNN engine for this voice's decoder, voiced on a Rockchip NPU. Needs a build with ENGINE_ENABLE_RKNN; build the engine with tools/prepare_piper_tts_rknn_vocoder.py.",
         "required": false
       }
     ],
@@ -130,7 +137,7 @@
     ],
     "docs": [
       "docs/tts.md",
-      "docs/community_models/piper_tts.md",
+      "docs/models/piper_tts.md",
       "docs/gguf.md"
     ]
   },

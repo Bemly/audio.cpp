@@ -31,6 +31,12 @@ runtime::ModelMetadata metadata(const VibeVoiceAssets & assets) {
 runtime::ModelCliInterface cli(const VibeVoiceAssets &) {
     runtime::ModelCliInterface out;
     out.request_options = {
+        {"max_tokens", "n", "Maximum generated tokens; 0 selects an automatic budget.", false, "0", "0"},
+        {"do_sample", "true|false", "Enable sampling instead of deterministic decoding.", false, "false"},
+        {"temperature", "float", "Positive sampling temperature.", false, "1"},
+        {"top_k", "n", "Top-k sampling limit; 0 disables filtering.", false, "50", "0"},
+        {"top_p", "float", "Nucleus sampling probability in (0, 1].", false, "1", std::nullopt, "1"},
+        {"seed", "int", "Generation seed.", false, "1234", "0", "4294967295"},
         {"voice_samples", "path[,path...]", "Comma-separated speaker reference WAV paths for multi-speaker prompts."},
         {"num_inference_steps", "n", "Diffusion inference steps."},
         {"guidance_scale", "float", "Classifier-free guidance scale."},
@@ -44,10 +50,12 @@ runtime::ModelCliInterface cli(const VibeVoiceAssets &) {
         {"vibevoice.connector_weight_type", "native|f32|f16|bf16|q8_0", "Acoustic and semantic connector weight storage type."},
         {"vibevoice.decoder_weight_type", "native|f32|f16|bf16|q8_0", "Language decoder weight storage type."},
         {"vibevoice.diffusion_head_weight_type", "native|f32|f16|bf16|q8_0", "Diffusion prediction head weight storage type."},
+        {"vibevoice.lora", "path", "Adapter directory applied when creating the session; do not also supply the load option."},
+        {"vibevoice.lora_scale", "float", "Session adapter scale override; omitted uses lora_alpha / r. Must be strictly positive when an adapter is supplied."},
     };
     out.load_options = {
         {"vibevoice.lora", "path", "Fine-tune adapter dir (LM LoRA + diffusion head + acoustic/semantic connectors) merged at load time."},
-        {"vibevoice.lora_scale", "float", "LoRA merge scale override; defaults to lora_alpha / r."},
+        {"vibevoice.lora_scale", "float", "LoRA scale override; omitted uses lora_alpha / r. Must be strictly positive when an adapter is supplied."},
     };
     return out;
 }

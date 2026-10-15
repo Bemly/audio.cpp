@@ -57,6 +57,11 @@ dependency detection.
 
 ## Config
 
+For ready-to-edit configs with explained paths, voice-library setup, and complete
+requests, see [server examples](../../examples/server/README.md). They cover
+Qwen3-TTS, BreezeTTS, Kokoro, PocketTTS, YuE2, MiniMax Music3, and Parakeet ASR.
+
+
 ```bash
 cat > server.json <<'JSON'
 {
@@ -77,12 +82,6 @@ cat > server.json <<'JSON'
       "mode": "offline",
       "load_options": {
         "language": "english"
-      },
-      "session_options": {
-        "language": "english"
-      },
-      "default_request_options": {
-        "speaking_rate": 1.0
       },
       "default_voice_preset": {
         "voice_id": "alba"
@@ -106,7 +105,9 @@ cat > server.json <<'JSON'
 JSON
 ```
 
-The server resolves model paths from this JSON exactly as written, so use paths that match your machine. Request-time audio paths are also user-provided paths.
+Relative model and voice-library paths are resolved against the config file’s directory.
+Use absolute paths in your first config to avoid confusion. Request-time audio paths
+refer to files accessible on the server’s computer.
 
 Package specs embedded in a GGUF are used automatically. Builds configured with
 `AUDIOCPP_DEPLOYMENT_BUILD=ON` also carry a compiled fallback catalog; normal builds
@@ -502,7 +503,7 @@ Models with revisable hypotheses, currently Phonon-2, may additionally emit
 `{"type":"transcript.text.partial","text":"..."}`. This is a whole provisional
 transcript to replace in the display, never append to the committed deltas.
 For these models, deltas contain finalized segments only. Other models retain
-their existing event behavior. See [Phonon-2](../../docs/community_models/phonon2.md).
+their existing event behavior. See [Phonon-2](../../docs/models/parakeet_tdt.md#phonon-2-parakeet-tdt-variant).
 
 Note that `stream=true` streams the *output* of an already-uploaded file: the whole recording is sent first, and the deltas describe decoding it. It shortens time-to-first-token on long audio, but nothing can appear while the speaker is still talking. For that, use the live endpoint below.
 

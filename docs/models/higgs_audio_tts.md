@@ -2,7 +2,8 @@
 
 Higgs Audio v3 TTS is a voice-clone TTS model. The current integration uses
 the framework chunker for long text and keeps the reference prompt state in the
-model session.
+model session. Use `clon` for voice-cloning requests; the existing `tts` route
+remains an alias to the same model path for compatibility.
 
 ## Install
 
@@ -15,7 +16,7 @@ python3 tools/model_manager_v2.py install --models-root models higgs_audio_tts_4
 ## Quick Start
 
 ```bash
-audiocpp_cli --task tts --family higgs_audio_tts --model models/Higgs-Audio-v3-TTS-4B-GGUF/higgs-audio-v3-tts-4b-q8_0.gguf --backend cuda --text "Hello from Higgs Audio." --voice-ref assets/resources/b.wav --reference-text "Some call me nature. Others call me Mother Nature. I've been here for over 4.5 billion years. 22,500 times longer than you." --out out.wav
+audiocpp_cli --task clon --family higgs_audio_tts --model models/Higgs-Audio-v3-TTS-4B-GGUF/higgs-audio-v3-tts-4b-q8_0.gguf --backend cuda --text "Hello from Higgs Audio." --voice-ref assets/resources/b.wav --reference-text "Some call me nature. Others call me Mother Nature. I've been here for over 4.5 billion years. 22,500 times longer than you." --out out.wav
 ```
 
 ## Model
@@ -24,7 +25,7 @@ audiocpp_cli --task tts --family higgs_audio_tts --model models/Higgs-Audio-v3-T
 |---|---|
 | Family | `higgs_audio_tts` |
 | Model path | `models/Higgs-Audio-v3-TTS-4B-GGUF/higgs-audio-v3-tts-4b-q8_0.gguf` when installed through the model manager |
-| Task | `tts` |
+| Tasks | `tts`, `clon` |
 | Modes | `offline`, `streaming` |
 | Languages | Model auto-handles supported languages |
 | Voice input | Reference WAV through `--voice-ref`; transcript through `--reference-text` when known |
@@ -34,24 +35,24 @@ audiocpp_cli --task tts --family higgs_audio_tts --model models/Higgs-Audio-v3-T
 
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
-| `--voice-ref` | WAV path | required | Reference speaker audio. |
+| `--voice-ref` | WAV path | optional | Reference speaker audio for cloning; generation without a reference is also supported. |
 | `--reference-text` | text | empty string | Transcript for reference audio. |
 | `--text-chunk-size` | integer chars | `1024` | Long-form chunk size. |
-| `--max-tokens` | integer | `2048` | Maximum generated AR tokens per chunk. |
-| `--temperature` | float | `0.8` | AR sampling temperature. |
+| `--max-tokens` | integer | `2048` | Maximum generated AR tokens; zero uses the default. Must not exceed the configured context length. |
+| `--temperature` | float | `0.8` | AR sampling temperature. Must be positive. |
 | `--top-k` | integer | `30` | AR top-k sampling limit. The narrower default is less prone to premature EOC than the Python client's `50`. |
-| `--top-p` | float | `0.8` | AR nucleus sampling limit. The Python client's unfiltered equivalent is `1.0`. |
-| `--repetition-penalty` | float | `1.1` | Accepted for Python API compatibility; Higgs audio-code sampling does not consume it. |
+| `--top-p` | float | `0.8` | AR nucleus sampling probability. Must be positive. |
+| `--repetition-penalty` | float | `1.1` | Accepted for Python API compatibility; audio sampling does not consume this value. Compatibility-only, but must be finite and positive. |
 
 ## Request Options (use with `--request-option`)
 
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
-| `max_tokens` | integer >= 0 | `2048` | Maximum generated AR tokens; zero uses the default. |
-| `temperature` | float | `0.8` | AR sampling temperature. |
-| `top_p` | float | `0.8` | AR nucleus sampling probability. |
+| `max_tokens` | integer >= 0 | `2048` | Maximum generated AR tokens; zero uses the default. Must not exceed the configured context length. |
+| `temperature` | float | `0.8` | AR sampling temperature. Must be positive. |
+| `top_p` | float | `0.8` | AR nucleus sampling probability. Must be positive. |
 | `top_k` | integer | `30` | AR top-k sampling limit. |
-| `repetition_penalty` | float | `1.1` | Accepted for Python API compatibility; audio sampling does not consume this value. |
+| `repetition_penalty` | float | `1.1` | Accepted for Python API compatibility; audio sampling does not consume this value. Compatibility-only, but must be finite and positive. |
 | `seed` | integer >= 0 | random | Torch sampling seed; omitted chooses a random seed. |
 | `reference_text` | text | empty string | Transcript accompanying reference audio. |
 | `text_chunk_size` | integer | `1024` | Framework long-form text chunk size. |
@@ -79,8 +80,17 @@ the request's `options` object. They are not applied to offline generation.
 
 ## Session Options (use with `--session-option`)
 
+Try `--session-option higgs_audio_tts.reference_prefill_mode=exact` for excessive
+repetition or unexpectedly long, mostly silent output on repeated voice-cloning
+requests. In server configuration, set
+`"session_options": {"higgs_audio_tts.reference_prefill_mode": "exact"}` on the model entry.
+This preserves reference-KV reuse and leaves full-prompt prefill and AR decoding
+unchanged. It may increase prefill time and is not a general generation-quality fix.
+The mode is fixed for the session and applies to offline and streaming generation.
+
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
+| `higgs_audio_tts.reference_prefill_mode` | `auto`, `exact` | `auto` | Cached-reference prefill attention; `auto` preserves existing behavior, `exact` enables the workaround described above. |
 | `higgs_audio_tts.weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | `native` | Shared AR and codec weight storage type. |
 | `higgs_audio_tts.ar_weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | shared setting | Autoregressive decoder weight storage override. |
 | `higgs_audio_tts.codec_weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | shared setting | Audio codec weight storage override. |

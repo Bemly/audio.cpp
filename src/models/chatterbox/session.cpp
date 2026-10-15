@@ -56,7 +56,7 @@ ChatterboxVoiceCloneConfig make_voice_clone_config(
     config.top_p = runtime::parse_float_option(options, {"top_p"}).value_or(config.top_p);
     config.s3gen_cfg_rate = runtime::parse_float_option(
         options,
-        {"s3gen_cfg_rate"})
+        {"flow_guidance_scale", "s3gen_cfg_rate"})
         .value_or(config.s3gen_cfg_rate);
     config.max_new_tokens = runtime::parse_positive_i64_option(
         options,
@@ -83,7 +83,7 @@ ChatterboxVoiceConversionConfig make_voice_conversion_config(
     ChatterboxVoiceConversionConfig config;
     config.s3gen_cfg_rate = runtime::parse_float_option(
         options,
-        {"s3gen_cfg_rate"})
+        {"flow_guidance_scale", "s3gen_cfg_rate"})
         .value_or(config.s3gen_cfg_rate);
     config.num_inference_steps = runtime::parse_positive_i64_option(
         options,
@@ -347,9 +347,10 @@ ChatterboxSession::ChatterboxSession(
       multilingual_t3_version_(resolve_multilingual_t3_version(this->options())),
       mem_saver_(resolve_mem_saver(this->options())),
       conditionals_cache_(resolve_conditionals_cache_slots(this->options())) {
-    if (task_.task != runtime::VoiceTaskKind::VoiceCloning &&
+    if (task_.task != runtime::VoiceTaskKind::Tts &&
+        task_.task != runtime::VoiceTaskKind::VoiceCloning &&
         task_.task != runtime::VoiceTaskKind::VoiceConversion) {
-        throw std::runtime_error("Chatterbox session supports --task clon or --task vc");
+        throw std::runtime_error("Chatterbox session supports --task tts, --task clon, or --task vc");
     }
     if (task_.mode != runtime::RunMode::Offline) {
         throw std::runtime_error("Chatterbox session only supports offline mode");

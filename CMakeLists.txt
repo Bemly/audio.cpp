@@ -95,6 +95,13 @@ option(ENGINE_ENABLE_CUDA_GRAPHS "Enable ggml CUDA graphs support" ${ENGINE_DEFA
 option(ENGINE_HIP_STRIX_HALO_OPTIMIZATIONS
     "Enable opt-in HIP optimizations validated only for Strix Halo (gfx1151)"
     OFF)
+# Rockchip NPU (RK3588 & co): a model-local compute path, not a ggml backend —
+# the Qwen3 TTS speech decoder runs a pre-compiled .rknn step graph through
+# librknnrt. The engine links the board runtime; the models themselves are
+# converted offline on x86 with rknn-toolkit2.
+option(ENGINE_ENABLE_RKNN "Build the Rockchip NPU (librknnrt) decoder path" OFF)
+set(ENGINE_RKNN_INCLUDE_DIR "" CACHE PATH "Directory containing rknn_api.h (empty = use the system include path)")
+set(ENGINE_RKNN_LIBRARY "rknnrt" CACHE STRING "librknnrt to link (path or library name)")
 option(ENGINE_ENABLE_NATIVE_CPU "Build ggml CPU kernels with native host ISA flags" ${ENGINE_DEFAULT_ENABLE_NATIVE_CPU})
 option(ENGINE_ENABLE_OPENMP "Build host code with OpenMP support" ON)
 option(AUDIOCPP_STATIC_ESPEAK "Build and statically link GPL-3.0-or-later eSpeak-ng; keep data separate" OFF)
@@ -400,6 +407,12 @@ function(audiocpp_configure_runtime_object target_name)
     if (AUDIOCPP_HIP_STRIX_HALO_OPTIMIZATIONS_ACTIVE)
         target_compile_definitions(${target_name} PRIVATE ENGINE_HIP_STRIX_HALO_OPTIMIZATIONS=1)
     endif()
+    if (ENGINE_ENABLE_RKNN)
+        target_compile_definitions(${target_name} PRIVATE ENGINE_HAVE_RKNN=1)
+        if (ENGINE_RKNN_INCLUDE_DIR)
+            target_include_directories(${target_name} PRIVATE ${ENGINE_RKNN_INCLUDE_DIR})
+        endif()
+    endif()
     target_link_libraries(${target_name} PRIVATE ggml sentencepiece)
     if (ENGINE_ENABLE_OPENMP)
         target_link_libraries(${target_name} PRIVATE OpenMP::OpenMP_CXX)
@@ -475,6 +488,7 @@ add_library(engine_core OBJECT
     src/framework/io/safetensors.cpp
     src/framework/debug/trace.cpp
     src/framework/debug/profiler.cpp
+    src/framework/rknn/engine.cpp
     src/framework/decoders/moss_tts_delay/backbone.cpp
     src/framework/decoders/moss_tts_delay/config.cpp
     src/framework/decoders/moss_tts_delay/delay_decoder.cpp
@@ -805,6 +819,7 @@ audiocpp_add_model(kokoro_tts
         src/models/kokoro_tts/frontend.cpp
         src/models/kokoro_tts/predictor.cpp
         src/models/kokoro_tts/decoder.cpp
+        src/models/kokoro_tts/rknn_generator.cpp
         src/models/kokoro_tts/plbert.cpp
         src/models/kokoro_tts/session.cpp
     INCLUDES engine/models/kokoro_tts/session.h
@@ -919,6 +934,19 @@ audiocpp_add_model(outetts
         qwen3_forced_aligner
 )
 
+audiocpp_add_model(voxtral_tts
+    SOURCES
+        src/models/voxtral_tts/assets.cpp
+        src/models/voxtral_tts/ar.cpp
+        src/models/voxtral_tts/acoustic.cpp
+        src/models/voxtral_tts/codec.cpp
+        src/models/voxtral_tts/session.cpp
+    INCLUDES
+        engine/models/voxtral_tts/session.h
+    LOADERS
+        engine::models::voxtral_tts::make_voxtral_tts_loader
+)
+
 audiocpp_add_model(kugelaudio
     SOURCES
         src/models/kugelaudio/ar.cpp
@@ -1006,6 +1034,7 @@ audiocpp_add_model(piper_tts
         src/community_models/piper_tts/assets.cpp
         src/community_models/piper_tts/frontend.cpp
         src/community_models/piper_tts/vits_runtime.cpp
+        src/community_models/piper_tts/rknn_decoder.cpp
         src/community_models/piper_tts/session.cpp
     INCLUDES
         engine/community_models/piper_tts/session.h
@@ -1758,6 +1787,7 @@ audiocpp_add_model(qwen3_tts
         src/models/qwen3_tts/tokenizer_text.cpp
         src/models/qwen3_tts/tokenizer_speech_encoder.cpp
         src/models/qwen3_tts/tokenizer_speech_decoder.cpp
+        src/models/qwen3_tts/rknn_speech_decoder.cpp
         src/models/qwen3_tts/speaker_encoder.cpp
         src/models/qwen3_tts/talker.cpp
         src/models/qwen3_tts/prompt_tts_voice_clone.cpp
@@ -2610,6 +2640,13 @@ endif()
 if (AUDIOCPP_HIP_STRIX_HALO_OPTIMIZATIONS_ACTIVE)
     target_compile_definitions(engine_runtime PRIVATE ENGINE_HIP_STRIX_HALO_OPTIMIZATIONS=1)
 endif()
+if (ENGINE_ENABLE_RKNN)
+    target_compile_definitions(engine_runtime PRIVATE ENGINE_HAVE_RKNN=1)
+    if (ENGINE_RKNN_INCLUDE_DIR)
+        target_include_directories(engine_runtime PUBLIC ${ENGINE_RKNN_INCLUDE_DIR})
+    endif()
+    target_link_libraries(engine_runtime PUBLIC ${ENGINE_RKNN_LIBRARY})
+endif()
 if (ENGINE_ENABLE_HIP)
     # ggml-hip publicly defines GGML_USE_CUDA for consumers, so engine code
     # needs this marker to tell a real CUDA build apart from a HIP build.
@@ -2936,6 +2973,8 @@ add_executable(audiocpp_server
     app/server/parallel_http.cpp
     app/server/model_memory.cpp
     app/server/multipart.cpp
+    app/server/server_protocol.cpp
+    app/server/server_ui.cpp
     app/server/runtime.cpp
     app/server/parallel_runtime.cpp
     app/server/ui_assets.cpp
@@ -3001,6 +3040,9 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         add_executable(firered_vad_rules_test tests/firered_vad/test_rules.cpp)
         target_link_libraries(firered_vad_rules_test PRIVATE engine_runtime ggml)
         add_test(NAME firered_vad_rules_test COMMAND firered_vad_rules_test)
+    endif()
+    if (moss_tts_nano IN_LIST AUDIOCPP_LINKED_MODELS)
+        # (moved next to the other moss_tts_nano tests)
     endif()
     if ("kitten_tts2" IN_LIST AUDIOCPP_LINKED_MODELS)
         add_executable(audiocpp_kitten_tts2_prepare_voices tools/community_models/prepare_kitten_tts2_voices.cpp)
@@ -3197,6 +3239,8 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
     add_test(NAME shared_weight_cache_test COMMAND shared_weight_cache_test)
     add_engine_unittest(cpu_extra_buffers_test tests/unittests/test_cpu_extra_buffers.cpp)
     add_test(NAME cpu_extra_buffers_test COMMAND cpu_extra_buffers_test)
+    add_engine_unittest(rknn_engine_test tests/unittests/test_rknn_engine.cpp)
+    add_test(NAME rknn_engine_test COMMAND rknn_engine_test)
     if (ENGINE_ENABLE_VULKAN)
         add_engine_unittest(vulkan_shared_weight_cache_test tests/unittests/test_vulkan_shared_weight_cache.cpp)
         add_test(NAME vulkan_shared_weight_cache_test COMMAND vulkan_shared_weight_cache_test)
@@ -3272,7 +3316,22 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
     endif()
 
+    if (granite5asr IN_LIST AUDIOCPP_LINKED_MODELS)
+        add_engine_unittest(granite5asr_ctc_timestamps_test tests/granite5asr/test_ctc_timestamps.cpp)
+        target_include_directories(granite5asr_ctc_timestamps_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
+        add_test(NAME granite5asr_ctc_timestamps_test COMMAND granite5asr_ctc_timestamps_test)
+    endif()
+
     if (ENGINE_BUILD_TESTS)
+        # Runtime tests exercise the core HTTP handlers, not optional frontend
+        # modules. Give their frontend.cpp an empty registry and exclude the
+        # server target's inherited frontend object files.
+        set(AUDIOCPP_SERVER_TEST_GENERATED_DIR
+            "${CMAKE_CURRENT_BINARY_DIR}/generated/server_runtime_tests")
+        file(MAKE_DIRECTORY "${AUDIOCPP_SERVER_TEST_GENERATED_DIR}")
+        file(WRITE "${AUDIOCPP_SERVER_TEST_GENERATED_DIR}/server_frontend_module_declarations.inc" "")
+        file(WRITE "${AUDIOCPP_SERVER_TEST_GENERATED_DIR}/server_frontend_module_registrations.inc" "")
+
         add_executable(server_speech_option_exceptions_test
             tests/unittests/test_server_speech_option_exceptions.cpp)
         target_include_directories(server_speech_option_exceptions_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/app/server)
@@ -3286,10 +3345,13 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
         get_target_property(server_selection_sources audiocpp_server SOURCES)
         list(FILTER server_selection_sources EXCLUDE REGEX "app/server/(main|model_installer|parallel_runtime)\\.cpp$")
+        list(FILTER server_selection_sources EXCLUDE REGEX "audiocpp_server_frontends")
         add_executable(server_runtime_selection_test
             tests/unittests/test_server_runtime_selection.cpp ${server_selection_sources})
         target_include_directories(server_runtime_selection_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/app/server "${CMAKE_CURRENT_BINARY_DIR}/generated")
+            ${CMAKE_CURRENT_SOURCE_DIR}/app/server
+            "${AUDIOCPP_SERVER_TEST_GENERATED_DIR}"
+            "${CMAKE_CURRENT_BINARY_DIR}/generated")
         target_link_libraries(server_runtime_selection_test PRIVATE engine_runtime ggml Threads::Threads)
         if(WIN32)
             target_link_libraries(server_runtime_selection_test PRIVATE ws2_32)
@@ -3301,10 +3363,13 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         # installer or backend-specific model admission is needed by this test.
         get_target_property(server_lifecycle_sources audiocpp_server SOURCES)
         list(FILTER server_lifecycle_sources EXCLUDE REGEX "app/server/(main|model_installer|runtime)\\.cpp$")
+        list(FILTER server_lifecycle_sources EXCLUDE REGEX "audiocpp_server_frontends")
         add_executable(server_parallel_lifecycle_test
             tests/unittests/test_server_parallel_lifecycle.cpp ${server_lifecycle_sources})
         target_include_directories(server_parallel_lifecycle_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/app/server "${CMAKE_CURRENT_BINARY_DIR}/generated")
+            ${CMAKE_CURRENT_SOURCE_DIR}/app/server
+            "${AUDIOCPP_SERVER_TEST_GENERATED_DIR}"
+            "${CMAKE_CURRENT_BINARY_DIR}/generated")
         target_link_libraries(server_parallel_lifecycle_test PRIVATE engine_runtime ggml Threads::Threads)
         if(WIN32)
             target_link_libraries(server_parallel_lifecycle_test PRIVATE ws2_32)
@@ -3438,6 +3503,8 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         add_engine_unittest(partial_text_test tests/unittests/test_partial_text.cpp)
         add_test(NAME partial_text_test COMMAND partial_text_test)
         add_engine_unittest(streaming_audio_test tests/unittests/test_streaming_audio.cpp)
+        add_engine_unittest(streaming_asr_session_test tests/unittests/test_streaming_asr_session.cpp)
+        add_test(NAME streaming_asr_session_test COMMAND streaming_asr_session_test)
         add_test(NAME streaming_audio_test COMMAND streaming_audio_test)
 
         add_engine_unittest(wav_writer_formats_test tests/unittests/test_wav_writer_formats.cpp)
@@ -3997,6 +4064,27 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         if (ENGINE_ENABLE_OPENMP)
             target_link_libraries(moss_tts_delay_backbone_parity PRIVATE OpenMP::OpenMP_CXX)
         endif()
+
+        # Incremental decode parity: chunked prefill / decode step / cross-utterance prefix reuse
+        # against a one-shot prefill, plus frame-cache independence for the local decoder.
+        add_executable(moss_tts_nano_kv_cache_parity
+            tests/moss_tts_nano/kv_cache_parity.cpp
+        )
+        target_link_libraries(moss_tts_nano_kv_cache_parity PRIVATE engine_runtime ggml)
+        if (ENGINE_ENABLE_OPENMP)
+            target_link_libraries(moss_tts_nano_kv_cache_parity PRIVATE OpenMP::OpenMP_CXX)
+        endif()
+
+        # Reference-voice cache rules. Deliberately model-free, so unlike the parity
+        # target above this one is registered as a test and needs no downloaded model.
+        add_executable(moss_tts_nano_reference_cache_test
+            tests/moss_tts_nano/reference_cache_test.cpp
+        )
+        target_link_libraries(moss_tts_nano_reference_cache_test PRIVATE engine_runtime ggml)
+        if (ENGINE_ENABLE_OPENMP)
+            target_link_libraries(moss_tts_nano_reference_cache_test PRIVATE OpenMP::OpenMP_CXX)
+        endif()
+        add_test(NAME moss_tts_nano_reference_cache_test COMMAND moss_tts_nano_reference_cache_test)
 
         add_executable(moss_tts_v15_prompt_parity
             tests/moss_tts_v15/prompt_parity.cpp
