@@ -1890,6 +1890,11 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
         dispatch_release(completion_semaphore);
 
+        // newBufferWithLength follows the +1 "new" convention (it is NOT
+        // autoreleased): release it, otherwise every upload leaks its
+        // driver mappings (~1 graphics region per transfer).
+        [buf_src release];
+
         //[cmd_buf waitUntilCompleted];
     }
 }
@@ -1938,6 +1943,9 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
             GGML_LOG_ERROR("%s: error: staging download command buffer failed: %s\n", __func__, [[cmd_buf error].localizedDescription UTF8String]);
         }
         memcpy(data, [buf_dst contents], size);
+
+        // +1 "new" convention: must release (see set_tensor).
+        [buf_dst release];
     }
 }
 
