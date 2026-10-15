@@ -343,7 +343,10 @@ bool uses_host_graph_plan(BackendType type) {
 bool metal_fa_rdna2_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_METAL_FA_AMD");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
+        // Default ON; opt out with GGML_METAL_FA_AMD=0. On Apple-family
+        // GPUs the ggml dispatch gate keeps the RDNA2 kernels off anyway,
+        // so models safely select the flash lowerings there too.
+        return value == nullptr || value[0] != '0';
     }();
     return enabled;
 }

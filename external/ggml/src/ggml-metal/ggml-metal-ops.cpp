@@ -2843,11 +2843,14 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
 // {64,128,256}, no sinks/ALiBi/softcap; anything else falls back to upstream.
 // Phase knobs GGML_METAL_DECODE_FA_* / GGML_METAL_PP_FA_* win over GGML_METAL_FA_*.
 
+// Master switch, default ON. Opt out with GGML_METAL_FA_AMD=0.
+// The Apple-family safety gate lives at the dispatch site below: these
+// self-written VALU kernels only ever run on non-Apple discrete GPUs.
 static bool ggml_metal_fa_amd_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char * val = getenv("GGML_METAL_FA_AMD");
-        cached = (val && val[0] && val[0] != '0') ? 1 : 0;
+        cached = (val && val[0] == '0') ? 0 : 1;
     }
     return cached == 1;
 }
@@ -3742,12 +3745,15 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
 
-    // FA-RDNA2: self-written AMD kernels (env GGML_METAL_FA_AMD=1 + shape/align gates)
-    if (ggml_metal_op_flash_attn_ext_amd_supported(op) && ggml_metal_op_flash_attn_ext_amd_align_ok(op)) {
+    // FA-RDNA2: self-written AMD kernels (default on, GGML_METAL_FA_AMD=0
+    // opts out; shape/align gates). Apple-family GPUs never take this path
+    // even when the shapes would pass: the VALU tuning is RDNA2-specific.
+    const bool fa_amd_allowed = !props_dev->supports_gpu_family_apple7 && !props_dev->has_unified_memory;
+    if (fa_amd_allowed && ggml_metal_op_flash_attn_ext_amd_supported(op) && ggml_metal_op_flash_attn_ext_amd_align_ok(op)) {
         return ggml_metal_op_flash_attn_ext_amd(ctx, idx, scale);
     }
     // Quantized KV: dequant prepass to scratch F16, then fa_amd vec/tile (any nq)
-    if (ggml_metal_op_flash_attn_ext_amd_quant_supported(op)) {
+    if (fa_amd_allowed && ggml_metal_op_flash_attn_ext_amd_quant_supported(op)) {
         return ggml_metal_op_flash_attn_ext_amd_quant(ctx, idx, scale);
     }
 
