@@ -12001,7 +12001,7 @@ kernel void kernel_flash_attn_ext_amd_vec_dk(
                     float4 p = float4(q4 * kh4[i]);
                     acc += p.x + p.y + p.z + p.w;
                 }
-                s = HAS_MASK_FA_AMD ? acc + (float) mp[t] : acc;
+                s = HAS_MASK_FA_AMD ? acc + (float) mp[t]*1.44269504088896f : acc;   // mask 在 ln 域，S 在 log2 域
             }
             if (lane < NBC) {
                 ss[lane] = s;
@@ -12217,7 +12217,7 @@ kernel void kernel_flash_attn_ext_amd_tile_dk(
                     }
                     s = acc;
                     if (HAS_MASK_FA_AMD) {
-                        s += (float) ((device const half *) mp)[t];
+                        s += (float) ((device const half *) mp)[t]*1.44269504088896f;   // ln 域 mask → log2 域
                     }
                 }
                 s_reg[kk] = s;
