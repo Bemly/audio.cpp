@@ -29,6 +29,9 @@ struct CausalDecoderRuntimeConfig {
     std::vector<int32_t> logits_readback_token_ids;
     int64_t sliding_window = 0;
     bool evict_cuda_graph_cache_on_release = false;
+    // Zero keeps full-capacity attention; positive values cache bounded decode graphs.
+    int64_t batched_attention_alignment = 0;
+    bool reuse_batched_decode_scratch = false;
 };
 
 struct CausalDecoderRuntimeWeights {
@@ -107,6 +110,16 @@ public:
         int64_t batch_size,
         int64_t steps);
 
+    // Unequal-length prefixes write directly into their persistent cache lanes.
+    std::vector<CausalDecoderStepResult> prefill_tokens_into_batched_decode_cache(
+        const std::vector<std::vector<int32_t>> & prefixes,
+        int64_t required_cache_steps);
+    // Same for embedding inputs: each prefix holds steps x hidden_size floats. Follow
+    // with decode_embeddings_batched().
+    std::vector<CausalDecoderStepResult> prefill_embeddings_into_batched_decode_cache(
+        const std::vector<std::vector<float>> & prefixes,
+        int64_t required_cache_steps);
+
     void start_decode_tokens(const runtime::TransformerKVState & state, int64_t required_cache_steps);
     void start_decode_embeddings(const runtime::TransformerKVState & state, int64_t required_cache_steps);
     CausalDecoderStepResult decode_token(int32_t token);
@@ -132,6 +145,7 @@ public:
     int64_t decode_cache_steps() const noexcept;
     int64_t decode_current_end() const noexcept;
     int64_t decode_valid_steps() const noexcept;
+    void release_prefill_graph();
     void release_runtime_graphs();
 
 private:

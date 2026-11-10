@@ -1,6 +1,78 @@
 {
   "cases": [
     {
+      "id": "moss_soundeffect_requests",
+      "coverage": "English and Chinese sound effects, changing durations/prompts/seeds and repeated-request determinism",
+      "family": "moss_soundeffect",
+      "model": "models/audio.cpp-gguf/MOSS-SoundEffect-v2-GGUF/moss-soundeffect-v2-q8_0.gguf",
+      "task": "gen",
+      "outputs": [
+        "audio"
+      ],
+      "requests": [
+        {
+          "id": "rain",
+          "text": "Steady rain pattering on a wooden roof, with distant thunder.",
+          "seed": 42,
+          "options": {
+            "duration_sec": 10
+          }
+        },
+        {
+          "id": "fire",
+          "text": "A crackling campfire with occasional sharp pops in a quiet forest.",
+          "seed": 2026,
+          "options": {
+            "duration_sec": 8
+          }
+        },
+        {
+          "id": "birds",
+          "text": "清晨的森林里，鸟儿鸣叫，微风轻轻吹过树叶。",
+          "seed": 1234,
+          "options": {
+            "duration_sec": 6
+          }
+        },
+        {
+          "id": "rain_repeat",
+          "text": "Steady rain pattering on a wooden roof, with distant thunder.",
+          "seed": 42,
+          "options": {
+            "duration_sec": 10
+          }
+        }
+      ]
+    },
+    {
+      "id": "plapre_conditioning",
+      "coverage": "Danish voices, reference conditioning, speaker-only cloning, chunking, growing decode capacity and repeated requests",
+      "family": "plapre",
+      "model": "models/Plapre-3-GGUF/plapre-3-bf16.gguf",
+      "task": "tts",
+      "outputs": ["audio"],
+      "requests": [
+        {"id": "base", "text": "Hej, hvordan har du det?", "seed": 42, "options": {"temperature": 0, "max_tokens": 128}},
+        {"id": "base_repeat", "text": "Hej, hvordan har du det?", "seed": 42, "options": {"temperature": 0, "max_tokens": 128}},
+        {"id": "reference", "text": "I morgen kommer jeg igen.", "voice_ref": "resources/hviske_asr/danish_unified_00.wav", "seed": 42, "options": {"temperature": 0, "max_tokens": 1000}},
+        {"id": "speaker_only", "text": "I morgen kommer jeg igen.", "voice_ref": "resources/hviske_asr/danish_unified_00.wav", "seed": 42, "options": {"temperature": 0, "x_vector_only_mode": true}},
+        {"id": "chunked", "text": "Godmorgen. I dag skinner solen over byen. Hej, hvordan har du det?", "seed": 42, "options": {"temperature": 0, "voice_id": "ida", "text_chunk_size": 40}},
+        {"id": "repeat", "text": "Hej, hvordan har du det?", "seed": 42, "options": {"temperature": 0, "max_tokens": 128}}
+      ]
+    },
+    {
+      "id": "plapre_streaming",
+      "coverage": "Completed text-chunk audio deltas and streaming finalization",
+      "family": "plapre",
+      "model": "models/Plapre-3-GGUF/plapre-3-bf16.gguf",
+      "task": "tts",
+      "mode": "streaming",
+      "outputs": ["audio"],
+      "requests": [
+        {"id": "sentences", "text": "Godmorgen. I dag skinner solen over byen.\nHej, hvordan har du det?", "seed": 42, "options": {"temperature": 0, "text_chunk_mode": "endline"}}
+      ]
+    },
+    {
       "id": "ced_classification",
       "coverage": "CED classification, changing graph shapes, long audio pooling, top-k selection and repeat requests",
       "family": "ced",
@@ -2927,6 +2999,37 @@
       ]
     },
     {
+      "id": "gradium_phonon_long_short_long",
+      "coverage": "Gradium Phonon text conditioner, speaker_wavs voice prompt, flow LM, Mimi decoder chunk/reuse path",
+      "family": "gradium_phonon",
+      "model": "models/phonon-31m-en",
+      "task": "tts",
+      "mode": "offline",
+      "outputs": [
+        "audio"
+      ],
+      "requests": [
+        {
+          "id": "long",
+          "text": "The museum guide paused at the bronze clock so the children could hear its careful chime echo through the hall while visitors moved toward the river doors.",
+          "voice_id": "default",
+          "seed": 1234
+        },
+        {
+          "id": "short",
+          "text": "Rain taps softly on the glass roof.",
+          "voice_id": "default",
+          "seed": 1234
+        },
+        {
+          "id": "long_again",
+          "text": "Another longer request checks that Phonon keeps its session state stable after a shorter sentence and does not rebuild more than needed.",
+          "voice_id": "default",
+          "seed": 1234
+        }
+      ]
+    },
+    {
       "id": "moss_tts_nano_streaming",
       "coverage": "MOSS-TTS-Nano incremental code frames and cached causal codec decoding",
       "family": "moss_tts_nano",
@@ -3407,6 +3510,66 @@
       ]
     },
     {
+      "id": "lfm3_audio_q8_offline",
+      "coverage": "LFM3-Audio Q8_0 published GGUF: whole-input, VAD and fixed chunking, and spoken-question chat",
+      "family": "lfm3_audio",
+      "model": "models/LFM3-Audio-2B-GGUF/LFM3-Audio-2B-Q8_0.gguf",
+      "task": "asr",
+      "mode": "offline",
+      "outputs": [
+        "text"
+      ],
+      "requests": [
+        {
+          "id": "librispeech_whole",
+          "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0000.wav",
+          "language": "en"
+        },
+        {
+          "id": "librispeech_vad",
+          "audio": "assets/asr_validation/librispeech/librispeech_test_other_7902-96591-0000.wav",
+          "options": {
+            "audio_chunk_mode": "vad"
+          }
+        },
+        {
+          "id": "librispeech_fixed_2s",
+          "audio": "assets/asr_validation/librispeech/librispeech_test_clean_6930-75918-0001.wav",
+          "language": "en",
+          "options": {
+            "audio_chunk_mode": "fixed",
+            "audio_chunk_duration_sec": 2
+          }
+        },
+        {
+          "id": "spoken_chat",
+          "audio": "assets/resources/c.wav",
+          "options": {
+            "chat": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "lfm3_audio_q8_s2s",
+      "coverage": "LFM3-Audio Q8_0 spoken chat: a spoken turn in, a reply of interleaved text and 24 kHz speech out",
+      "family": "lfm3_audio",
+      "model": "models/LFM3-Audio-2B-GGUF/LFM3-Audio-2B-Q8_0.gguf",
+      "task": "s2s",
+      "mode": "offline",
+      "outputs": [
+        "audio",
+        "text"
+      ],
+      "requests": [
+        {
+          "id": "greeting",
+          "audio": "assets/resources/c.wav",
+          "seed": 1234
+        }
+      ]
+    },
+    {
       "id": "fun_asr_nano_offline",
       "coverage": "Fun-ASR-Nano Q8 GGUF offline English ASR warm-session path",
       "family": "fun_asr_nano",
@@ -3429,6 +3592,56 @@
             "enable_itn": false,
             "max_tokens": 128
           }
+        }
+      ]
+    },
+    {
+      "id": "haas_ja_offline",
+      "coverage": "Haas Japanese KDA predictor, full-context and bounded-window scheduling, state reset",
+      "family": "haas_asr",
+      "model": "models/Haas-ja-v1.0-GGUF/haas-ja-v1.0-q8_0.gguf",
+      "task": "asr",
+      "session_options": {
+        "haas_asr.matmul_weight_type": "q8_0"
+      },
+      "outputs": [
+        "text"
+      ],
+      "requests": [
+        {
+          "id": "full",
+          "audio": "assets/asr_validation/common_voice_ja/common_voice_ja_20461197.wav"
+        },
+        {
+          "id": "windowed",
+          "audio": "assets/asr_validation/common_voice_ja/common_voice_ja_20461197.wav",
+          "options": {
+            "audio_chunk_mode": "fixed"
+          }
+        },
+        {
+          "id": "repeat",
+          "audio": "assets/asr_validation/common_voice_ja/common_voice_ja_20461197.wav"
+        }
+      ]
+    },
+    {
+      "id": "haas_ja_streaming",
+      "coverage": "Haas Japanese buffered streaming chunk ingestion and finalize",
+      "family": "haas_asr",
+      "model": "models/Haas-ja-v1.0-GGUF/haas-ja-v1.0-q8_0.gguf",
+      "task": "asr",
+      "session_options": {
+        "haas_asr.matmul_weight_type": "q8_0"
+      },
+      "outputs": [
+        "text"
+      ],
+      "mode": "streaming",
+      "requests": [
+        {
+          "id": "stream",
+          "audio": "assets/asr_validation/common_voice_ja/common_voice_ja_20461197.wav"
         }
       ]
     },

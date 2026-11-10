@@ -27,7 +27,7 @@
       {
         "name": "language",
         "type": "string",
-        "description": "Language selection precedence: voice-style language, transcript language (CLI --language), request-option language, then voice prefix. Must match the selected voice.",
+        "description": "Language selection precedence: voice-style language, transcript language (CLI --language), request-option language, then voice prefix. Must match the first voice in a blend.",
         "required": false
       },
       {
@@ -53,10 +53,9 @@
       {
         "name": "text_chunk_size",
         "type": "int",
-        "description": "Maximum codepoints per text chunk before synthesis. Default 240.",
+        "description": "Maximum codepoints per text chunk before synthesis. Default 100 for Chinese and Japanese voices, otherwise 240.",
         "required": false,
-        "min": 1,
-        "default": 240
+        "min": 1
       },
       {
         "name": "return_timestamps",
@@ -139,10 +138,11 @@
         "default": 0
       },
       {
-        "name": "rknn_generator",
-        "type": "path",
-        "description": "Path to a pre-compiled RKNN engine for the iSTFTNet generator, voiced on a Rockchip NPU. Needs a build with ENGINE_ENABLE_RKNN; build the engine with tools/prepare_kokoro_tts_rknn_generator.py.",
-        "required": false
+        "name": "exec_plan",
+        "type": "string",
+        "description": "JSON object of component execution plans. Component: generator. Each plan accepts impl, backend, artifacts, and params. impl is default/ggml/rknn/neon. GGML keeps the session backend. The complete NEON generator requires a CPU session and ENGINE_ENABLE_NEON=ON on AArch64, without artifacts or params. RKNN requires artifacts.main and ENGINE_ENABLE_RKNN; omit backend. RKNN params: overlap (nonnegative integer, default 0, smaller than the emitted window), gain (boolean, default false; keeps a GGML generator reference).",
+        "required": false,
+        "default": "{}"
       }
     ],
     "load": []
@@ -178,6 +178,24 @@
         "Kokoro-82M-GGUF/kokoro-82m-bf16.gguf"
       ],
       "strip_prefix": "Kokoro-82M-GGUF"
+    },
+    {
+      "id": "kokoro_82m_generator_rk3588",
+      "display_name": "Kokoro 82M NPU Generator RKNN (RK3588)",
+      "format": "rknn",
+      "precision": "f16",
+      "target_directory": "Kokoro-82M-GGUF",
+      "files": [
+        "rk3588/generator_w512.rknn"
+      ],
+      "strip_prefix": "rk3588",
+      "description": "Pre-compiled RK3588 engine for the kokoro_tts RKNN generator sidecar (kokoro_tts.exec_plan, artifacts.main); installs beside the GGUF weights and is named by bare file name. Built by tools/rknn from the Kokoro-82M iSTFTNet generator export; see docs/build/rockchip-npu.md.",
+      "download": {
+        "kind": "huggingface_snapshot",
+        "repo": "wOvANAI/rknn-tts-engines",
+        "revision": "main",
+        "gated": false
+      }
     }
   ],
   "dependencies": [],

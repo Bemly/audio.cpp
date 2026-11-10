@@ -1,11 +1,21 @@
 export type StringMap = Record<string, string>;
 
+export interface PackageLoadTarget {
+  family: string;
+  model_path: string;
+  load_options: StringMap;
+  session_options: StringMap;
+}
+
 export interface InstallPackageChoice {
   id: string;
   label: string;
   path: string;
   format: string;
   precision: string;
+  load_target?: PackageLoadTarget;
+  load_target_error?: string;
+  load_options?: StringMap;
   session_options?: StringMap;
 }
 
@@ -33,10 +43,13 @@ export interface CatalogEntry {
   required_request_options?: string[];
   builtin_voices?: string[];
   default_voice?: string;
+  // A model the server config defines under an id the catalog does not have.
+  configured?: boolean;
 }
 
 export interface ParamSpec {
   name: string;
+  group?: 'lora';
   type: 'slider' | 'number' | 'bool' | 'text' | 'choice';
   scope?: 'request' | 'session';
   session_option?: string;
@@ -62,6 +75,8 @@ export interface LoadedModel {
   path: string;
   session_options?: StringMap;
   loaded: boolean;
+  // Registered from the server config rather than loaded through the UI.
+  configured?: boolean;
 }
 
 export interface ServerHealth {

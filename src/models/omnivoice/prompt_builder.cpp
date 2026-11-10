@@ -377,7 +377,7 @@ std::string resolve_instruct(const std::string & instruct, bool use_zh) {
     }
 
     std::vector<std::string> raw_items;
-    std::regex separator(R"(\s*[,，]\s*)");
+    std::regex separator(R"(\s*(?:,|\xEF\xBC\x8C)\s*)");
     std::sregex_token_iterator begin(trimmed.begin(), trimmed.end(), separator, -1);
     std::sregex_token_iterator end;
     for (auto it = begin; it != end; ++it) {
@@ -576,6 +576,27 @@ private:
             (codepoint >= 0xFF3B && codepoint <= 0xFF40) ||
             (codepoint >= 0xFF5B && codepoint <= 0xFF65)) {
             return weights_.at("punctuation");
+        }
+        // Bengali block and dandas, matching Python's unicodedata categories (M -> mark, P/S -> punctuation, N -> digit).
+        if ((codepoint >= 0x0981 && codepoint <= 0x0983) ||
+            codepoint == 0x09BC ||
+            (codepoint >= 0x09BE && codepoint <= 0x09C4) ||
+            (codepoint >= 0x09C7 && codepoint <= 0x09C8) ||
+            (codepoint >= 0x09CB && codepoint <= 0x09CD) ||
+            codepoint == 0x09D7 ||
+            (codepoint >= 0x09E2 && codepoint <= 0x09E3) ||
+            codepoint == 0x09FE) {
+            return weights_.at("mark");
+        }
+        if (codepoint == 0x0964 || codepoint == 0x0965 ||
+            (codepoint >= 0x09F2 && codepoint <= 0x09F3) ||
+            (codepoint >= 0x09FA && codepoint <= 0x09FB) ||
+            codepoint == 0x09FD) {
+            return weights_.at("punctuation");
+        }
+        if ((codepoint >= 0x09E6 && codepoint <= 0x09EF) ||
+            (codepoint >= 0x09F4 && codepoint <= 0x09F9)) {
+            return weights_.at("digit");
         }
 
         const auto it = std::lower_bound(breakpoints_.begin(), breakpoints_.end(), codepoint);

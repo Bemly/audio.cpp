@@ -28,6 +28,18 @@ public:
     ModelInspection inspect(const std::filesystem::path & model_path) const;
     std::unique_ptr<ILoadedVoiceModel> load(const ModelLoadRequest & request) const;
     std::unique_ptr<ILoadedVoiceModel> load(const std::filesystem::path & model_path) const;
+    PackageLoadTarget resolve_package_load(
+        const std::string & family, const assets::ModelPackage & package) const;
+
+    /**
+     * What the named family's session options ask for beyond weight files, from the loader that
+     * owns the family (see IVoiceModelLoader::model_resources). A family with no loader registered
+     * in this registry -- or one that reports nothing -- yields an empty plan.
+     */
+    ModelResourcePlan model_resources(
+        const std::string & family,
+        const std::filesystem::path & model_path,
+        const std::unordered_map<std::string, std::string> & session_options) const;
 
 private:
     void validate_request(const ModelLoadRequest & request) const;
@@ -41,6 +53,14 @@ ModelRegistry make_registry_from_config(
     const RegistryConfig & config,
     const std::vector<std::shared_ptr<IVoiceModelLoader>> & available_loaders);
 ModelRegistry make_default_registry(const std::optional<std::filesystem::path> & config_path = std::nullopt);
+
+/**
+ * Load a VAD model of any family built into this binary, for internal use such as ASR
+ * VAD chunking. Only loaders that advertise offline VAD are considered; for a weight
+ * file, the loader that uses exactly that file wins over a package in the same folder.
+ * A path no VAD loader claims is loaded as Silero VAD, as before this helper existed.
+ */
+std::unique_ptr<ILoadedVoiceModel> load_vad_model(const ModelLoadRequest & request);
 
 /**
  * Close the load-progress bracket opened by ModelRegistry::load: emit

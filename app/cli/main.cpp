@@ -9,9 +9,12 @@
 #include "../workflow/file_sink.h"
 #include "../workflow/pipeline.h"
 #include "../workflow/workflow.h"
+#include "../recipe/cli_recipe.h"
+#include "../recipe/recipe.h"
 
 #include "engine/framework/audio/chunking.h"
 #include "engine/framework/audio/conversion.h"
+#include "engine/framework/audio/resampling.h"
 #include "engine/framework/core/load_progress.h"
 #include "engine/framework/debug/trace.h"
 #include "engine/framework/io/json.h"
@@ -57,19 +60,22 @@ void print_task_list_help() {
         << "    --task vad|asr|diar|sep|gen|tts|clon|vc|s2s|align|vdes|spk|svc|midi|wake|cls\n"
         << "    --family <name>\n"
         << "    --model <path>\n"
-        << "    --backend cpu|cuda|hip|rocm|vulkan|metal|best  (rocm is an alias for hip)\n"
+        << "    --backend cpu|cuda|hip|rocm|vulkan|metal|webgpu|sycl|best  (rocm is an alias for hip)\n"
         << "    --mode offline|streaming  default offline\n"
         << "    --device <n>\n"
-        << "    --list-devices  List available backend devices and exit\n"
+        << "    --backend-impl <name>             optional backend implementation; default preserves existing dispatch\n"
+        << "    --list-devices  List available backend devices and exit; --json adds PCI ids and memory\n"
         << "    --threads <n>  Backend and OpenMP worker threads, default 4\n"
         << "    --registry-config <path>\n"
-        << "    --model-spec-override <json-or-directory>  Override package-spec resolution\n"
+        << "    --model-spec-override <json-or-directory|embedded>  Select a spec file/directory or the GGUF's embedded spec\n"
         << "    --config <id>\n"
         << "    --weight <id>\n"
         << "    --log  Stream framework progress and timing logs to stdout\n"
         << "    --log-file <path>  Stream framework progress and timing logs to a file\n"
         << "    --load-progress 0|1  with --log/--log-file, emit model-load progress keys\n"
         << "                (runtime.load.phase, <store>.weights.upload_progress); default 0\n"
+        << "    --resample-kernel-cache-mb <mb>  Resampling kernel cache in MiB, default 32; 0 disables it\n"
+        << "                (a kernel larger than this is rebuilt on every call)\n"
         << "    --metrics  Print compact wall time, audio duration, and RTF summary after offline generation\n"
         << "    --load-option key=value\n"
         << "    --session-option key=value\n"
@@ -88,6 +94,12 @@ void print_task_list_help() {
         << "    --list-pipelines\n"
         << "    --workflow-input key=value  Override a top-level workflow input\n"
         << "    --audio-converter <cmd>  Converter executable for workflow media import, default ffmpeg\n"
+        << "  Recipes:\n"
+        << "    --recipe <name>  Run a built-in multi-model recipe\n"
+        << "    --list-recipes\n"
+        << "    --recipe-model role=path  Select a model file or directory for a recipe role\n"
+        << "    --recipe-family role=family  Select the model family for a recipe role\n"
+        << "    Prefix --load-option and --session-option keys with role., e.g. tts.weight_type=q8_0\n"
         << "  Task routing and media roles:\n"
         << "    --task-route <name>  User-facing route, e.g. text2music, zero_shot_tts, style_preserved_vc\n"
         << "    --source-audio <wav>  Source audio path for models that take path-based source refs\n"
@@ -660,6 +672,10 @@ int audiocpp_cli_main(int argc, char ** argv) {
             }
             engine::core::set_load_progress_enabled(*load_progress == "1");
         }
+        if (const auto cache_mb = find_arg(argc, argv, "--resample-kernel-cache-mb")) {
+            const int mb = parse_non_negative_int(*cache_mb, "--resample-kernel-cache-mb");
+            engine::audio::set_resample_kernel_cache_budget_bytes(static_cast<size_t>(mb) * 1024ull * 1024ull);
+        }
         const bool metrics_requested = has_arg(argc, argv, "--metrics");
         if (has_arg(argc, argv, "--version")) {
             minitts::app::print_build_info(std::cout);
@@ -670,6 +686,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
         auto registry = engine::runtime::make_default_registry(
             registry_config ? std::optional<std::filesystem::path>(std::filesystem::path(*registry_config)) : std::nullopt);
         auto pipeline_registry = minitts::app::make_default_pipeline_registry();
+        auto recipe_registry = minitts::app::make_recipe_registry();
         const bool help_requested = has_arg(argc, argv, "--help");
         // Read before the command branches below. An option that no lookup ever runs for cannot
         // be told apart from a misspelling, which is what require_known_args rejects.
@@ -684,8 +701,21 @@ int audiocpp_cli_main(int argc, char ** argv) {
             }
             return 0;
         }
+        if (has_arg(argc, argv, "--list-recipes")) {
+            const auto ids = recipe_registry.ids();
+            std::cout << "registered_recipes=" << ids.size() << "\n";
+            for (const auto & id : ids) {
+                const auto & recipe = recipe_registry.require(id);
+                std::cout << id << "\t" << recipe.description() << "\n";
+            }
+            return 0;
+        }
         if (has_arg(argc, argv, "--list-devices")) {
-            engine::core::print_backend_devices(std::cout);
+            if (json_output) {
+                engine::core::print_backend_devices_json(std::cout);
+            } else {
+                engine::core::print_backend_devices(std::cout);
+            }
             return 0;
         }
         if (has_arg(argc, argv, "--list-loaders")) {
@@ -756,6 +786,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
 
         const auto model_arg = find_arg(argc, argv, "--model");
         const auto pipeline_arg = find_arg(argc, argv, "--pipeline");
+        const auto recipe_arg = find_arg(argc, argv, "--recipe");
         // Read up front for the same reason as the options above.
         const auto workflow_inputs = collect_key_value_args(argc, argv, "--workflow-input");
         const auto audio_converter = find_arg(argc, argv, "--audio-converter").value_or("ffmpeg");
@@ -771,6 +802,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
 #endif
             engine::core::BackendConfig backend;
             backend.type = parse_backend(find_arg(argc, argv, "--backend").value_or("cpu"));
+            backend.impl = find_arg(argc, argv, "--backend-impl").value_or("");
             backend.device = parse_int_arg(argc, argv, "--device", 0);
             backend.threads = threads;
             minitts::app::run_json_workflow(
@@ -786,6 +818,57 @@ int audiocpp_cli_main(int argc, char ** argv) {
                     optional_path_arg(argc, argv, "--model-spec-override"),
                     audio_converter,
                 });
+            return 0;
+        }
+        if (recipe_arg.has_value()) {
+            const int threads = parse_int_arg(argc, argv, "--threads", 4);
+            if (threads <= 0) {
+                throw std::runtime_error("--threads must be positive");
+            }
+#ifdef _OPENMP
+            omp_set_num_threads(threads);
+#endif
+            minitts::app::CliRecipeOptions recipe_options;
+            for (const auto & [role, path] : collect_key_value_args(argc, argv, "--recipe-model")) {
+                recipe_options.model_paths.emplace(role, std::filesystem::path(path));
+            }
+            recipe_options.model_families = collect_key_value_args(argc, argv, "--recipe-family");
+            recipe_options.load_options = collect_key_value_args(argc, argv, "--load-option");
+            recipe_options.session_options = collect_key_value_args(argc, argv, "--session-option");
+            recipe_options.model_spec_override = optional_path_arg(argc, argv, "--model-spec-override");
+            recipe_options.backend.type = parse_backend(find_arg(argc, argv, "--backend").value_or("cpu"));
+            recipe_options.backend.impl = find_arg(argc, argv, "--backend-impl").value_or("");
+            recipe_options.backend.device = parse_int_arg(argc, argv, "--device", 0);
+            recipe_options.backend.threads = threads;
+
+            auto request = build_request_from_cli(argc, argv);
+            const auto wav_options = wav_write_options_from_cli(argc, argv);
+            const auto audio_out = optional_path_arg(argc, argv, "--out");
+            const auto output_dir = optional_path_arg(argc, argv, "--out-dir");
+            const auto text_out = optional_path_arg(argc, argv, "--text-out");
+            require_known_args(argc, argv);
+
+            minitts::app::CliRecipeModelExecutor executor(registry, std::move(recipe_options));
+            const auto started = std::chrono::steady_clock::now();
+            auto result = recipe_registry.require(*recipe_arg).run(executor, request);
+            const double wall_ms = duration_ms(std::chrono::steady_clock::now() - started);
+            engine::debug::timing_log_scalar("session.wall_ms", wall_ms);
+            std::cout << "recipe=" << *recipe_arg << "\n";
+            minitts::app::emit_task_result(
+                result,
+                audio_out,
+                output_dir,
+                output_dir,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                wav_options);
+            if (text_out.has_value()) {
+                write_text_output(result, *text_out, "text_out");
+            }
+            if (metrics_requested) {
+                minitts::app::emit_task_metrics(result, audio_metrics_info(request), wall_ms);
+            }
             return 0;
         }
         if (help_requested && !model_arg.has_value()) {
@@ -844,6 +927,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
 
         engine::runtime::SessionOptions session_options;
         session_options.backend.type = parse_backend(find_arg(argc, argv, "--backend").value_or("cpu"));
+        session_options.backend.impl = find_arg(argc, argv, "--backend-impl").value_or("");
         session_options.backend.device = parse_int_arg(argc, argv, "--device", 0);
         const int threads = parse_int_arg(argc, argv, "--threads", 4);
         if (threads <= 0) {

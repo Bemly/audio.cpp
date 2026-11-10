@@ -4,11 +4,14 @@
 |---|---|---|---|
 | AST AudioSet | `ast_audioset` | `cls` | [Model guide](models/ast_audioset.md) |
 | CED Audio Tagging | `ced` | `cls` | [Model guide](models/ced.md) |
+| d1-Omni-2B | `lfm_d1_omni` | `cls` | [Model guide](models/lfm_d1_omni.md) |
+| Earshot VAD | `earshot_vad` | `vad` | [Model guide](models/earshot_vad.md) |
 | FireRed VAD / Stream-VAD | `firered_vad` | `vad` | [Model guide](models/firered_vad.md) |
 | MarbleNet VAD | `marblenet_vad` | `vad` | [MarbleNet VAD](#marblenet-vad) |
 | microWakeWord | `micro_wake_word` | `wake` | [Model guide](models/micro_wake_word.md) |
 | MMS Forced Aligner | `mms_forced_aligner` | `align` | [MMS Forced Aligner](#mms-forced-aligner) |
 | Nemotron 3 Diarization | `nemotron_3_diar` | `diar` | [Model guide](models/nemotron_3_diar.md) |
+| OpenWakeWord Alexa | `open_wake_word` | `wake` | [Model guide](models/open_wake_word.md) |
 | PulseVAD | `pulsevad` | `vad` | [PulseVAD](models/pulsevad.md) |
 | Qwen3 Forced Aligner | `qwen3_forced_aligner` | `align` | [Qwen3 Forced Aligner](models/qwen3_forced_aligner.md) |
 | sherpa-onnx Zipformer KWS | `sherpa_kws` | `wake` | [Model guide](models/sherpa_kws.md) |
@@ -16,7 +19,7 @@
 | Sortformer Diarization | `sortformer_diar` | `diar` | [Sortformer Diarization](#sortformer-diarization) |
 | Sortformer Diarization v2.1 | `sortformer_diar_v2` | `diar` | [Sortformer Diarization v2.1](#sortformer-diarization-v21) |
 
-This page covers audio classification, VAD, diarization, and forced-aligner models. ASR models are documented in [ASR models](asr.md).
+This page covers audio classification, wake-word detection, VAD, diarization, and forced-aligner models. ASR models are documented in [ASR models](asr.md).
 
 Common CLI shape:
 
@@ -223,3 +226,9 @@ See the [community-model guide](models/sortformer_diar_v2.md) for
 conversion commands, weight profiles, streaming geometry, and validation
 limits. CUDA offline F32 execution is memory-heavy; streaming is the supported
 path for long recordings.
+
+## Audio decisions
+
+[d1-Omni-2B](models/lfm_d1_omni.md) answers named yes/no, choice, score,
+and numeric-estimate questions about audio using the `lfm_d1_omni` family and the
+`cls` task. Use the matching published main/mmproj GGUF pair from Liquid AI.

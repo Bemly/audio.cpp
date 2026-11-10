@@ -1,5 +1,6 @@
 #include "args.h"
 
+#include <charconv>
 #include <iostream>
 #include <set>
 #include <stdexcept>
@@ -163,6 +164,16 @@ int parse_int_arg(int argc, char ** argv, const std::string & name, int fallback
     return fallback;
 }
 
+int parse_non_negative_int(const std::string & value, const std::string & name) {
+    int parsed = -1;
+    const auto * last = value.data() + value.size();
+    const auto [ptr, ec] = std::from_chars(value.data(), last, parsed);
+    if (ec != std::errc{} || ptr != last || parsed < 0) {
+        throw std::runtime_error(name + " expects a non-negative integer, got: " + value);
+    }
+    return parsed;
+}
+
 std::optional<float> parse_optional_float_arg(int argc, char ** argv, const std::string & name) {
     if (const auto value = find_arg(argc, argv, name)) {
         return std::stof(*value);
@@ -192,6 +203,12 @@ engine::core::BackendType parse_backend(const std::string & value) {
     }
     if (value == "metal") {
         return engine::core::BackendType::Metal;
+    }
+    if (value == "webgpu") {
+        return engine::core::BackendType::WebGPU;
+    }
+    if (value == "sycl") {
+        return engine::core::BackendType::Sycl;
     }
     if (value == "best") {
         return engine::core::BackendType::BestAvailable;

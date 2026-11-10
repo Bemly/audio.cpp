@@ -202,6 +202,18 @@ extern "C" {
 
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
+    // Optional implementation hooks. Returned names have static lifetime and lists are NULL-terminated.
+    typedef const char * const * (*ggml_backend_dev_get_impls_t)(ggml_backend_dev_t device);
+    typedef ggml_backend_t (*ggml_backend_dev_init_with_impl_t)(
+        ggml_backend_dev_t device, const char * impl, const char * params);
+    typedef const char * (*ggml_backend_get_impl_t)(ggml_backend_t backend);
+
+    // NULL, empty and "default" preserve ordinary backend initialization.
+    GGML_API const char * const * ggml_backend_dev_get_impls(ggml_backend_dev_t device);
+    GGML_API ggml_backend_t ggml_backend_dev_init_with_impl(
+        ggml_backend_dev_t device, const char * impl, const char * params);
+    GGML_API const char * ggml_backend_get_impl(ggml_backend_t backend);
+
     // Context management and operations for faster communication between backends, used for tensor parallelism (meta backend)
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
@@ -209,6 +221,18 @@ extern "C" {
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
+    // Optional per-graph pointwise lowering. A zero mask unregisters the graph.
+    // First registration must precede allocation; it may reorder pure nodes.
+    // Registration must not change while the graph is executing. The backend
+    // returns the supported subset; unsupported patterns retain ordinary ops.
+    enum ggml_backend_graph_fusion {
+        GGML_BACKEND_GRAPH_FUSION_NORM_AFFINE = 1u << 0,
+        GGML_BACKEND_GRAPH_FUSION_BIAS_ACTIVATION = 1u << 1,
+        GGML_BACKEND_GRAPH_FUSION_GATED_RESIDUAL = 1u << 2,
+    };
+    typedef uint32_t (*ggml_backend_set_graph_fusions_t)(
+        ggml_backend_t backend, struct ggml_cgraph * graph, uint32_t mask);
+
     // Set the number of threads for the backend
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)

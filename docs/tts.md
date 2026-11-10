@@ -1,5 +1,7 @@
 # TTS Models
 
+For adapter loading and merged GGUF export, see the [LoRA guide](lora.md).
+
 | Model | Family | Task(s) | Quick Start |
 |---|---|---|---|
 | AuK (experimental) | `auk` | `tts`, `clon`, `gen` editing | [AuK](models/auk.md) |
@@ -13,8 +15,10 @@
 | F5-TTS | `f5_tts` | `tts`, `clon` | [F5-TTS](models/f5_tts.md) |
 | FireRedAudio | `firered_audio` | `asr`, `tts`, `clon`, `vdes` | [FireRedAudio](models/firered_audio.md) |
 | FireRedTTS3 | `fireredtts3` | `tts`, `clon`, `vdes` | [FireRedTTS3](models/fireredtts3.md) |
+| Fish Audio Drama3 / Drama3-small | `fish_drama3` | `tts`, `clon` | [Drama3](models/fish_drama3.md) |
 | Fish Audio S2 Pro | `fish_audio` | `tts`, `clon` | [Fish Audio S2 Pro](#fish-audio-s2-pro) |
 | GLM-TTS | `glm_tts` | `tts`, `clon` | [GLM-TTS](#glm-tts) |
+| Gradium Phonon | `gradium_phonon` | `tts` | [Gradium Phonon](models/gradium_phonon.md) |
 | Higgs Audio v3 TTS | `higgs_audio_tts` | `tts`, `clon` | [Higgs Audio v3 TTS](models/higgs_audio_tts.md) |
 | IndexTTS2 | `index_tts2` | `tts` | [IndexTTS](models/index_tts2.md) |
 | IndexTTS2.5 | `index_tts2` (variant `2.5`) | `tts` | [IndexTTS](models/index_tts2.md) |
@@ -25,9 +29,12 @@
 | Kokoro 82M | `kokoro_tts` | `tts` | [Kokoro 82M](models/kokoro_tts.md) |
 | KugelAudio-0-Open | `kugelaudio` | `tts` | [KugelAudio](models/kugelaudio.md) |
 | LFM2.5-Audio | `lfm2_audio` | `asr`, `tts`, `s2s` | [LFM2.5-Audio](models/lfm2_audio.md) |
+| LFM3-Audio | `lfm3_audio` | `asr`, `tts`, `s2s` | [LFM3-Audio](models/lfm3_audio.md) |
 | MagpieTTS | `magpie_tts` | `tts` | [MagpieTTS](#magpietts), [full guide](models/magpie_tts.md) |
 | Maya1 | `maya1` | `tts`, `vdes` | [Maya1](models/maya1.md) |
 | MiniMax-H3 | `minimax_h3` | `gen` dialogue audio | [MiniMax-H3](models/minimax_h3.md) |
+| Ming 3.0 Audio Tiny | `ming3_audio` | `tts`, `clon`, `s2s` | [Ming Audio](models/ming3_audio.md) |
+| Ming 3.0 TTS 0.5B | `ming3_tts` | `tts`, `clon`, `vdes` | [Ming TTS](models/ming3_tts.md) |
 | MioTTS | `miotts` | `tts`, `clon` | [MioTTS](models/miotts.md) |
 | MOSS-TTS-Local | `moss_tts_local` | `tts`, `clon` | [MOSS-TTS-Local](#moss-tts-local) |
 | MOSS-TTS-Nano | `moss_tts_nano` | `tts`, `clon` | [MOSS-TTS-Nano](#moss-tts-nano) |
@@ -37,7 +44,9 @@
 | OmniVoice | `omnivoice` | `tts`, `clon`, `vdes` | [OmniVoice](#omnivoice), [full guide](models/omnivoice.md) |
 | OuteTTS | `outetts` | `tts`, `clon` | [OuteTTS](#outetts) |
 | Piper TTS | `piper_tts` | `tts` | [Piper TTS](models/piper_tts.md) |
+| Plapre 3 | `plapre` | `tts`, `clon` | [Plapre 3](models/plapre.md) |
 | PocketTTS | `pocket_tts` | `tts`, `clon` | [PocketTTS](#pockettts) |
+| PocketTTS Small | `pocket_tts_small` | `tts`, `clon` | [PocketTTS Small](models/pocket_tts_small.md) |
 | Qwen3 TTS | `qwen3_tts` | `tts`, `clon`, `vdes` | [Qwen3 TTS](#qwen3-tts) |
 | sanoTTS voice family | `sanotts` | `tts` | [sanoTTS](#sanotts) |
 | Supertonic | `supertonic` | `tts` | [Supertonic](#supertonic) |
@@ -46,6 +55,7 @@
 | VoxCPM1 | `voxcpm1` | `tts`, `clon` | [VoxCPM1](#voxcpm1) |
 | VoxCPM2 | `voxcpm2` | `tts`, `clon`, `vdes` | [VoxCPM2](#voxcpm2) |
 | Voxtral 4B TTS | `voxtral_tts` | `tts` | [Voxtral TTS](models/voxtral_tts.md) |
+| XTTS v2 | `xtts_v2` | `tts` | [XTTS v2](community_models/xtts_v2.md) |
 
 This page covers speech TTS-style families. MiniMax-H3 appears here for prompt-driven dialogue audio, but it uses the generation route (`--task gen`) rather than the normal speech route (`--task tts`). Detailed route manuals live under `docs/models/` or `docs/models/` when a model needs more space.
 
@@ -848,7 +858,7 @@ VibeVoice is a long-form multi-speaker TTS model, available in 1.5B and 7B sizes
 | Voice input | Up to four speaker reference WAVs through `voice_samples` |
 | Text format | Lines like `Speaker 1: ... Speaker 2: ...`; ids are normalized internally |
 | Long-form | No text chunking; generation uses the model long-form path |
-| LoRA | Optional PEFT decoder adapter through `--load-option vibevoice.lora` |
+| LoRA | Optional decoder adapter through `--load-option vibevoice.lora` or the matching session option |
 
 Use `--mode streaming` to emit native audio chunks during generation, including
 speaker changes. The completed audio uses the same generation path as offline
@@ -900,18 +910,24 @@ audiocpp_cli --task tts --family vibevoice --model models/VibeVoice-1.5B --backe
 | `vibevoice.connector_weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | not set | Weight storage type; component-specific settings inherit weight_type. |
 | `vibevoice.decoder_weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | not set | Weight storage type; component-specific settings inherit weight_type. |
 | `vibevoice.diffusion_head_weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | not set | Weight storage type; component-specific settings inherit weight_type. |
-| `vibevoice.lora` | path | not set | Adapter directory applied when creating the session; do not also supply the load option. |
+| `vibevoice.lora` | path | not set | Decoder adapter file or PEFT directory applied when creating the session; do not also supply the load option. |
 | `vibevoice.lora_scale` | float | not set | Session adapter scale override; omitted uses lora_alpha / r. |
 
 ### Load Options (use with `--load-option`)
 
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
-| `vibevoice.lora` | path | not set | Adapter directory, merged at load time. |
+| `vibevoice.lora` | path | not set | Decoder adapter file or PEFT directory, merged at load time. |
 | `vibevoice.lora_scale` | float | not set | LoRA scale override; omitted uses lora_alpha / r. |
 
 
 The adapter follows the PEFT training layout: `adapter_model.safetensors` + `adapter_config.json` for the language-model LoRA, plus optional `diffusion_head/model.safetensors` (or `diffusion_head_full.bin`), `acoustic_connector/pytorch_model.bin`, and `semantic_connector/pytorch_model.bin` for the fully fine-tuned components. Everything is applied at load time, so it composes with the `vibevoice.*_weight_type` quantization options and adds no per-step cost; the overlay is logged with `--log`. Use a 1.5B adapter with `VibeVoice-1.5B` and a 7B adapter with `VibeVoice-7B`; a size mismatch is rejected with a descriptive error. The same option may instead be passed as `--session-option vibevoice.lora` (but not via both at once).
+
+Native A/B and ComfyUI up/down files with matching decoder targets are also
+accepted. Per-tensor alpha supplies scaling without a PEFT config; otherwise
+provide `vibevoice.lora_scale` when no config is present. Ordinary matrix LoKr
+factors are supported; unsupported adapter algorithms fail explicitly. Optional
+component sidecars are resolved beside the adapter file or inside its directory.
 
 For backend weight-type controls, use `audiocpp_cli --inspect --model <model-dir> --family <family>`.
 
@@ -964,6 +980,8 @@ audiocpp_cli --task tts --family voxcpm1 --model models/VoxCPM1-GGUF/voxcpm-0.5b
 ## VoxCPM2
 
 VoxCPM2 supports plain TTS, voice design, controllable voice cloning, and an ultimate-clone style that uses both prompt audio and transcript. The CLI expresses voice design with the same text convention as the upstream examples: put the voice/style description in parentheses at the start of `--text`.
+
+[VocalRender-Pro](models/vocalrender.md) is a Mandarin score-conditioned singing fine-tune of VoxCPM2. It uses the `voxcpm2` family and has a separate installable GGUF package; see its guide for score tokens, reference-audio requirements, and a working CLI example.
 
 | Field | Value |
 |---|---|
@@ -1033,9 +1051,18 @@ audiocpp_cli --task tts --family voxcpm2 --model models/VoxCPM2 --backend cuda -
 | `stream_chunk_policy` | `grow`, `fixed` | `grow` | Streaming only. Grow emits one patch first, then doubles toward `stream_frames_per_event`; fixed waits for the configured patch count. |
 | `stream_frames_per_event` | integer >= 1 | `4` | Maximum generated latent patches per streaming audio event. Set to `1` for the original one-patch cadence. Ignored offline. |
 | `prompt_text` | text | not set | Transcript for continuation prompt audio, distinct from the base voice reference. |
+| `ultimate_clone` | bool | `false` | Use the voice reference itself as the continuation prompt, with `reference_text` or `prompt_text` as its transcript. Requires both reference audio and its transcript; cannot be combined with explicit prompt audio. Omitted/false preserves existing prompt selection. |
 | `chunk_strategy` | `continuation`, `stateless` | `continuation` | Long-form continuation or independent generation per chunk. Offline only. |
 | `text_chunk_size` | integer | `2048` | Framework long-form text chunk size. Offline only. |
 | `text_chunk_mode` | `default`, `tag_aware`, `japanese`, `endline` | `tag_aware` | Framework text chunking mode. Offline only. |
+
+For ultimate cloning, add `--request-option ultimate_clone=true` to a voice-clone
+request with `--voice-ref` and `--reference-text`. This uses continuation
+conditioning rather than reference-only cloning, in both offline and streaming
+modes. Existing explicit prompt audio with `prompt_text` remains supported when
+`ultimate_clone` is omitted or false. Encoded prompts use the existing in-memory
+cache; increase `voxcpm2.prompt_cache_slots` to retain multiple reference/prompt
+combinations in a session.
 
 ### Session Options (use with `--session-option`)
 
@@ -1045,6 +1072,10 @@ audiocpp_cli --task tts --family voxcpm2 --model models/VoxCPM2 --backend cuda -
 | `voxcpm2.audiovae_weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | not set | AudioVAE weight storage; defaults independently to native, not the shared weight_type. |
 | `voxcpm2.prompt_cache_slots` | integer >= 0 | `1` | Cached encoded prompt slots; zero disables reuse. |
 | `voxcpm2.mem_saver` | bool | `true` | Release staged runtime graphs. |
+| `voxcpm2.audiovae_tile_frames` | integer >= 0 | `0` | Opt-in causal AudioVAE tiling; zero preserves full decoding. Set 128 to reduce decoder memory, at the cost of repeated context computation that can slow CPU decoding. |
+| `voxcpm2.perf_mode` | `off`, `cuda_perf` | `off` | `cuda_perf` packs QKV and gate/up projections using their existing weight dtype. May change numerical results and generated audio; `off` preserves standard execution. |
+| `voxcpm2.lora` | directory or checkpoint file | not set | Native LoRA weights with adjacent `lora_config.json`; merged at session creation without changing the AudioVAE. |
+| `voxcpm2.lora_scale` | finite float | `1` | Multiplier for the adapter's configured alpha/r scaling. |
 | `voxcpm2.weight_context_mb` | integer >= 1 | `3072` | Context or graph arena size in MiB. |
 | `voxcpm2.text_embedding_graph_arena_mb` | integer >= 1 | `64` | Host graph-metadata arena size in MiB; legacy `text_embedding_graph_context_mb` accepted with the same family prefix. |
 | `voxcpm2.lm_step_graph_arena_mb` | integer >= 1 | `1024` | Host graph-metadata arena size in MiB; legacy `lm_step_graph_context_mb` accepted with the same family prefix. |
@@ -1054,5 +1085,12 @@ audiocpp_cli --task tts --family voxcpm2 --model models/VoxCPM2 --backend cuda -
 | `voxcpm2.audiovae_weight_context_mb` | integer >= 1 | `768` | Context or graph arena size in MiB. |
 | `voxcpm2.audiovae_graph_arena_mb` | integer >= 1 | `1024` | Host graph-metadata arena size in MiB; legacy `audiovae_graph_context_mb` accepted with the same family prefix. |
 | `voxcpm2.audiovae_encoder_graph_arena_mb` | integer >= 1 | `1024` | Host graph-metadata arena size in MiB; legacy `audiovae_encoder_graph_context_mb` accepted with the same family prefix. |
-| `voxcpm2.audiovae_latent_capacity` | integer >= 1 | not set | Optional reserved latent frame capacity; omitted selects automatically. |
+| `voxcpm2.audiovae_latent_capacity` | integer >= 1 | not set | Optional decoder graph reservation in latent frames, reused by shorter requests and doubled when exceeded; omitted builds the graph at each request's own frame count. |
+| `voxcpm2.exec_plan` | JSON string | `{}` | Component `audiovae`: `impl` is `default`/`ggml`; `backend`, if supplied, must match the session; no artifacts. `params.threads` is a nonnegative int. Positive values require a CPU session and create a dedicated AudioVAE backend, enabling streaming decode overlap; also controls offline decoding and prompt encoding threads. Omitted/0 shares the session backend. |
 | `voxcpm2.audiovae_encoder_sample_capacity` | integer >= 1 | `240000` | Reserved encoder sample capacity. |
+
+For a CPU session with a four-thread AudioVAE worker, add:
+
+```bash
+--session-option 'voxcpm2.exec_plan={"audiovae":{"impl":"ggml","backend":"cpu","params":{"threads":4}}}'
+```

@@ -95,6 +95,91 @@ int main() {
         require(chunks[1] == "How are you today?", "second latin chunk verbatim");
     }
 
+    // A CJK run without punctuation has no word boundary. It is cut into equal
+    // pieces that fit the budget instead of coming back as one over-budget
+    // chunk; a Latin word longer than the budget still stays whole.
+    {
+        const std::string run = "一二三四五六七八九十一二三四五六七八九十一二三四五";
+        const auto chunks = engine::text::split_text_chunks(run, 10);
+        require(chunks.size() == 3, "unpunctuated CJK run splits into three pieces");
+        require(chunks[0] == "一二三四五六七八", "first piece");
+        require(chunks[1] == "九十一二三四五六", "second piece");
+        require(chunks[2] == "七八九十一二三四五", "third piece");
+        check_chunks(run, 10, 3, "unpunctuated CJK run");
+        const auto latin = engine::text::split_text_chunks("supercalifragilistic is long", 10);
+        require(latin.size() == 2 && latin[0] == "supercalifragilistic" && latin[1] == "is long",
+                "latin word over budget stays whole");
+
+        // Cuts fall only between two CJK letters: a tag or a Latin word inside
+        // the run stays in one piece.
+        const std::string tag = "<|emotion:contemplation|>";
+        const std::string tagged = "一二三四五六七八九十" + tag + "一二三四五六七八九十";
+        const auto tag_chunks = engine::text::split_text_chunks(tagged, 12);
+        check_chunks(tagged, 12, 2, "CJK run with a tag");
+        size_t tag_count = 0;
+        for (const auto & c : tag_chunks) {
+            tag_count += c.find(tag) != std::string::npos;
+            require(c.find(tag) != std::string::npos || c.find('|') == std::string::npos, "tag is not cut");
+        }
+        require(tag_count == 1, "tag stays in exactly one chunk");
+        const std::string mixed = "一二三四五六七八九十GPT一二三四五六七八九十";
+        const auto mixed_chunks = engine::text::split_text_chunks(mixed, 8);
+        check_chunks(mixed, 8, 2, "CJK run with a Latin word");
+        size_t gpt = 0;
+        for (const auto & c : mixed_chunks) {
+            gpt += c.find("GPT") != std::string::npos;
+        }
+        require(gpt == 1, "Latin word inside a CJK run stays whole");
+    }
+
+    // Tag-aware mode: a closing quote or bracket after a sentence stop belongs to
+    // that sentence. Units used to end at the stop, so the closer opened the next
+    // chunk (`."` split between `.` and `"`) and dialogue attribution shifted.
+    // Each budget puts the chunk boundary right after the closer.
+    const auto tag_aware = [](const std::string & text, int64_t budget) {
+        return engine::text::split_text_chunks(text, budget, engine::text::TextChunkMode::TagAware);
+    };
+    const auto expect = [&](const std::string & text, int64_t budget, const std::vector<std::string> & want) {
+        const auto got = tag_aware(text, budget);
+        std::string shown;
+        for (const auto & c : got) shown += "[" + c + "]";
+        require(got == want, "tag_aware " + text + " -> " + shown);
+    };
+    expect("He said \"stop.\" Then left.", 16, {"He said \"stop.\"", "Then left."});
+    expect("He said 'stop.' Then left.", 16, {"He said 'stop.'", "Then left."});
+    expect("He said \u201cstop.\u201d Then left.", 16, {"He said \u201cstop.\u201d", "Then left."});
+    expect("He said \u2018stop.\u2019 Then left.", 16, {"He said \u2018stop.\u2019", "Then left."});
+    expect("Il dit \u00abstop!\u00bb Puis parti.", 14, {"Il dit \u00abstop!\u00bb", "Puis parti."});
+    expect("See (this.) Next one.", 11, {"See (this.)", "Next one."});
+    expect("Ask \"why?\") Then go.", 11, {"Ask \"why?\")", "Then go."});
+    expect("\u300c\u4e00\u4e8c\u4e09\u3002\u300d\u56db\u4e94\u3002", 6,
+           {"\u300c\u4e00\u4e8c\u4e09\u3002\u300d", "\u56db\u4e94\u3002"});
+    expect("\u300e\u4e00\u4e8c\u4e09\u3002\u300f\u56db\u4e94\u3002", 6,
+           {"\u300e\u4e00\u4e8c\u4e09\u3002\u300f", "\u56db\u4e94\u3002"});
+    expect("\uff08\u4e00\u4e8c\u4e09\u3002\uff09\u56db\u4e94\u3002", 6,
+           {"\uff08\u4e00\u4e8c\u4e09\u3002\uff09", "\u56db\u4e94\u3002"});
+    // `"`, `'` and `\u2019` that open the next word stay with it.
+    expect("Wait.'Tis true.", 6, {"Wait.", "'Tis", "true."});
+    expect("Wait.\u2019Tis true.", 6, {"Wait.", "\u2019Tis", "true."});
+    expect("He left.\"Hi,\" she said.", 15, {"He left.", "\"Hi,\" she said."});
+    expect("He left.\"'Tis.\"", 9, {"He left.", "\"'Tis.\""});
+    expect("He left.\"\u2019Tis.\"", 9, {"He left.", "\"\u2019Tis.\""});
+    // A long run of quotes after a stop is scanned once.
+    {
+        const auto chunks = tag_aware("Stop." + std::string(100000, '"') + " Next.", 200);
+        require(!chunks.empty() && chunks.back() == "Next.", "tag_aware long quote run");
+    }
+    // Long dialogue: no chunk opens with a stray closing quote.
+    {
+        const std::string text =
+            "\"You're late,\" Marcus said. \"I know. I'm sorry.\" She sat down. "
+            "\"The bridge was closed!\" (It always was.) He shrugged.";
+        for (const auto & c : tag_aware(text, 30)) {
+            require(c.rfind("\" ", 0) != 0 && c.rfind(") ", 0) != 0 && c != "\"" && c != ")",
+                    "tag_aware dialogue chunk opens with a closer: " + c);
+        }
+    }
+
     // A single oversized word without any boundary still passes through whole
     // (pre-existing behavior: no hard character-level cut).
     {

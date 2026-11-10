@@ -51,7 +51,7 @@ extern "C" {
 /* ------------------------------------------------------------------ */
 
 #define AUDIOCPP_ABI_VERSION_MAJOR 0
-#define AUDIOCPP_ABI_VERSION_MINOR 2
+#define AUDIOCPP_ABI_VERSION_MINOR 3
 #define AUDIOCPP_ABI_VERSION_PATCH 0
 
 /* Packed as (major << 16) | (minor << 8) | patch. A caller built against a
@@ -86,6 +86,30 @@ AUDIOCPP_API const char * audiocpp_last_error(void);
 
 /* Human-readable name for a status code. Borrowed, static lifetime. */
 AUDIOCPP_API const char * audiocpp_status_string(audiocpp_status status);
+
+/* ------------------------------------------------------------------ */
+/* Logging                                                             */
+/* ------------------------------------------------------------------ */
+
+typedef enum audiocpp_log_level {
+    AUDIOCPP_LOG_LEVEL_NONE  = 0,
+    AUDIOCPP_LOG_LEVEL_DEBUG = 1,
+    AUDIOCPP_LOG_LEVEL_INFO  = 2,
+    AUDIOCPP_LOG_LEVEL_WARN  = 3,
+    AUDIOCPP_LOG_LEVEL_ERROR = 4,
+    AUDIOCPP_LOG_LEVEL_CONT  = 5
+} audiocpp_log_level;
+
+typedef void (*audiocpp_log_callback)(audiocpp_log_level level,
+                                      const char * text,
+                                      void * user_data);
+
+/* Register a callback for internal runtime and backend log messages.
+ * Directs engine and GGML logs to the provided callback instead of printing to
+ * stderr. Pass NULL for log_callback to restore the default stderr behavior.
+ * user_data is forwarded to every callback invocation. */
+AUDIOCPP_API void audiocpp_log_set(audiocpp_log_callback log_callback,
+                                   void * user_data);
 
 /* ------------------------------------------------------------------ */
 /* Handles                                                             */
@@ -127,7 +151,7 @@ AUDIOCPP_API audiocpp_status audiocpp_registry_family(const audiocpp_registry * 
  *
  * The tasks this build knows, askable without a model. Every other task-aware
  * entry point takes an audiocpp_model, so a caller that is deciding what to
- * install -- reading model_specs/*.json to build a picker, say -- has had
+ * install -- reading JSON files in model_specs/ to build a picker, say -- has had
  * nothing to ask and has had to hardcode a copy of the table in
  * src/framework/model_spec/metadata.cpp.
  *
@@ -235,7 +259,7 @@ AUDIOCPP_API audiocpp_status audiocpp_model_option(const audiocpp_model * model,
 /* Session                                                             */
 /* ------------------------------------------------------------------ */
 
-/* backend is "cpu", "cuda", "hip"/"rocm", "vulkan", "metal" or "best";
+/* backend is "cpu", "cuda", "hip"/"rocm", "vulkan", "metal", "webgpu", "sycl" or "best";
  * NULL means "cpu". device and threads mirror --device / --threads. */
 typedef struct audiocpp_backend_config {
     const char * backend;
@@ -251,6 +275,11 @@ AUDIOCPP_API audiocpp_status audiocpp_session_create(const audiocpp_model * mode
                                                       const audiocpp_backend_config * backend_config,
                                                       const audiocpp_options * options,
                                                       audiocpp_session ** out_session);
+/* Same operation with an explicit backend implementation. NULL/empty means default. */
+AUDIOCPP_API audiocpp_status audiocpp_session_create_with_impl(
+    const audiocpp_model * model, const char * task, const char * mode,
+    const audiocpp_backend_config * backend_config, const char * impl,
+    const audiocpp_options * options, audiocpp_session ** out_session);
 AUDIOCPP_API void            audiocpp_session_free(audiocpp_session * session);
 
 AUDIOCPP_API const char * audiocpp_session_family(const audiocpp_session * session);

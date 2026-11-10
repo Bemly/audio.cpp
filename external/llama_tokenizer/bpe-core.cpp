@@ -341,7 +341,9 @@ void llm_tokenizer_bpe_session::add_new_bigram(int left, int right) {
 
 void llm_tokenizer_bpe_session::tokenize(const std::string & text, std::vector<int32_t> & output) {
     int final_prev_index = -1;
-    const auto word_collection = unicode_regex_split(text, tokenizer.regex_exprs, tokenizer.byte_encode);
+    const auto word_collection = vocab.pre_tokenize
+        ? vocab.pre_tokenize(text)
+        : unicode_regex_split(text, tokenizer.regex_exprs, tokenizer.byte_encode);
 
     symbols_final.clear();
     for (const auto & word : word_collection) {
@@ -350,6 +352,14 @@ void llm_tokenizer_bpe_session::tokenize(const std::string & text, std::vector<i
 
         int index = 0;
         size_t offset = 0;
+        if (vocab.ignore_merges) {
+            // Base vocab entries only (attr 0), as HF looks the word up in the model vocab, not the added tokens.
+            const int32_t whole = vocab.text_to_token(word);
+            if (whole >= 0 && vocab.require_token_data(whole).attr == 0) {
+                symbols.emplace_back(llm_symbol{-1, -1, word.c_str(), word.size()});
+                offset = word.size();
+            }
+        }
         while (offset < word.size()) {
             llm_symbol sym;
             const size_t char_len = std::min(word.size() - offset, static_cast<size_t>(unicode_len_utf8(word[offset])));

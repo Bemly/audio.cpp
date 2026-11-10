@@ -53,7 +53,8 @@ generation, conversion, separation, VAD, diarization, alignment, and voice desig
 - embedded demo voices with matching transcripts;
 - a Voices page for importing, previewing, editing, downloading, and deleting
   reference recordings and transcripts stored in browser IndexedDB; select
-  **Use in Studio** or use Studio's saved-voice selector;
+  **Use in Studio**, or select a saved voice alongside demo voices in Studio
+  and Arena's voice dropdowns;
 - multilingual UI resources under `native/lang/`;
 - structured results, generated artifacts, and request timing.
 
@@ -85,6 +86,29 @@ Use their **Download SafeTensors weights** links, place the files on the server,
 and set **Weights path on server** before loading. Keep the original filenames;
 the default paths are under `Audio-Utilities/` in the selected models folder.
 Then choose an input recording and run it from the studio.
+
+### ACE-Step adapters
+
+In Studio, expand **LoRA** and enter the adapter's server path and strength.
+For PEFT, use the directory containing `adapter_model.safetensors` and
+`adapter_config.json`. Changing or clearing the adapter reloads the model on
+the next Run when UI management is enabled. Config-driven servers must update
+their session configuration instead.
+
+### Drama 3
+
+Select **Fish Audio Drama 3** in the **Text to speech** Studio tab. Its
+model-specific panel separates **Single-voice clone** from
+**Multi-speaker** generation. Each reference recording needs its matching
+transcript; saved voices can also be selected from the Voices library.
+
+Multi-speaker mode supports up to 16 cast members, matching the
+[official speaker IDs](https://huggingface.co/fishaudio/drama-3).
+Assign a speaker to each dialogue turn; references and speaker tags are submitted
+together in one request. Multi-speaker generation is still under testing.
+Model parameters include text chunk size, sampling, expert-weight offload, and
+context capacity. The workspace uses offline generation and the shared Run,
+Cancel, and output controls.
 
 ## Frontend development
 

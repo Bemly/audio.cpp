@@ -1,7 +1,7 @@
 {
   "family": "qwen3_tts",
   "display_name": "Qwen3-TTS",
-  "description": "Qwen TTS family for controllable 10-language speech synthesis, including 3-second voice cloning, CustomVoice instruction control over preset timbres, and VoiceDesign from natural-language descriptions.",
+  "description": "Qwen3-TTS for controllable 10-language synthesis, 3-second voice cloning, CustomVoice, and VoiceDesign.",
   "category": "tts",
   "status": "supported",
   "tasks": [
@@ -38,7 +38,7 @@
       {
         "name": "stream_chunk_policy",
         "type": "enum",
-        "description": "Streaming codec chunk schedule: grow starts with one frame and doubles to stream_frames_per_event; fixed uses that size throughout. Ignored offline.",
+        "description": "Streaming codec chunk schedule: grow starts with one frame and doubles to stream_frames_per_event; fixed uses that size throughout.",
         "required": false,
         "default": "grow",
         "values": [
@@ -49,7 +49,7 @@
       {
         "name": "stream_frames_per_event",
         "type": "int",
-        "description": "Codec frames per fixed streaming event, or the maximum for growing events. Smaller values reduce chunk latency but increase decoding overhead. Ignored in offline mode.",
+        "description": "Codec frames per fixed streaming event, or the maximum for growing events. Smaller values reduce chunk latency but increase decoding overhead.",
         "required": false,
         "default": 12,
         "min": 1
@@ -151,13 +151,13 @@
       {
         "name": "reference_text",
         "type": "string",
-        "description": "Transcript matching the reference audio for Base voice cloning; required unless x_vector_only_mode=true.",
+        "description": "Transcript matching the reference audio for voice cloning; required unless x_vector_only_mode=true.",
         "required": false
       },
       {
         "name": "x_vector_only_mode",
         "type": "bool",
-        "description": "Use only the speaker embedding for Base voice cloning instead of ICL reference codec prompting; default false.",
+        "description": "Use only the speaker embedding for voice cloning instead of ICL reference codec prompting; default false.",
         "required": false,
         "default": false
       },
@@ -170,7 +170,7 @@
       {
         "name": "voice_id",
         "type": "enum",
-        "description": "Named preset speaker from the CustomVoice checkpoint. These are the official checkpoint's presets; available names are determined by the loaded checkpoint. Legacy speaker remains accepted.",
+        "description": "Named preset speaker from the CustomVoice checkpoint. Legacy speaker remains accepted.",
         "values": [
           "aiden",
           "dylan",
@@ -195,6 +195,19 @@
     ],
     "session": [
       {
+        "name": "lora",
+        "type": "path",
+        "description": "PEFT LoRA adapter directory or checkpoint file; optional speaker_embedding and tts_config.json sidecars provide a trained custom voice.",
+        "required": false
+      },
+      {
+        "name": "lora_scale",
+        "type": "float",
+        "description": "Multiplier for the adapter's alpha/r scaling; default 1.",
+        "required": false,
+        "default": 1.0
+      },
+      {
         "name": "mem_saver",
         "type": "bool",
         "description": "Release the talker cached-step graph after each request; default false.",
@@ -202,10 +215,69 @@
         "default": false
       },
       {
+        "name": "stitch_decode",
+        "type": "bool",
+        "description": "Voice the concatenated speech codes of all text chunks in one decoder pass instead of voicing each chunk separately; default false. Per-chunk voicing re-voices the voice-clone reference once per chunk and restarts the stateful vocoder cache at every chunk boundary; the stitched pass costs device memory proportional to the utterance.",
+        "required": false,
+        "default": false
+      },
+      {
+        "name": "attention",
+        "type": "enum",
+        "description": "Attention preference; default mixed uses manual prefill and contiguous-K/V flash cached decoding in the talker and code predictor, with eager speech tokenization. auto uses the shared backend policy; eager disables flash; flash uses flash with K/V views. Explicit values override perf_mode.",
+        "values": ["mixed", "auto", "eager", "flash"],
+        "required": false,
+        "default": "mixed"
+      },
+      {
+        "name": "activation_type",
+        "type": "enum",
+        "description": "Talker and code-predictor activation rounding: f32 preserves the default path; bf16 rounds at reference BF16 operation boundaries, including text projection. Independent of weight storage and perf_mode; changes generated audio and does not guarantee identical PyTorch tokens.",
+        "values": ["f32", "bf16"],
+        "required": false,
+        "default": "f32"
+      },
+      {
+        "name": "packed_projections",
+        "type": "bool",
+        "description": "Pack QKV and gate/up projections in the talker and code predictor without changing weight dtype; default false, true with cuda_perf. Explicit values override the preset.",
+        "required": false
+      },
+      {
+        "name": "kv_cache_write",
+        "type": "enum",
+        "description": "Talker and code-predictor cache writes: standard by default, optimized with cuda_perf. Optimized uses backend-friendly views and I64 indices to allow fusion where supported. Explicit values override the preset.",
+        "values": ["standard", "optimized"],
+        "required": false
+      },
+      {
+        "name": "kv_cache_type",
+        "type": "enum",
+        "description": "Talker and code-predictor KV storage: f32 by default, f16 with cuda_perf. Explicit values override the preset. F16 reduces cache memory and may change numerical results.",
+        "values": ["f32", "f16"],
+        "required": false
+      },
+      {
+        "name": "talker_kv_cache_alignment",
+        "type": "int",
+        "description": "Round talker KV capacity to this many rows. Defaults to 1 (no padding), or 256 with perf_mode=cuda_perf. Explicit values override the preset. Larger alignments may use more memory and change numerical results.",
+        "min": 1,
+        "default": 1,
+        "required": false
+      },
+      {
+        "name": "stream_decoder",
+        "type": "enum",
+        "description": "GGML streaming decoder; stateful carries convolution and attention history and caches graphs for exact chunk lengths. Uses more graph memory and can change audio; default windowed preserves existing behavior.",
+        "values": ["windowed", "stateful"],
+        "default": "windowed",
+        "required": false
+      },
+      {
         "name": "perf_mode",
         "type": "enum",
-        "description": "Q8_0-only attention performance mode; default off keeps the exact-safe path.",
-        "preset": "perf_mode_flash_attention",
+        "description": "Performance preset; default off. flash_attention selects flash attention. cuda_perf also selects packed projections, optimized cache writes, f16 KV and convolution weights, stateful streaming decoding, and KV alignment 256. Explicit session options override the preset. May change audio and memory use.",
+        "values": ["off", "flash_attention", "cuda_perf"],
         "required": false,
         "default": "off"
       },
@@ -257,16 +329,11 @@
         "preset": "weight_type_conv"
       },
       {
-        "name": "rknn_decoder",
-        "type": "path",
+        "name": "exec_plan",
+        "type": "string",
         "required": false,
-        "description": "Path to a pre-compiled stateful speech-tokenizer decoder .rknn (Rockchip NPU). Requires a build with ENGINE_ENABLE_RKNN. When set, the decoder stage runs on the NPU and its ggml weights are not loaded."
-      },
-      {
-        "name": "rknn_decoder_first",
-        "type": "path",
-        "required": false,
-        "description": "Optional smaller-batch .rknn used for the first token group only, to cut time-to-first-audio in streaming. Requires rknn_decoder."
+        "default": "{}",
+        "description": "JSON object of component execution plans. Component: speech_decoder. Each plan accepts impl, backend, artifacts, and params. impl is default/ggml/rknn. GGML supports the session backend. RKNN requires artifacts.main, optionally artifacts.first for the first streaming group, and ENGINE_ENABLE_RKNN; omit backend. RKNN skips GGML decoder weights. Neither implementation takes params."
       },
       {
         "name": "talker_graph_arena_mb",
@@ -474,6 +541,25 @@
       "download": {
         "kind": "huggingface_snapshot",
         "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+      }
+    },
+    {
+      "id": "qwen3_tts_0_6b_base_speech_decoder_rk3588",
+      "display_name": "Qwen3 TTS 12Hz 0.6B NPU Speech Decoder RKNN Pair (RK3588)",
+      "format": "rknn",
+      "precision": "f16",
+      "target_directory": "Qwen3-TTS-12Hz-0.6B-Base-GGUF",
+      "files": [
+        "rk3588/qwen3-tts/vocoder_stateful_16_fp16.rknn",
+        "rk3588/qwen3-tts/vocoder_stateful_64b_fp16.rknn"
+      ],
+      "strip_prefix": "rk3588/qwen3-tts",
+      "description": "Pre-compiled RK3588 engine pair (chunk 16 for the first streaming group, chunk 64 for the rest) for the qwen3_tts RKNN speech decoder (qwen3_tts.exec_plan, artifacts.main/first); installs beside the 0.6B GGUF weights and is named by bare file name. Built by tools/rknn from the Qwen3-TTS-12Hz speech tokenizer decoder; see docs/build/rockchip-npu.md.",
+      "download": {
+        "kind": "huggingface_snapshot",
+        "repo": "wOvANAI/rknn-tts-engines",
+        "revision": "main",
+        "gated": false
       }
     }
   ],

@@ -93,6 +93,19 @@
     ],
     "session": [
       {
+        "name": "lora",
+        "type": "path",
+        "description": "PEFT DiT LoRA adapter directory or checkpoint file; merged into session-owned weights and graphs. Vocos is unchanged.",
+        "required": false
+      },
+      {
+        "name": "lora_scale",
+        "type": "float",
+        "description": "Multiplier for the adapter's alpha/r scaling; default 1.",
+        "required": false,
+        "default": 1.0
+      },
+      {
         "name": "vocos_path",
         "type": "string",
         "description": "Path to the Vocos vocoder checkpoint (vocos.safetensors); required unless placed next to the DiT checkpoint.",
@@ -108,7 +121,7 @@
       {
         "name": "frame_budget",
         "type": "int",
-        "description": "Total mel frames per CFM pass (ref + generated); larger budgets allow sentence-scale chunks at higher VRAM. Must be in [256, 8192]; omitted uses 2048. Explicit zero is not accepted.",
+        "description": "Total mel frames per CFM pass (ref + generated); larger budgets allow sentence-scale chunks at higher VRAM. Must be in [256, 8192]; omitted uses 2048. Explicit zero is not accepted. On CPU the allocated DiT graph pool caps a pass at 960 frames (10.2 s), so larger values are clamped there; CUDA keeps the full range.",
         "required": false,
         "min": 256,
         "max": 8192,

@@ -1,9 +1,11 @@
 #include "engine/models/irodori_tts/rf_dit.h"
 #include "engine/models/irodori_tts/schedule.h"
+#include "mf_dit.h"
 
 #include "engine/framework/core/backend_weight_store.h"
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/modules/activation_modules.h"
+#include "engine/framework/modules/attention/scaled_dot_product_attention.h"
 #include "engine/framework/sampling/flow_sampler_runtime.h"
 #include "engine/framework/modules/norm_modules.h"
 #include "engine/framework/modules/optimizations/fast_projection_modules.h"
@@ -17,6 +19,7 @@
 #include <ggml.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -74,6 +77,7 @@ struct IrodoriRFDiTWeights {
   modules::LinearWeights cond_fc0;
   modules::LinearWeights cond_fc1;
   modules::LinearWeights cond_fc2;
+  std::optional<std::array<modules::LinearWeights, 3>> delta_cond;
   modules::LinearWeights in_proj;
   std::vector<IrodoriDiffusionBlockWeights> blocks;
   core::TensorValue out_norm;
@@ -538,29 +542,6 @@ IrodoriLayerAdaLNModulation select_modulation_step(
   return out;
 }
 
-core::TensorValue flash_attention_from_heads(
-    core::ModuleBuildContext &ctx, const core::TensorValue &q_heads,
-    const core::TensorValue &k_heads, const core::TensorValue &v_heads,
-    const core::TensorValue &attention_mask, int64_t dim) {
-  const auto q_contiguous =
-      core::ensure_backend_addressable_layout(ctx, q_heads);
-  const auto k_contiguous =
-      core::ensure_backend_addressable_layout(ctx, k_heads);
-  const auto v_contiguous =
-      core::ensure_backend_addressable_layout(ctx, v_heads);
-  auto *flash = ggml_flash_attn_ext(
-      ctx.ggml, q_contiguous.tensor, k_contiguous.tensor, v_contiguous.tensor,
-      attention_mask.tensor, 1.0F / std::sqrt(static_cast<float>(dim)), 0.0F,
-      0.0F);
-  ggml_flash_attn_ext_set_prec(flash, GGML_PREC_F32);
-  return core::wrap_tensor(
-      flash,
-      core::TensorShape::from_dims({q_contiguous.shape.dims[0],
-                                    q_contiguous.shape.dims[2],
-                                    q_contiguous.shape.dims[1], dim}),
-      GGML_TYPE_F32);
-}
-
 IrodoriLayerContextKV
 build_layer_context_kv(core::ModuleBuildContext &ctx,
                        const core::TensorValue &text_state,
@@ -710,8 +691,11 @@ core::TensorValue build_joint_attention(
       modules::TransposeModule({{0, 2, 1, 3}, k.shape.rank}).build(ctx, k);
   auto v_heads =
       modules::TransposeModule({{0, 2, 1, 3}, v.shape.rank}).build(ctx, v);
-  auto context = flash_attention_from_heads(ctx, q_heads, k_heads, v_heads,
-                                            attention_mask, dim);
+  auto context = modules::ScaledDotProductAttentionModule(
+      {dim, modules::ScaledDotProductAttentionLowering::FlashPreserveViews,
+       GGML_PREC_F32, modules::AttentionCausality::NonCausal})
+      .build(ctx, core::ensure_backend_addressable_layout(ctx, q_heads),
+             k_heads, v_heads, attention_mask);
   context = core::reshape_tensor(
       ctx, core::ensure_backend_addressable_layout(ctx, context),
       core::TensorShape::from_dims(
@@ -808,6 +792,18 @@ load_irodori_rf_dit_weights(const IrodoriTTSAssets &assets, ggml_backend_t backe
       binding::linear_from_source(*weights.store, source, "in_proj",
                                   weight_storage_type, config.model_dim,
                                   config.patched_latent_dim(), true);
+  if (config.flow_parameterization == "meanflow") {
+    weights.delta_cond = std::array<modules::LinearWeights, 3>{
+        binding::linear_from_source(*weights.store, source, "delta_cond_module.0",
+                                    weight_storage_type, config.model_dim,
+                                    config.timestep_embed_dim, false),
+        binding::linear_from_source(*weights.store, source, "delta_cond_module.2",
+                                    weight_storage_type, config.model_dim,
+                                    config.model_dim, false),
+        binding::linear_from_source(*weights.store, source, "delta_cond_module.4",
+                                    weight_storage_type, 3 * config.model_dim,
+                                    config.model_dim, false)};
+  }
   weights.blocks.reserve(static_cast<size_t>(config.num_layers));
   for (int64_t layer = 0; layer < config.num_layers; ++layer) {
     weights.blocks.push_back(
@@ -842,8 +838,14 @@ std::vector<IrodoriLayerContextKV> build_irodori_context_kv_cache(
 
 std::vector<IrodoriLayerAdaLNModulation> build_irodori_adaln_modulation_cache(
     core::ModuleBuildContext &ctx, const core::TensorValue &t,
-    const IrodoriRFDiTWeights &weights, const IrodoriModelConfig &config) {
+    const IrodoriRFDiTWeights &weights, const IrodoriModelConfig &config,
+    const std::optional<core::TensorValue> &delta_t = std::nullopt) {
   auto cond_embed = build_condition_embedding(ctx, t, weights, config, false);
+  if (delta_t) {
+    const auto interval = build_timestep_embedding(ctx, *delta_t, weights, config);
+    cond_embed = build_irodori_meanflow_conditioning(
+        ctx, interval, cond_embed, weights.delta_cond.value(), config);
+  }
   std::vector<IrodoriLayerAdaLNModulation> out;
   out.reserve(weights.blocks.size());
   for (const auto &block : weights.blocks) {
@@ -1239,6 +1241,9 @@ public:
         context_graph_->caption_tokens() != caption_tokens ||
         context_graph_->batch() != batch) {
       ++context_graph_rebuilds_;
+      // Step graphs read the context graph's K/V tensors in place.
+      cond_graph_.reset();
+      cfg_graph_.reset();
       context_graph_.reset();
       context_graph_ = std::make_unique<ContextGraph>(
           *this, speaker.tokens, caption_tokens, batch, graph_arena_bytes_);
@@ -1247,7 +1252,8 @@ public:
     return cache;
   }
 
-  ModulationCache build_modulation_cache(const std::vector<float> &timesteps) {
+  ModulationCache build_modulation_cache(const std::vector<float> &timesteps,
+                                        const std::vector<float> &intervals = {}) {
     const int64_t steps = static_cast<int64_t>(timesteps.size());
     if (steps <= 0) {
       throw std::runtime_error("Irodori-TTS RF modulation cache needs steps");
@@ -1257,7 +1263,7 @@ public:
       modulation_graph_ =
           std::make_unique<ModulationGraph>(*this, steps, graph_arena_bytes_);
     }
-    auto cache = modulation_graph_->run(timesteps);
+    auto cache = modulation_graph_->run(timesteps, intervals);
     cache.id = ++next_modulation_id_;
     return cache;
   }
@@ -1470,7 +1476,11 @@ public:
     std::unique_ptr<StepGraph> &inactive_graph =
         batch == 1 ? cfg_graph_ : cond_graph_;
     inactive_graph.reset();
+    if (context_cache.backend_kv == nullptr) {
+      throw std::runtime_error("Irodori-TTS RF context cache is not built");
+    }
     if (graph == nullptr || graph->latent_steps() != latent_steps ||
+        graph->context_kv() != context_cache.backend_kv ||
         graph->speaker_tokens() != context_cache.speaker_tokens ||
         graph->caption_tokens() != caption_tokens || graph->batch() != batch ||
         graph->modulation_steps() != modulation_cache.steps ||
@@ -1482,7 +1492,8 @@ public:
       graph = std::make_unique<StepGraph>(
           *this, latent_steps, context_cache.speaker_tokens, caption_tokens,
           batch, modulation_cache.steps, text_cfg_enabled, speaker_cfg_enabled,
-          caption_cfg_enabled, graph_arena_bytes_);
+          caption_cfg_enabled, *context_cache.backend_kv, context_cache.batch,
+          graph_arena_bytes_);
     }
   }
 
@@ -1510,6 +1521,9 @@ public:
   IrodoriRfSampleResult sample(
       const IrodoriRfSampleRequest &request,
       IrodoriRfSampleTiming *timing) {
+    if (assets_->config.flow_parameterization == "meanflow") {
+      return sample_meanflow(request, timing);
+    }
     if (request.conditions == nullptr || request.text_mask == nullptr) {
       throw std::runtime_error("Irodori-TTS RF sample requires conditions");
     }
@@ -1521,9 +1535,11 @@ public:
         request.generation.seed,
         sampling::TorchRandnPrecision::Float32);
 
+    // Without a caption every caption token is masked out, so the context
+    // carries none: no caption K/V, no masked keys in attention.
     IrodoriCaptionCondition rf_caption;
     std::vector<float> rf_caption_state;
-    if (config.use_caption_condition) {
+    if (config.use_caption_condition && request.caption.has_caption) {
       const int64_t dim = config.caption_dim_resolved();
       rf_caption.mask = request.caption.mask;
       rf_caption.has_caption = request.caption.has_caption;
@@ -1636,6 +1652,81 @@ public:
       if (flattening_samples > 0) {
         result.target_samples =
             std::min(result.target_samples, flattening_samples);
+      }
+    }
+    return result;
+  }
+
+  IrodoriRfSampleResult sample_meanflow(
+      const IrodoriRfSampleRequest &request, IrodoriRfSampleTiming *timing) {
+    if (request.conditions == nullptr || request.text_mask == nullptr) {
+      throw std::runtime_error("Irodori-TTS MeanFlow sample requires conditions");
+    }
+    const auto &config = assets_->config;
+    const SampleShape shape = resolve_sample_shape(request);
+
+    const auto context_start = Clock::now();
+    const bool has_caption =
+        config.use_caption_condition && request.caption.has_caption;
+    const auto context = build_context_cache(
+        request.conditions->text_state, *request.text_mask,
+        has_caption ? request.conditions->caption_state : std::vector<float>{},
+        has_caption ? request.caption : IrodoriCaptionCondition{},
+        request.speaker, false, false, false);
+    if (timing != nullptr) {
+      timing->context_cond_ms += debug::elapsed_ms(context_start);
+    }
+    StepContextSelection selection;
+    selection.context = &context;
+
+    ModulationCache modulation;
+    modules::FlowSamplerSingleBranchDenoiserConfig denoiser_config;
+    denoiser_config.begin_sequence =
+        [&](const modules::FlowSamplerSequenceState &state) {
+          std::vector<float> times;
+          std::vector<float> intervals;
+          for (const auto &step : state.schedule) {
+            times.push_back(step.t);
+            intervals.push_back(step.t - step.t_next);
+          }
+          modulation = build_modulation_cache(times, intervals);
+          return std::vector<modules::FlowSamplerCacheUpdate>{};
+        };
+    denoiser_config.modulation_revision = [&](const modules::FlowSamplerStepState &) {
+      return static_cast<int64_t>(modulation.id);
+    };
+    denoiser_config.rebuild_graph =
+        [&](const modules::FlowSamplerGraphKey &, const modules::FlowSamplerStepState &) {
+          prepare_step_graph(modulation, selection, shape.patched_steps);
+        };
+    denoiser_config.predict = [&](const modules::FlowSamplerDenoiserInput &input) {
+      const auto start = Clock::now();
+      auto velocity = run_step_velocity(input.latent, input.state.sequence_index,
+                                        modulation, selection);
+      if (timing != nullptr) {
+        timing->step_cond_ms += debug::elapsed_ms(start);
+      }
+      return velocity;
+    };
+    if (mem_saver_) {
+      denoiser_config.release_graphs = [&]() { release_graphs(); };
+    }
+    const auto latent = sample_irodori_meanflow(
+        request.generation, shape.patched_steps, shape.patched_dim, mem_saver_,
+        std::move(denoiser_config));
+
+    IrodoriRfSampleResult result;
+    result.latent_steps = shape.latent_steps;
+    result.target_samples = shape.target_samples;
+    result.latent = unpatch_latent(latent, shape);
+    if (request.generation.trim_tail) {
+      const int flat = find_flattening_point(
+          result.latent, result.latent_steps, config.latent_dim,
+          request.generation.tail_window_size, request.generation.tail_std_threshold,
+          request.generation.tail_mean_threshold);
+      const int64_t samples = static_cast<int64_t>(flat) * assets_->codec.hop_length;
+      if (samples > 0) {
+        result.target_samples = std::min(result.target_samples, samples);
       }
     }
     return result;
@@ -1790,8 +1881,13 @@ private:
       timesteps_ = core::make_tensor(build_ctx, GGML_TYPE_F32,
                                      core::TensorShape::from_dims({steps_}));
       ggml_set_input(timesteps_.tensor);
+      if (config.flow_parameterization == "meanflow") {
+        intervals_ = core::make_tensor(build_ctx, GGML_TYPE_F32,
+                                       core::TensorShape::from_dims({steps_}));
+        ggml_set_input(intervals_->tensor);
+      }
       outputs_ = build_irodori_adaln_modulation_cache(build_ctx, timesteps_,
-                                                      owner.weights_, config);
+                                                      owner.weights_, config, intervals_);
       for (auto &layer : outputs_) {
         ggml_set_output(layer.attention.shift.tensor);
         ggml_set_output(layer.attention.scale.tensor);
@@ -1827,12 +1923,16 @@ private:
 
     int64_t steps() const noexcept { return steps_; }
 
-    ModulationCache run(const std::vector<float> &timesteps) const {
+    ModulationCache run(const std::vector<float> &timesteps,
+                        const std::vector<float> &intervals) const {
       if (static_cast<int64_t>(timesteps.size()) != steps_) {
         throw std::runtime_error(
             "Irodori-TTS RF modulation timestep count mismatch");
       }
       core::write_tensor_f32(timesteps_, timesteps);
+      if (intervals_) {
+        core::write_tensor_f32(*intervals_, intervals);
+      }
       core::set_backend_threads(owner_->backend_, owner_->threads_);
       const ggml_status status =
           core::compute_backend_graph(owner_->backend_, graph_, nullptr,
@@ -1853,6 +1953,7 @@ private:
     int64_t steps_ = 0;
     std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
     core::TensorValue timesteps_;
+    std::optional<core::TensorValue> intervals_;
     std::vector<IrodoriLayerAdaLNModulation> outputs_;
     ggml_cgraph *graph_ = nullptr;
     ggml_gallocr_t gallocr_ = nullptr;
@@ -1864,8 +1965,10 @@ private:
               int64_t speaker_tokens, int64_t caption_tokens, int64_t batch,
               int64_t modulation_steps, bool text_cfg_enabled,
               bool speaker_cfg_enabled, bool caption_cfg_enabled,
-              size_t graph_arena_bytes)
-        : owner_(&owner), latent_steps_(latent_steps),
+              const std::vector<IrodoriLayerContextKV> &context_kv,
+              int64_t context_batch, size_t graph_arena_bytes)
+        : owner_(&owner), context_kv_(&context_kv),
+          latent_steps_(latent_steps),
           speaker_tokens_(speaker_tokens), caption_tokens_(caption_tokens),
           batch_(batch), modulation_steps_(modulation_steps),
           text_cfg_enabled_(text_cfg_enabled),
@@ -1898,19 +2001,49 @@ private:
       const int64_t dim = config.model_dim / config.num_heads;
       const int64_t context_tokens =
           config.max_text_len + speaker_tokens_ + caption_tokens_;
-      context_kv_inputs_.reserve(owner.weights_.blocks.size());
-      for (size_t layer = 0; layer < owner.weights_.blocks.size(); ++layer) {
+      // The graph reads the context graph's K/V where it lives, through leaf
+      // tensors placed at the same addresses (a plain use or view of those
+      // outputs would pull the context graph's own nodes into this graph). A
+      // single-branch graph over a guided cache reads its first (conditional)
+      // branch, the leading slice of the outermost dimension.
+      if (context_kv.size() != owner.weights_.blocks.size()) {
+        throw std::runtime_error(
+            "Irodori-TTS RF context cache layer count mismatch");
+      }
+      if (context_batch != batch_ && !(batch_ == 1 && context_batch > 1)) {
+        throw std::runtime_error("Irodori-TTS RF context cache shape mismatch");
+      }
+      const auto context_shape = core::TensorShape::from_dims(
+          {batch_, context_tokens, config.num_heads, dim});
+      auto context_view = [&](const core::TensorValue &source) {
+        if (source.shape.rank != 4 || source.shape.dims[0] != context_batch ||
+            source.shape.dims[1] != context_tokens ||
+            source.shape.dims[2] != config.num_heads ||
+            source.shape.dims[3] != dim) {
+          throw std::runtime_error(
+              "Irodori-TTS RF context cache tensor shape mismatch");
+        }
+        if (source.tensor->buffer == nullptr || source.tensor->data == nullptr ||
+            !ggml_is_contiguous(source.tensor)) {
+          throw std::runtime_error(
+              "Irodori-TTS RF context cache tensor is not allocated");
+        }
+        ggml_tensor *alias = ggml_new_tensor_4d(
+            ctx_.get(), GGML_TYPE_F32, source.tensor->ne[0],
+            source.tensor->ne[1], source.tensor->ne[2], batch_);
+        if (ggml_backend_tensor_alloc(source.tensor->buffer, alias,
+                                      source.tensor->data) !=
+            GGML_STATUS_SUCCESS) {
+          throw std::runtime_error(
+              "Irodori-TTS RF context cache alias allocation failed");
+        }
+        return core::wrap_tensor(alias, context_shape, GGML_TYPE_F32);
+      };
+      context_kv_inputs_.reserve(context_kv.size());
+      for (const auto &source : context_kv) {
         IrodoriLayerContextKV kv;
-        kv.k_context = core::make_tensor(
-            io_build_ctx, GGML_TYPE_F32,
-            core::TensorShape::from_dims(
-                {batch_, context_tokens, config.num_heads, dim}));
-        kv.v_context = core::make_tensor(
-            io_build_ctx, GGML_TYPE_F32,
-            core::TensorShape::from_dims(
-                {batch_, context_tokens, config.num_heads, dim}));
-        ggml_set_input(kv.k_context.tensor);
-        ggml_set_input(kv.v_context.tensor);
+        kv.k_context = context_view(source.k_context);
+        kv.v_context = context_view(source.v_context);
         context_kv_inputs_.push_back(kv);
       }
       modulation_cache_inputs_.reserve(owner.weights_.blocks.size());
@@ -2001,6 +2134,10 @@ private:
 
     int64_t latent_steps() const noexcept { return latent_steps_; }
 
+    const std::vector<IrodoriLayerContextKV> *context_kv() const noexcept {
+      return context_kv_;
+    }
+
     int64_t speaker_tokens() const noexcept { return speaker_tokens_; }
 
     int64_t caption_tokens() const noexcept { return caption_tokens_; }
@@ -2027,52 +2164,9 @@ private:
           cache.caption_tokens != caption_tokens_) {
         throw std::runtime_error("Irodori-TTS RF context cache shape mismatch");
       }
-      if (cache.backend_kv == nullptr ||
-          cache.backend_kv->size() != context_kv_inputs_.size()) {
+      if (cache.backend_kv != context_kv_) {
         throw std::runtime_error(
-            "Irodori-TTS RF context cache layer count mismatch");
-      }
-      const auto *source_kv = cache.backend_kv;
-      const int64_t context_tokens =
-          config.max_text_len + speaker_tokens_ + caption_tokens_;
-      const size_t context_values =
-          static_cast<size_t>(cache.batch * context_tokens * config.num_heads *
-                              (config.model_dim / config.num_heads));
-      const size_t write_context_values =
-          static_cast<size_t>(batch_ * context_tokens * config.num_heads *
-                              (config.model_dim / config.num_heads));
-      auto upload_context_tensor =
-          [&](const core::TensorValue &source, const core::TensorValue &target,
-              size_t source_values, size_t target_values) {
-            if (source.shape.num_elements() !=
-                    static_cast<int64_t>(source_values) ||
-                target.shape.num_elements() !=
-                    static_cast<int64_t>(target_values)) {
-              throw std::runtime_error(
-                  "Irodori-TTS RF context cache tensor shape mismatch");
-            }
-            if (use_first_branch) {
-              context_first_branch_scratch_ =
-                  core::read_tensor_f32(source.tensor);
-              if (context_first_branch_scratch_.size() < target_values) {
-                throw std::runtime_error(
-                    "Irodori-TTS RF first-branch context cache is too small");
-              }
-              core::write_tensor_f32(target,
-                                     context_first_branch_scratch_.data(),
-                                     target_values);
-              return;
-            }
-            ggml_backend_tensor_copy(source.tensor, target.tensor);
-          };
-      for (size_t layer = 0; layer < context_kv_inputs_.size(); ++layer) {
-        const auto &source = (*source_kv)[layer];
-        upload_context_tensor(source.k_context,
-                              context_kv_inputs_[layer].k_context,
-                              context_values, write_context_values);
-        upload_context_tensor(source.v_context,
-                              context_kv_inputs_[layer].v_context,
-                              context_values, write_context_values);
+            "Irodori-TTS RF step graph was built for another context cache");
       }
       const auto attention_mask_values = make_rf_attention_mask(
           cache.text_mask, cache.speaker_mask, cache.caption_mask, batch_,
@@ -2176,6 +2270,7 @@ private:
 
   private:
     IrodoriRfSampler::Impl *owner_ = nullptr;
+    const std::vector<IrodoriLayerContextKV> *context_kv_ = nullptr;
     int64_t latent_steps_ = 0;
     int64_t speaker_tokens_ = 0;
     int64_t caption_tokens_ = 0;
@@ -2199,7 +2294,6 @@ private:
     core::TensorValue output_;
     std::vector<float> x_batch_scratch_;
     std::vector<float> output_scratch_;
-    std::vector<float> context_first_branch_scratch_;
     uint64_t loaded_context_id_ = 0;
     uint64_t loaded_modulation_id_ = 0;
     ggml_cgraph *graph_ = nullptr;

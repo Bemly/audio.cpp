@@ -1,12 +1,17 @@
 #include "engine/models/moonshine_asr/session.h"
 
+#include "engine/framework/debug/profiler.h"
+
 #include "engine/models/moonshine_asr/runtime.h"
 #include "engine/models/moonshine_asr/assets.h"
 #include "engine/models/moonshine_asr/weights.h"
+#ifdef ENGINE_HAVE_NEON
+#include "engine/models/moonshine_asr/neon_decoder.h"
+#endif
 #include "engine/framework/audio/chunking.h"
 #include "engine/framework/runtime/options.h"
 #include "engine/framework/runtime/spec_backed_model.h"
-#include "engine/models/silero_vad/session.h"
+#include "engine/framework/runtime/registry.h"
 
 #include <cmath>
 #include <filesystem>
@@ -74,6 +79,10 @@ runtime::SessionOptions require_supported_session_options(
     if (checked_contract->session_option_keys.find("moonshine_asr.vad_model_path") ==
         checked_contract->session_option_keys.end()) {
         validation_options.options.erase("moonshine_asr.vad_model_path");
+    }
+    // Older embedded contracts omit exec_plan; parse_exec_plan validates it below.
+    if (!checked_contract->session_option_keys.count("moonshine_asr.exec_plan")) {
+        validation_options.options.erase("moonshine_asr.exec_plan");
     }
     runtime::validate_spec_backed_session_options(validation_options, *checked_contract, kFamily, "Moonshine ASR");
     return options;
@@ -203,6 +212,23 @@ MoonshineSTTSession::MoonshineSTTSession(
         assets_->config,
         execution_context().backend_type(),
         RuntimeSessionBase::options().options);
+    const auto backend = execution_context().backend_type();
+    const auto exec_plan = runtime::parse_exec_plan(
+        RuntimeSessionBase::options().options, "moonshine_asr.exec_plan",
+        {{"decoder", "ggml",
+          {{"ggml", {backend}, {}, {}}, {"neon", {core::BackendType::Cpu}, {}, {}}}}});
+    const auto & decoder_plan = exec_plan.at("decoder");
+    if (decoder_plan.impl == "neon") {
+#ifdef ENGINE_HAVE_NEON
+        if (backend != core::BackendType::Cpu || !neon::available()) {
+            throw std::runtime_error("moonshine_asr.exec_plan.decoder: impl neon requires CPU with AArch64 NEON");
+        }
+        auto bound = load_moonshine_neon_decoder_weights(*assets_, runtime_config_.decoder_weight_storage_type);
+        runtime_config_.neon_decoder = std::make_shared<MoonshineNeonDecoder>(assets_->config.decoder, std::move(bound));
+#else
+        throw std::runtime_error("moonshine_asr.exec_plan.decoder: impl neon requires ENGINE_ENABLE_NEON=ON");
+#endif
+    }
     vad_model_path_ = runtime::find_option(RuntimeSessionBase::options().options, {"moonshine_asr.vad_model_path"})
         .value_or(default_vad_model_path().string());
     weights_ = load_moonshine_asr_weights(
@@ -212,7 +238,8 @@ MoonshineSTTSession::MoonshineSTTSession(
         runtime_config_.encoder_weight_storage_type,
         runtime_config_.decoder_weight_storage_type,
         runtime_config_.conv_weight_storage_type,
-        runtime_config_.weight_context_bytes);
+        runtime_config_.weight_context_bytes,
+        runtime_config_.neon_decoder == nullptr);
 }
 
 MoonshineSTTSession::~MoonshineSTTSession() = default;
@@ -235,6 +262,7 @@ void MoonshineSTTSession::prepare(const runtime::SessionPreparationRequest & req
 }
 
 runtime::TaskResult MoonshineSTTSession::run(const runtime::TaskRequest & request) {
+    const auto wall_start = std::chrono::steady_clock::now();
     require_prepared("run()");
     if (task_.mode != runtime::RunMode::Offline) {
         throw std::runtime_error("Moonshine ASR run() requires an offline session");
@@ -244,7 +272,7 @@ runtime::TaskResult MoonshineSTTSession::run(const runtime::TaskRequest & reques
     }
     auto normalized_request = request;
     normalized_request.options = normalize_request_options(request.options, *contract_);
-    return transcribe_moonshine_asr_with_chunking(
+    auto result = transcribe_moonshine_asr_with_chunking(
         *assets_,
         *weights_,
         execution_context(),
@@ -252,6 +280,8 @@ runtime::TaskResult MoonshineSTTSession::run(const runtime::TaskRequest & reques
         normalized_request.options,
         runtime_config_,
         engine::audio::parse_audio_chunk_mode(normalized_request.options) == engine::audio::AudioChunkMode::Vad ? &vad_session() : nullptr);
+    engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start));
+    return result;
 }
 
 runtime::StreamingPolicy MoonshineSTTSession::streaming_policy() const {
@@ -264,6 +294,7 @@ runtime::StreamingPolicy MoonshineSTTSession::streaming_policy() const {
 }
 
 void MoonshineSTTSession::start_stream(const runtime::TaskRequest & request) {
+    stream_wall_start_ = std::chrono::steady_clock::now();
     require_prepared("Moonshine ASR start_stream()");
     if (task_.mode != runtime::RunMode::Streaming) {
         throw std::runtime_error("Moonshine ASR start_stream() requires a streaming session");
@@ -333,6 +364,7 @@ runtime::TaskResult MoonshineSTTSession::finalize() {
             ? &vad_session()
             : nullptr);
     reset();
+    engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(stream_wall_start_));
     return result;
 }
 
@@ -344,7 +376,7 @@ runtime::IOfflineVoiceTaskSession & MoonshineSTTSession::vad_session() {
     if (vad_session_ == nullptr) {
         runtime::ModelLoadRequest load_request;
         load_request.model_path = vad_model_path_;
-        vad_model_ = engine::models::silero_vad::load_silero_vad_model(load_request);
+        vad_model_ = runtime::load_vad_model(load_request);
         auto session = vad_model_->create_task_session(
             runtime::TaskSpec{runtime::VoiceTaskKind::Vad, runtime::RunMode::Offline},
             runtime::SessionOptions{options().backend, {}});

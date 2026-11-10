@@ -1,4 +1,4 @@
-import type { LoadedModel, ServerHealth } from './types';
+import type { LoadedModel, PackageLoadTarget, ServerHealth } from './types';
 
 function apiUrl(path: string): string {
   return new URL(path.replace(/^\//, ''), document.baseURI).toString();
@@ -39,14 +39,23 @@ export async function models(): Promise<LoadedModel[]> {
   return response.data;
 }
 
-export async function loadModel(body: Record<string, unknown>): Promise<void> {
-  await jsonRequest('/v1/models/load', { method: 'POST', body: JSON.stringify(body) });
+export async function loadModel(body: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
+  await jsonRequest('/v1/models/load', { method: 'POST', body: JSON.stringify(body) }, signal);
 }
 
-export async function unloadModel(id: string): Promise<void> {
+export async function unloadModel(id: string, signal?: AbortSignal): Promise<void> {
   await jsonRequest('/v1/models/unload', {
     method: 'POST',
     body: JSON.stringify({ id })
+  }, signal);
+}
+
+// Frees the models' memory and keeps them registered as configured; the next
+// request loads them again. Unlike unloadModel it needs no UI management.
+export async function releaseModels(ids: string[]): Promise<void> {
+  await jsonRequest('/v1/tasks/unload_models', {
+    method: 'POST',
+    body: JSON.stringify({ model_ids: ids })
   });
 }
 
@@ -104,6 +113,8 @@ export async function modelInstallJobs(): Promise<ModelInstallJob[]> {
 
 export interface ModelPackageSize {
   id: string;
+  load_target?: PackageLoadTarget | null;
+  load_target_error?: string | null;
   size_bytes: number | null;
   state: 'pending' | 'ok' | 'gated' | 'unknown' | 'error';
   message: string;
@@ -243,9 +254,10 @@ function sseData(message: string): string {
 // TaskStreamClosedError.
 export async function* taskStreamEvents(
   body: Record<string, unknown>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  endpoint: '/v1/tasks/stream' | '/v1/recipes/run' = '/v1/tasks/stream'
 ): AsyncGenerator<TaskStreamMessage> {
-  const response = await fetch(apiUrl('/v1/tasks/stream'), {
+  const response = await fetch(apiUrl(endpoint), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ...body, stream_format: 'sse' }),
@@ -318,11 +330,15 @@ export async function* taskStreamEvents(
   if (!sawDone) throw new TaskStreamClosedError();
 }
 
-export function base64AudioUrl(data: string): string {
+export function base64AudioBlob(data: string): Blob {
   const binary = atob(data);
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) {
     bytes[index] = binary.charCodeAt(index);
   }
-  return URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+  return new Blob([bytes], { type: 'audio/wav' });
+}
+
+export function base64AudioUrl(data: string): string {
+  return URL.createObjectURL(base64AudioBlob(data));
 }

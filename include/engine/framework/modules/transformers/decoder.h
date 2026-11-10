@@ -70,6 +70,9 @@ struct DecoderActivationCastPolicy {
     bool after_mlp_silu = false;
     bool after_mlp_mul = false;
     bool after_output = false;
+    // Qwen rounds normalized activations before applying the norm weight.
+    std::optional<ggml_type> norm_intermediate_type = std::nullopt;
+    std::optional<ggml_type> rope_intermediate_type = std::nullopt;
 };
 
 struct DecoderAttentionPolicy {
@@ -80,6 +83,9 @@ struct DecoderAttentionPolicy {
     // False routes flash branches through repeat-KV + matmul/softmax for GPUs
     // without a flash kernel (e.g. CUDA sm70). True preserves historical behavior.
     bool allow_flash_attention = true;
+    // Return the prefix+new K/V concatenation the attention already built. Off
+    // by default: callers that feed it back would otherwise rebuild it.
+    bool prefix_state_returns_full_kv = false;
 };
 
 struct DecoderStaticCachePolicy {

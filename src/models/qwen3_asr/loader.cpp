@@ -40,8 +40,16 @@ runtime::ModelCliInterface cli() {
         {"preserve_punctuation", "bool", "Opt-in text output mode for timestamped chunked ASR: preserve ASR punctuation in text_output instead of rebuilding text from aligned words.", false, "false"},
     };
     out.session_options = {
+        {"qwen3_asr.perf_mode", "off|cuda_perf", "Performance preset; cuda_perf selects flash attention, packed projections, f16 KV, attention alignment 256 and offline batch size 2. Explicit controls override it.", false, "off"},
+        {"qwen3_asr.attention", "mixed|auto|eager|flash", "Decoder attention; default mixed preserves manual prefill and flash decode. cuda_perf selects flash. Explicit values override the preset."},
+        {"qwen3_asr.packed_projections", "bool", "Pack QKV and gate/up projections; default false, true with cuda_perf. Explicit values override the preset."},
+        {"qwen3_asr.kv_cache_type", "f32|f16", "KV storage; default f32, f16 with cuda_perf. Explicit values override the preset."},
+        {"qwen3_asr.kv_cache_alignment", "int", "Attention prefix alignment; default 1 (full capacity), 256 with cuda_perf. Explicit values override the preset.", false, std::nullopt, "1"},
+        {"qwen3_asr.offline_batch_size", "int", "Independent offline chunks decoded together: default 1, 2 with cuda_perf. Explicit values override the preset.", false, std::nullopt, "1", "2"},
+        {"qwen3_asr.lora", "path", "PEFT LoRA adapter directory or checkpoint file; merged into matching encoder/decoder weights at session creation.", false},
+        {"qwen3_asr.lora_scale", "float", "Multiplier for the adapter's alpha/r scaling; default 1.", false, "1"},
         {"qwen3_asr.forced_aligner_path", "path", "Optional Qwen3 ForcedAligner model path required for return_timestamps.", false},
-        {"qwen3_asr.vad_model_path", "path", "Optional Silero VAD model path for VAD chunking; default assets/framework/models/silero_vad.", false, "assets/framework/models/silero_vad"},
+        {"qwen3_asr.vad_model_path", "path", "Optional VAD model path for VAD chunking (any built-in VAD family); default assets/framework/models/silero_vad.", false, "assets/framework/models/silero_vad"},
         {"qwen3_asr.weight_type", "native|f32|f16|bf16|q8_0", "Shared text decoder weight storage fallback; default native.", false, "native"},
         {"qwen3_asr.audio_encoder_weight_type", "native|f32|f16", "Audio encoder weight storage type; default native.", false, "native"},
         {"qwen3_asr.text_decoder_weight_type", "native|f32|f16|bf16|q8_0", "Text decoder matmul weight storage type; defaults to weight_type when set, otherwise native.", false},

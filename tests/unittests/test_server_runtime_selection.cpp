@@ -1,6 +1,8 @@
 // Public legacy handlers reject every explicit slots field before touching state.
 // Exercise frontend forwarding too; no test hook in the original runtime is needed.
 #include "runtime.h"
+#include "server_protocol.h"
+#include "../../app/common/base64.h"
 #include "engine/framework/io/json.h"
 
 #include <filesystem>
@@ -9,6 +11,27 @@
 
 int main() {
     try {
+        // Artifact Base64 is already JSON-safe, including padding and all byte values.
+        for (const size_t count : {0, 1, 2, 3, 256, 257, 258}) {
+            std::vector<std::byte> payload(count);
+            for (size_t i = 0; i < count; ++i) payload[i] = static_cast<std::byte>(i & 255);
+            const auto artifact = engine::runtime::make_voice_artifact(
+                engine::runtime::ArtifactKind::Custom, "quoted\"id", payload, {{"key", "line\nvalue"}});
+            engine::runtime::TaskResult result;
+            result.output_artifacts.push_back(artifact);
+            engine::runtime::StreamEvent event;
+            event.output_artifacts.push_back(artifact);
+            for (const auto & body : {minitts::server::task_result_json(result, 0),
+                                     minitts::server::stream_event_json(event, false, true)}) {
+                const auto parsed = engine::io::json::parse(body);
+                const auto & row = parsed.require("artifacts").as_array().at(0);
+                if (minitts::app::base64_decode_bytes(row.require("payload").as_string()) != payload ||
+                    row.require("id").as_string() != artifact.id ||
+                    row.require("meta").require("key").as_string() != "line\nvalue" ||
+                    body.find("\"payload\":" + minitts::server::json_quote(minitts::app::base64_encode(payload))) == std::string::npos)
+                    throw std::runtime_error("artifact serialization changed JSON or payload bytes");
+            }
+        }
         minitts::server::ServerConfig config;
         config.backend = engine::core::BackendType::Cpu;
         config.ui_management = true;
@@ -37,11 +60,30 @@ int main() {
         }
         std::cout << "legacy registration and frontend forwarding boundary passed\n";
 
+        for (bool forwarded : {false, true}) {
+            minitts::server::HttpRequest recipes;
+            recipes.method = "GET";
+            recipes.path = "/v1/recipes";
+            const auto listed = forwarded ? state.forward_to_core(recipes) : state.handle(recipes);
+            if (listed.status != 200 ||
+                engine::io::json::parse(listed.body).require("data").as_array().empty()) {
+                throw std::runtime_error("recipe listing was not dispatched");
+            }
+            recipes.method = "POST";
+            recipes.path = "/v1/recipes/run";
+            recipes.body = "{\"recipe\":\"unknown-recipe\"}";
+            const auto rejected = forwarded ? state.forward_to_core(recipes) : state.handle(recipes);
+            if (rejected.status != 400 || rejected.body.find("unknown recipe") == std::string::npos) {
+                throw std::runtime_error("recipe errors bypassed shared HTTP handling");
+            }
+        }
+
         // Live speech needs `input` only for a model that speaks it. The entries
         // are lazy and the streams are never run, so no model loads and the
         // body is never read.
         minitts::server::ServerConfig live_config;
         live_config.backend = engine::core::BackendType::Cpu;
+        live_config.device = 3;
         live_config.ui_enabled = false;
         for (const std::string task : {"tts", "s2s", "vc"}) {
             minitts::server::ServerModelConfig model;
@@ -51,9 +93,19 @@ int main() {
             model.task = task;
             model.mode = "streaming";
             model.lazy = true;
+            if (task == "vc") model.device = 7;
             live_config.models.push_back(model);
         }
         minitts::server::ServerState live(live_config, std::filesystem::current_path());
+        minitts::server::HttpRequest live_list;
+        live_list.method = "GET";
+        live_list.path = "/v1/models";
+        const auto live_models = engine::io::json::parse(live.handle(live_list).body).require("data").as_array();
+        if (live_models.size() != 3 || live_models[0].require("device").as_number() != 3 ||
+            live_models[1].require("device").as_number() != 3 ||
+            live_models[2].require("device").as_number() != 7) {
+            throw std::runtime_error("legacy model listing did not resolve per-model devices");
+        }
         for (const std::string task : {"tts", "s2s", "vc"}) {
             for (const std::string input : {"", "&input="}) {
                 std::istream pcm(nullptr);

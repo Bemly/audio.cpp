@@ -1,5 +1,6 @@
 // Unit tests for TransformerKVCache ring_mode: slot mapping, wrap advance,
-// chronological export, wrap-placement import, and non-ring regression.
+// chronological export, wrap-placement import, and non-ring regression, plus
+// the bucketed step-graph capacity a static-cache AR loop sizes itself from.
 #include "engine/framework/runtime/kv_cache.h"
 
 #include "engine/framework/core/backend.h"
@@ -7,8 +8,11 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -44,7 +48,7 @@ struct BackendDeleter {
     }
 };
 
-// 1 layer of F32 key/value tensors with room for (steps * elems) floats.
+// One layer of key/value tensors, F32 by default, with (steps * elems) elements.
 struct TestTensors {
     std::unique_ptr<ggml_context, GgmlContextDeleter> ctx;
     std::unique_ptr<std::remove_pointer_t<ggml_backend_buffer_t>, void (*)(ggml_backend_buffer_t)> buffer{
@@ -62,7 +66,7 @@ ggml_backend_t cpu_backend() {
     return backend.get();
 }
 
-TestTensors make_tensors(int64_t steps, int64_t elems) {
+TestTensors make_tensors(int64_t steps, int64_t elems, ggml_type type = GGML_TYPE_F32) {
     TestTensors out;
     ggml_init_params params{1024ull * 1024ull, nullptr, true};
     out.ctx.reset(ggml_init(params));
@@ -70,14 +74,14 @@ TestTensors make_tensors(int64_t steps, int64_t elems) {
         throw std::runtime_error("test context init failed");
     }
     const int64_t count = steps * elems;
-    ggml_tensor * k = ggml_new_tensor_1d(out.ctx.get(), GGML_TYPE_F32, count);
-    ggml_tensor * v = ggml_new_tensor_1d(out.ctx.get(), GGML_TYPE_F32, count);
+    ggml_tensor * k = ggml_new_tensor_1d(out.ctx.get(), type, count);
+    ggml_tensor * v = ggml_new_tensor_1d(out.ctx.get(), type, count);
     out.buffer.reset(ggml_backend_alloc_ctx_tensors(out.ctx.get(), cpu_backend()));
     if (out.buffer == nullptr) {
         throw std::runtime_error("test buffer alloc failed");
     }
-    out.keys = core::TensorValue{k, core::TensorShape::from_dims({count}), GGML_TYPE_F32};
-    out.values = core::TensorValue{v, core::TensorShape::from_dims({count}), GGML_TYPE_F32};
+    out.keys = core::TensorValue{k, core::TensorShape::from_dims({count}), type};
+    out.values = core::TensorValue{v, core::TensorShape::from_dims({count}), type};
     return out;
 }
 
@@ -265,6 +269,91 @@ void test_non_ring_regression() {
     std::cout << "non-ring regression done\n";
 }
 
+void test_bucketed_cache_steps() {
+    // The shape families size their step graph from: doubling buckets from 128,
+    // clamped to prompt + max_tokens, exact once doubling would overshoot.
+    check(runtime::bucketed_cache_steps(114, 128) == 242, "one generated window is exact");
+    check(runtime::bucketed_cache_steps(100, 200) == 256, "short request rounds to a bucket");
+    check(runtime::bucketed_cache_steps(200, 8000) == 512, "generated window stops at 128 steps");
+    check(runtime::bucketed_cache_steps(8000, 0) == 8000, "long prompt lands on its own length");
+    check(runtime::bucketed_cache_steps(0, 64) == 64, "promptless request clamps to the total");
+    check(runtime::bucketed_cache_steps(0, 0) == 0, "empty request is empty");
+    check(runtime::bucketed_cache_steps(10, 10, 4, 8) == 16, "window and floor knobs are honoured");
+    for (const int64_t prompt : {0, 1, 43, 114, 1000, 8000}) {
+        int64_t previous = 0;
+        for (const int64_t tokens : {0, 1, 64, 128, 129, 1024, 8192}) {
+            const int64_t maximum = prompt + tokens;
+            const int64_t bucket = runtime::bucketed_cache_steps(prompt, tokens);
+            check(bucket <= maximum, "bucket never exceeds the request total");
+            check(bucket >= std::min(prompt + std::min(tokens, int64_t{128}), maximum),
+                  "bucket never undercuts the generated window it needs");
+            check(bucket >= previous, "bucket grows with the request");
+            previous = bucket;
+        }
+    }
+    std::cout << "bucketed_cache_steps done\n";
+}
+
+void test_direct_import() {
+    constexpr int64_t steps = 8, elems = 3;
+    auto ordinary = make_tensors(steps, elems);
+    auto direct = make_tensors(steps, elems);
+    auto reference = make_cache(ordinary, steps, elems, {});
+    runtime::TransformerKVCacheOptions options;
+    options.direct_import = true;
+    auto cache = make_cache(direct, steps, elems, options);
+    const std::vector<float> poison(steps * elems, std::numeric_limits<float>::quiet_NaN());
+    for (auto * tensor : {ordinary.keys.tensor, ordinary.values.tensor, direct.keys.tensor, direct.values.tensor}) {
+        ggml_backend_tensor_set(tensor, poison.data(), 0, poison.size() * sizeof(float));
+    }
+    for (const int64_t length : {6, 2, 0, 8, 3}) {
+        runtime::TransformerKVState state;
+        state.current_end = length;
+        state.layers.resize(1);
+        auto & layer = state.layers.front();
+        layer.valid_steps = length;
+        for (int64_t i = 0; i < length * elems; ++i) {
+            layer.key.push_back(static_cast<float>(i - 4) / 7.0F);
+            layer.value.push_back(i == 0 ? -0.0F : static_cast<float>(i + 2) / -11.0F);
+        }
+        reference.import_state(state);
+        cache.import_state(state);
+        for (const auto & tensors : {std::pair{ordinary.keys.tensor, direct.keys.tensor},
+                                     std::pair{ordinary.values.tensor, direct.values.tensor}}) {
+            std::vector<float> expected(steps * elems), actual(steps * elems);
+            ggml_backend_tensor_get(tensors.first, expected.data(), 0, expected.size() * sizeof(float));
+            ggml_backend_tensor_get(tensors.second, actual.data(), 0, actual.size() * sizeof(float));
+            check(std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)) == 0,
+                  "direct import preserves every prefix and unused-tail byte");
+        }
+        const auto exported = cache.export_state();
+        check(exported.current_end == length && cache.valid_steps() == length, "direct import counters");
+        check(exported.layers.front().key == layer.key && exported.layers.front().value == layer.value,
+              "direct import/export round trip");
+    }
+    // Poison rows that a failed or truncated direct append could leave behind.
+    ggml_backend_tensor_set(direct.keys.tensor, poison.data(), 0, poison.size() * sizeof(float));
+    cache.advance_after_direct_append(2);
+    cache.retain_prefix(1);
+    runtime::TransformerKVState empty;
+    empty.layers.resize(1);
+    cache.import_state(empty);
+    std::vector<float> cleared(steps * elems);
+    ggml_backend_tensor_get(direct.keys.tensor, cleared.data(), 0, cleared.size() * sizeof(float));
+    check(cleared == std::vector<float>(steps * elems, 0.0F), "direct reset clears all stale rows after truncation");
+    for (const bool ring : {false, true}) {
+        auto invalid_options = options;
+        invalid_options.ring_mode = ring;
+        invalid_options.allow_f16_storage = true;
+        auto tensors = make_tensors(steps, elems, ring ? GGML_TYPE_F32 : GGML_TYPE_F16);
+        bool rejected = false;
+        try { (void)make_cache(tensors, steps, elems, invalid_options); }
+        catch (const std::runtime_error &) { rejected = true; }
+        check(rejected, "direct import rejects unsupported storage and ring mode");
+    }
+    std::cout << "direct import done\n";
+}
+
 }  // namespace
 
 int main() {
@@ -274,6 +363,8 @@ int main() {
         test_wrap_round_trip();
         test_wrap_advance();
         test_non_ring_regression();
+        test_bucketed_cache_steps();
+        test_direct_import();
     } catch (const std::exception & e) {
         std::cerr << "ERROR: " << e.what() << "\n";
         return 1;

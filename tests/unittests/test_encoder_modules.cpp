@@ -1,9 +1,14 @@
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/backend_weight_store.h"
+#include "engine/framework/debug/profiler.h"
 #include "engine/framework/modules/attention_modules.h"
 #include "engine/framework/modules/activation_modules.h"
+#include "engine/framework/modules/conditioning_modules.h"
 #include "engine/framework/modules/conformer_modules.h"
+#include "engine/framework/modules/convnext_modules.h"
 #include "engine/framework/modules/primitive_modules.h"
+#include "engine/framework/modules/positional_modules.h"
+#include "engine/framework/modules/structural_modules.h"
 #include "engine/framework/modules/weight_binding.h"
 #include "engine/framework/runtime/graph_optimizer.h"
 
@@ -217,6 +222,8 @@ engine::runtime::GraphOptimizationBackend graph_optimizer_backend_for_test(engin
             return engine::runtime::GraphOptimizationBackend::Gpu;
         case engine::core::BackendType::Vulkan:
         case engine::core::BackendType::Metal:
+        case engine::core::BackendType::WebGPU:
+        case engine::core::BackendType::Sycl:
         case engine::core::BackendType::BestAvailable:
             return engine::runtime::GraphOptimizationBackend::Other;
     }
@@ -230,6 +237,99 @@ void set_runner_backend(ModuleRunner & runner, engine::core::BackendType type) {
         runner.backend = nullptr;
     }
     runner.backend = engine::core::init_backend(runner.backend_config);
+}
+
+void test_cuda_f16_lowerings_default_off() {
+    using namespace engine;
+    require(!modules::LinearConfig{}.cuda_f16_output, "FP16 Linear must be opt-in");
+    require(!modules::NormConfig{}.cuda_f16_output, "FP16 LayerNorm must be opt-in");
+    require(!modules::GroupNormConfig{}.cuda_f16_output, "FP16 GroupNorm must be opt-in");
+    require(!modules::Conv2dConfig{}.cuda_cudnn && !modules::Conv2dConfig{}.cuda_f16_output,
+        "cuDNN Conv2D and FP16 output must be opt-in");
+    static_assert(static_cast<int>(modules::ScaledDotProductAttentionLowering::ExplicitCpuPerHead) == 3);
+    (void) []() -> modules::SiluModule { return {}; }();
+    (void) []() -> modules::AddModule { return {}; }();
+    (void) []() -> modules::MulModule { return {}; }();
+}
+
+void test_mul_optional_broadcasting() {
+    using namespace engine;
+    using core::TensorShape;
+    struct Case {
+        TensorShape shape, rhs_shape;
+        std::vector<float> input, rhs, expected;
+    };
+    const std::vector<Case> cases = {
+        {TensorShape::from_dims({2, 3}), TensorShape::from_dims({2, 3}),
+         {1, -2, 3, 4, -5, 6}, {2, -1, .5F, 4, 2, -.5F}, {2, 2, 1.5F, 16, -10, -3}},
+        {TensorShape::from_dims({2, 3}), TensorShape::from_dims({1}),
+         {1, -2, 3, 4, -5, 6}, {-2}, {-2, 4, -6, -8, 10, -12}},
+        {TensorShape::from_dims({2, 3}), TensorShape::from_dims({1, 3}),
+         {1, -2, 3, 4, -5, 6}, {2, -1, .5F}, {2, 2, 1.5F, 8, 5, 3}},
+        {TensorShape::from_dims({2, 3}), TensorShape::from_dims({2, 1}),
+         {1, -2, 3, 4, -5, 6}, {2, -1}, {2, -4, 6, -4, 5, -6}},
+        {TensorShape::from_dims({2, 2, 3}), TensorShape::from_dims({1, 2, 1}),
+         {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, {2, -1},
+         {2, 4, 6, -4, -5, -6, 14, 16, 18, -10, -11, -12}},
+        {TensorShape::from_dims({4, 2}), TensorShape::from_dims({2, 2}),
+         {1, 2, 3, 4, 5, 6, 7, 8}, {2, -1, 3, .5F}, {2, -2, 9, 2, 10, -6, 21, 4}},
+    };
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const auto & c = cases[i];
+        CpuModuleRunner runner;
+        const auto input = runner.make_f32(c.shape), rhs = runner.make_f32(c.rhs_shape);
+        std::optional<core::TensorValue> strict;
+        bool rejected = false;
+        try {
+            strict = modules::MulModule().build(runner.ctx, input, rhs);
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        require(rejected == (i != 0), "Mul default shape validation changed");
+        const auto output = modules::MulModule(true).build(runner.ctx, input, rhs);
+        core::validate_shape(output, c.shape, "Mul broadcast output");
+        require(output.type == GGML_TYPE_F32, "Mul output type changed");
+        auto * graph = ggml_new_graph_custom(runner.ggml, kTestGraphNodes, false);
+        ggml_build_forward_expand(graph, output.tensor);
+        for (int node = 0; node < ggml_graph_n_nodes(graph); ++node)
+            require(ggml_graph_node(graph, node)->op != GGML_OP_REPEAT, "Mul materialized a broadcast");
+        runner.allocate_tensors();
+        core::write_tensor_f32(input, c.input);
+        core::write_tensor_f32(rhs, c.rhs);
+        require_allclose(runner.run_f32(output), c.expected, 0, "Mul optional broadcast");
+        if (strict) require_allclose(runner.run_f32(*strict), c.expected, 0, "Mul unchanged default");
+    }
+    CpuModuleRunner runner;
+    const auto input = runner.make_f32(TensorShape::from_dims({2, 3}));
+    for (const auto & shape : {TensorShape::from_dims({4, 3}), TensorShape::from_dims({1, 2})}) {
+        bool rejected = false;
+        try {
+            (void)modules::MulModule(true).build(runner.ctx, input, runner.make_f32(shape));
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        require(rejected, "Mul accepted incompatible RHS broadcasting");
+    }
+}
+
+
+void test_mul_preserved_views() {
+    using namespace engine;
+    CpuModuleRunner runner;
+    const auto packed = runner.make_f32(core::TensorShape::from_dims({2, 6}));
+    const auto lhs = modules::SliceModule({1, 0, 3}).build(runner.ctx, packed);
+    const auto rhs = modules::SliceModule({1, 3, 3}).build(runner.ctx, packed);
+    const auto output = modules::MulModule(false, true).build(runner.ctx, lhs, rhs);
+    require(output.tensor->src[0] == lhs.tensor && output.tensor->src[1] == rhs.tensor,
+            "Mul preserved views were materialized");
+    const auto broadcast_rhs = modules::SliceModule({0, 1, 1}).build(runner.ctx, rhs);
+    const auto broadcast = modules::MulModule(true, true).build(runner.ctx, lhs, broadcast_rhs);
+    const auto original = modules::MulModule().build(runner.ctx, lhs, rhs);
+    runner.allocate_tensors();
+    core::write_tensor_f32(packed, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    require_allclose(runner.run_f32(output), {4, 10, 18, 70, 88, 108}, 0, "Mul strided views");
+    require_allclose(runner.run_f32(original), {4, 10, 18, 70, 88, 108}, 0, "Mul default view handling");
+    require_allclose(runner.run_f32(broadcast), {10, 22, 36, 70, 88, 108}, 0, "Mul strided broadcast");
 }
 
 void test_graph_optimizer_elides_metadata_nodes_without_changing_output() {
@@ -936,6 +1036,49 @@ void test_batch_norm_eval_binding() {
     require_allclose(bias, {-3, 0}, 1e-6f, "batch norm eval bias");
 }
 
+void test_timestep_embedding_norm_opt_in() {
+    using namespace engine;
+    ModuleRunner runner;
+    auto timestep = runner.make_f32(core::TensorShape::from_dims({1, 1}));
+    auto freqs = runner.make_f32(core::TensorShape::from_dims({2}));
+    auto identity = runner.make_f32(core::TensorShape::from_dims({4, 4}));
+    auto zeros = runner.make_f32(core::TensorShape::from_dims({4}));
+    auto alpha = runner.make_f32(core::TensorShape::from_dims({4}));
+    modules::TimestepEmbeddingWeights weights{freqs, {identity, zeros}, {identity, zeros}, alpha};
+    modules::TimestepEmbeddingConfig config{4, 4, 1e-5f};
+    require(config.norm == modules::TimestepEmbeddingNorm::VarianceRms, "default norm remains the variance RMS");
+    auto legacy = modules::TimestepEmbeddingModule(config).build(runner.ctx, timestep, weights);
+    config.norm = modules::TimestepEmbeddingNorm::Rms;
+    auto rms = modules::TimestepEmbeddingModule(config).build(runner.ctx, timestep, weights);
+    runner.allocate_tensors();
+    const float t = 0.7f;
+    const std::vector<float> freq_values{1.0f, 0.25f};
+    const std::vector<float> alpha_values{1.0f, 2.0f, 0.5f, -1.0f};
+    core::write_tensor_f32(timestep, {t});
+    core::write_tensor_f32(freqs, freq_values);
+    core::write_tensor_f32(identity, {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1});
+    core::write_tensor_f32(zeros, {0, 0, 0, 0});
+    core::write_tensor_f32(alpha, alpha_values);
+    std::vector<float> x;
+    for (float f : freq_values) x.push_back(std::cos(t * f));
+    for (float f : freq_values) x.push_back(std::sin(t * f));
+    for (float & v : x) v = v / (1.0f + std::exp(-v));
+    float mean = 0.0f, mean_square = 0.0f;
+    for (float v : x) {
+        mean += v / 4.0f;
+        mean_square += v * v / 4.0f;
+    }
+    float variance = 0.0f;
+    for (float v : x) variance += (v - mean) * (v - mean) / 3.0f;
+    std::vector<float> expected_legacy, expected_rms;
+    for (size_t i = 0; i < x.size(); ++i) {
+        expected_legacy.push_back(x[i] * alpha_values[i] / std::sqrt(variance + 1e-5f));
+        expected_rms.push_back(x[i] * alpha_values[i] / std::sqrt(mean_square + 1e-5f));
+    }
+    require_allclose(runner.run_f32(legacy), expected_legacy, 1e-4f, "legacy variance RMS time embedding");
+    require_allclose(runner.run_f32(rms), expected_rms, 1e-5f, "opt-in plain RMS time embedding");
+}
+
 void test_feed_forward_activation_opt_in() {
     using namespace engine;
     ModuleRunner runner;
@@ -1087,6 +1230,55 @@ void test_cached_cross_flash_masks() {
     require_allclose(runner.run_f32(per_head), runner.run_f32(expected), 1e-5f, "per-head cached flash mask");
 }
 
+void test_weighted_statistics_and_scale_bias() {
+    using namespace engine;
+    CpuModuleRunner runner;
+    const auto shape = core::TensorShape::from_dims({1, 2, 3});
+    const auto input = runner.make_f32(shape);
+    const auto weights = runner.make_f32(shape);
+    const auto moments = modules::WeightedStatisticsModule({2, 1e-4f, 1e4f}).build(runner.ctx, input, weights);
+    const auto affine = modules::ScaleBiasModule({2.0f, -1.0f}).build(runner.ctx, input);
+    runner.allocate_tensors();
+    core::write_tensor_f32(input, {1, 2, 3, 2, 2, 2});
+    core::write_tensor_f32(weights, {0.25f, 0.5f, 0.25f, 0.25f, 0.5f, 0.25f});
+    require_allclose(runner.run_f32(moments.mean), {2, 2}, 0, "weighted mean");
+    require_allclose(runner.run_f32(moments.stddev), {std::sqrt(0.5f), 0.01f}, 1e-7f, "weighted stddev and floor");
+    require_allclose(runner.run_f32(affine), {1, 3, 5, 3, 3, 3}, 0, "scalar affine");
+}
+
+void test_convnext_default_matches_composition() {
+    using namespace engine;
+    using core::TensorShape;
+    CpuModuleRunner runner;
+    std::vector<std::pair<core::TensorValue, std::vector<float>>> parameters;
+    const auto parameter = [&](const TensorShape & shape) {
+        const auto tensor = runner.make_f32(shape);
+        parameters.emplace_back(tensor, make_patterned_f32(shape.num_elements(), 0.4f, 0.2f));
+        return tensor;
+    };
+    const auto input = parameter(TensorShape::from_dims({1, 7, 4}));
+    modules::ConvNeXt1dWeights weights;
+    weights.depthwise = {parameter(TensorShape::from_dims({4, 1, 3})), parameter(TensorShape::from_dims({4}))};
+    weights.norm = {parameter(TensorShape::from_dims({4})), parameter(TensorShape::from_dims({4}))};
+    weights.expansion = {parameter(TensorShape::from_dims({8, 4})), parameter(TensorShape::from_dims({8}))};
+    weights.projection = {parameter(TensorShape::from_dims({4, 8})), parameter(TensorShape::from_dims({4}))};
+    weights.gamma = parameter(TensorShape::from_dims({4}));
+    const auto actual = modules::build_convnext1d(runner.ctx, input, weights);
+    auto expected = modules::TransposeModule({{0, 2, 1, 3}, 3}).build(runner.ctx, input);
+    expected = modules::DepthwiseConv1dModule({4, 3, 1, 1, 1, true}).build(runner.ctx, expected, weights.depthwise);
+    expected = modules::TransposeModule({{0, 2, 1, 3}, 3}).build(runner.ctx, expected);
+    expected = modules::LayerNormModule({4, 1e-6f, true, true}).build(runner.ctx, expected, weights.norm);
+    expected = modules::LinearModule({4, 8, true}).build(runner.ctx, expected, weights.expansion);
+    expected = modules::GeluModule({modules::GeluApproximation::ExactErf}).build(runner.ctx, expected);
+    expected = modules::LinearModule({8, 4, true}).build(runner.ctx, expected, weights.projection);
+    const auto gamma = core::reshape_tensor(runner.ctx, weights.gamma, TensorShape::from_dims({1, 1, 4}));
+    expected = modules::MulModule().build(runner.ctx, expected, modules::RepeatModule({expected.shape}).build(runner.ctx, gamma));
+    expected = modules::AddModule().build(runner.ctx, input, expected);
+    runner.allocate_tensors();
+    for (const auto & parameter : parameters) core::write_tensor_f32(parameter.first, parameter.second);
+    require_allclose(runner.run_f32(actual), runner.run_f32(expected), 0, "ConvNeXt default composition");
+}
+
 void test_prelu_broadcasting() {
     using namespace engine;
     for (size_t axis = 0; axis < 3; ++axis) {
@@ -1114,15 +1306,87 @@ void test_prelu_broadcasting() {
     }
 }
 
+void test_interpolate_align_corners() {
+    using namespace engine;
+    CpuModuleRunner runner;
+    const auto input=runner.make_f32(core::TensorShape::from_dims({1,1,3}));
+    const auto legacy=modules::Interpolate1dModule({5,modules::Interpolate1dMode::Linear}).build(runner.ctx,input);
+    const auto aligned=modules::Interpolate1dModule({5,modules::Interpolate1dMode::Linear,true}).build(runner.ctx,input);
+    const auto single=modules::Interpolate1dModule({1,modules::Interpolate1dMode::Linear,true}).build(runner.ctx,input);
+    runner.allocate_tensors();
+    core::write_tensor_f32(input,{0,1,4});
+    require_allclose(runner.run_f32(legacy),{0,.4F,1,2.8F,4},1.e-6F,"interpolation unchanged default");
+    require_allclose(runner.run_f32(aligned),{0,.5F,1,2.5F,4},1.e-6F,"interpolation aligned corners");
+    require_allclose(runner.run_f32(single),{0},1.e-6F,"interpolation aligned singleton");
+}
+
+void test_batched_rope_matches_independent_rows() {
+    using namespace engine;
+    for (const int64_t batch : {1, 2, 5}) {
+        for (const int64_t steps : {1, 3}) {
+            for (const int mode : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX}) {
+                for (const bool half : {false, true}) {
+                    for (const bool use_factors : {false, true}) {
+                        CpuModuleRunner runner;
+                        const auto shape = core::TensorShape::from_dims({batch, steps, 3, 8});
+                        const auto source = runner.make_f32(shape);
+                        const auto input = half ? core::wrap_tensor(ggml_cast(runner.ggml, source.tensor, GGML_TYPE_F16),
+                            shape, GGML_TYPE_F16) : source;
+                        const auto positions = runner.make_i32(core::TensorShape::from_dims({batch, steps}));
+                        const auto factors = runner.make_f32(core::TensorShape::from_dims({4}));
+                        const modules::RoPEModule rope({8, mode, 10000.0F});
+                        const auto actual = rope.build_batched(runner.ctx, input, positions, use_factors ? &factors : nullptr);
+                        std::vector<core::TensorValue> independent;
+                        for (int64_t row = 0; row < batch; ++row) {
+                            const auto x = modules::SliceModule({0, row, 1}).build(runner.ctx, input);
+                            auto p = modules::SliceModule({0, row, 1}).build(runner.ctx, positions);
+                            p = core::reshape_tensor(runner.ctx, p, core::TensorShape::from_dims({steps}));
+                            independent.push_back(rope.build(runner.ctx, x, p, use_factors ? &factors : nullptr));
+                        }
+                        auto expected = independent.front();
+                        for (size_t row = 1; row < independent.size(); ++row)
+                            expected = modules::ConcatModule({0}).build(runner.ctx, expected, independent[row]);
+                        const auto actual_f32 = core::wrap_tensor(ggml_cast(runner.ggml, actual.tensor, GGML_TYPE_F32), shape, GGML_TYPE_F32);
+                        const auto expected_f32 = core::wrap_tensor(ggml_cast(runner.ggml, expected.tensor, GGML_TYPE_F32), shape, GGML_TYPE_F32);
+                        runner.allocate_tensors();
+                        core::write_tensor_f32(source, make_patterned_f32(shape.num_elements(), 0.3F, 0.8F));
+                        core::write_tensor_f32(factors, {1.0F, 1.5F, 2.0F, 0.5F});
+                        for (int round = 0; round < 2; ++round) {
+                            std::vector<int32_t> ids(batch * steps);
+                            for (int64_t row = 0; row < batch; ++row)
+                                for (int64_t t = 0; t < steps; ++t) ids[row * steps + t] = row * 137 + t * 3 + round * 4096;
+                            core::write_tensor_i32(positions, ids);
+                            require_allclose(runner.run_f32(actual_f32), runner.run_f32(expected_f32), 0.0F, "Independent batched RoPE");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    const auto started = std::chrono::steady_clock::now();
     try {
+        if (argc == 3 && std::string(argv[1]) == "--log")
+            engine::debug::configure_logging({true, argv[2]});
+        else if (argc != 1)
+            throw std::runtime_error("Usage: encoder_module_test [--log FILE]");
+        test_batched_rope_matches_independent_rows();
+        test_cuda_f16_lowerings_default_off();
+        test_mul_optional_broadcasting();
+        test_mul_preserved_views();
+        test_weighted_statistics_and_scale_bias();
+        test_convnext_default_matches_composition();
         test_prelu_broadcasting();
+        test_interpolate_align_corners();
         test_glu_contiguous_gate_opt_in();
         test_depthwise_subsampling_stage_masks();
         test_batch_norm_eval_binding();
         test_feed_forward_activation_opt_in();
+        test_timestep_embedding_norm_opt_in();
         test_cached_decoder_block_matches_composition(false);
         test_cached_decoder_block_matches_composition(true);
         test_cached_cross_flash_masks();
@@ -1133,9 +1397,11 @@ int main() {
         test_relative_attention_specialized_flash_matches_reference_on_realistic_shapes();
         test_conformer_conv_pad_mask_ignores_dirty_padded_frames();
         std::cout << "encoder_module_test: ok\n";
+        engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(started));
         return 0;
     } catch (const std::exception & ex) {
         std::cerr << "encoder_module_test: failed: " << ex.what() << "\n";
+        engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(started));
         return 1;
     }
 }

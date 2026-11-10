@@ -1,3 +1,5 @@
+#include "engine/framework/debug/profiler.h"
+#include "engine/framework/debug/trace.h"
 // Run the actual server handlers with tiny controlled loaders. Barriers force
 // lifecycle overlaps without GPU timing, sleeps in production, or large models.
 #include "parallel_runtime.h"
@@ -76,6 +78,7 @@ struct Control {
     Gate load, run, destroy;
     std::atomic<int> loads{0}, destructions{0}, runs{0}, finishes{0};
     std::atomic<int> sessions{0}, clones{0}, final_text{0};
+    std::atomic<int> last_device{-1};
     std::atomic<bool> fail_load{false}, null_session{false}, fail_prepare{false}, fail_run{false}, fail_clone{false}, reject_run{false};
     std::atomic<bool> premature_model_destruction{false}, live_input{false}, no_text{false}; std::optional<rt::Transcript> live_text;
 };
@@ -130,6 +133,7 @@ public:
         emitted_ = true;
         rt::StreamEvent event;
         event.audio_output = result_.audio_output;
+        event.output_artifacts = result_.output_artifacts;
         event.partial_text = result_.text_output; if (control_->final_text == 2) { event.partial_text->text += "!"; }
         event.is_final = true;
         return event;
@@ -159,6 +163,7 @@ public:
     const rt::CapabilitySet & capabilities() const noexcept override { return capabilities_; }
     std::unique_ptr<rt::IVoiceTaskSession> create_task_session(const rt::TaskSpec & task, const rt::SessionOptions & options) const override {
         if (control_->null_session) { return nullptr; }
+        control_->last_device = options.backend.device;
         const auto cap = options.options.find("fixture_capacity");
         return std::make_unique<Session>(control_, task, revision_,
             cap == options.options.end() ? 4 : std::stoul(cap->second));
@@ -243,11 +248,11 @@ struct Fixture {
     std::shared_ptr<Loader> loader = std::make_shared<Loader>();
     std::unique_ptr<srv::ParallelServerState> state;
     int count;
-    Fixture(int slots, int limit = 0) : count(slots) {
+    Fixture(int slots, int limit = 0, int device = 0) : count(slots) {
         root = std::filesystem::temp_directory_path() /
             ("audiocpp-lifecycle-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(root);
-        srv::ServerConfig config; config.backend = engine::core::BackendType::Cpu;
+        srv::ServerConfig config; config.backend = engine::core::BackendType::Cpu; config.device = device;
         config.ui_enabled = false; config.max_loaded_models = limit; config.busy_timeout_ms = 0;
         state = std::make_unique<srv::ParallelServerState>(config, root);
         Access::registry(*state, loader);
@@ -280,6 +285,37 @@ struct Fixture {
             quote(task) + ",\"slots\":" + std::to_string(count) + "}");
     }
 };
+
+void per_model_device_selection() {
+    Fixture f(1, 0, 3);
+    auto inherited = f.add("inherited");
+    auto overridden = f.add("overridden");
+    Access::model(*f.state, "overridden").config.device = 7;
+
+    success(run(*f.state, "inherited"));
+    success(run(*f.state, "overridden"));
+    require(inherited->last_device == 3, "model without override did not use the server device");
+    require(overridden->last_device == 7, "model override did not reach SessionOptions");
+
+    srv::HttpRequest list; list.method = "GET"; list.path = "/v1/models";
+    const auto listed = f.state->handle(list);
+    success(listed);
+    const auto data = parse(listed.body).require("data").as_array();
+    require(data.size() == 2 && data[0].require("device").as_number() == 3 &&
+            data[1].require("device").as_number() == 7,
+            "model listing did not expose effective devices: " + listed.body);
+
+    f.asset("replacement");
+    success(f.replace("overridden", "replacement"));
+    require(overridden->last_device == 7,
+            "reloading a configured model without device discarded its assignment");
+
+    const auto invalid = post(*f.state, "/v1/models/load",
+        "{\"id\":\"bad\",\"path\":" + quote((f.root / "replacement").generic_string()) +
+        ",\"family\":\"lifecycle_fixture\",\"device\":-1,\"slots\":1}");
+    require(invalid.status == 400 && invalid.body.find("device for model bad") != std::string::npos,
+            "dynamic load accepted a negative model device: " + invalid.body);
+}
 
 void older_work_before_management(int count, bool reconfigure) {
     Fixture f(count); auto c = f.add("shared"); f.asset("replacement");
@@ -704,7 +740,8 @@ void unsupported_capacity_preserves_registration() {
             } catch (const std::exception & error) {
                 response.status = 500; response.body = error.what();
             }
-            const auto & model = Access::model(*f.state, "shared");
+            const std::string model_id = "shared";
+            const auto & model = Access::model(*f.state, model_id);
             require(model.sessions.get() == before && model.config.slots == count &&
                     model.config.path == f.root / "shared" && Access::resident(*f.state, "shared") &&
                     old->destructions == 0 && old->loads == 1,
@@ -968,6 +1005,25 @@ void generic_request_artifacts(int count) {
 // then the JSON response's "result" and [DONE]. Without the field, or with
 // null, the response is the JSON body. The fixture counts finalize calls, so a
 // writer that records the count at each write shows when an event left.
+void stream_artifacts_are_output() {
+    rt::StreamEvent event;
+    require(!srv::stream_event_has_output(event), "empty event counted as output");
+    require(srv::stream_event_json(event,false)=="{\"is_final\":false}", "empty event shape changed");
+    event.output_artifacts.push_back(rt::make_voice_artifact(rt::ArtifactKind::Custom,"frame",{std::byte{0},std::byte{255}},{{"format","rgb24"}}));
+    require(!srv::stream_event_has_output(event), "artifact-only event changed default output timing");
+    require(parse(srv::stream_event_json(event,false)).find("artifacts") == nullptr, "artifacts leaked without opt-in");
+    require(srv::stream_event_has_output(event, true), "opt-in artifact-only event not counted as output");
+    const auto encoded=parse(srv::stream_event_json(event,false,true));
+    const auto & artifacts=encoded.require("artifacts").as_array();
+    require(artifacts.size()==1 && artifacts[0].require("id").as_string()=="frame" &&
+            artifacts[0].require("payload").as_string()=="AP8=" &&
+            artifacts[0].require("meta").require("format").as_string()=="rgb24", "stream artifact was lost or changed");
+    rt::TaskResult result;result.output_artifacts=event.output_artifacts;
+    const auto final=parse(srv::task_result_json(result,0));
+    require(engine::io::json::stringify(final.require("artifacts"))==engine::io::json::stringify(encoded.require("artifacts")),
+            "stream and final artifact formats differ");
+}
+
 void generic_task_stream_sse(int count) {
     Fixture f(count); auto c = f.add("stream", "streaming");
     const auto active = [&] { return Access::slots(*f.state, "stream").active; };
@@ -1037,6 +1093,17 @@ void generic_task_stream_sse(int count) {
         require(writer.writes[0].first == before && writer.writes[1].first == before + 1,
                 "task stream wrote its event after the run was over");
     }
+    const auto default_events = parse(stream(body("", true)).body).require("events").as_array();
+    require(default_events.front().find("artifacts") == nullptr, "default route leaked event artifacts");
+    const auto opted_events = parse(stream(body(",\"include_artifacts\":true", true)).body).require("events").as_array();
+    require(opted_events.front().require("artifacts").as_array().size() == 1,
+            "opt-in JSON route omitted event artifacts");
+    auto opted_sse = stream(body(sse + ",\"include_artifacts\":true", true));
+    Recorder opted_writer(c);
+    opted_sse.stream_body(opted_writer);
+    require(opted_writer.writes.front().second.find("\"artifacts\"") != std::string::npos,
+            "opt-in SSE route omitted event artifacts");
+    opted_sse.stream_body = {};
     // Only the top-level field of this route opts in: not the Accept header,
     // not a field inside `request`, not the field on /v1/tasks/run.
     srv::HttpRequest accept; accept.method = "POST"; accept.path = "/v1/tasks/stream"; accept.body = body("", true);
@@ -1104,6 +1171,15 @@ void generic_task_stream_sse(int count) {
 int main(int argc, char ** argv) {
     try {
         engine::io::json::enable_serialized_json_parsing();
+        if (argc >= 2 && std::string(argv[1]) == "stream-artifacts") {
+            engine::debug::configure_logging({true});
+            const auto started = std::chrono::steady_clock::now();
+            stream_artifacts_are_output();
+            for (int count : {1, 2}) generic_task_stream_sse(count);
+            engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(started));
+            std::cout << "stream artifact defaults and opt-in JSON/SSE passed\n";
+            return 0;
+        }
         if (argc == 2) {
             const std::string test = argv[1];
             if (test == "audit-capacity") { unsupported_capacity_preserves_registration(); }
@@ -1117,6 +1193,8 @@ int main(int argc, char ** argv) {
         registration_is_visible_while_loading();
         live_policy_does_not_hold_registry_lock();
         concurrent_json_parsing();
+        stream_artifacts_are_output();
+        per_model_device_selection();
         unsupported_capacity_preserves_registration();
         dynamic_capacity_changes_use_parallel_lifecycle();
         generic_batch_single_slot_and_invalid_input();

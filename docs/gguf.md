@@ -10,7 +10,7 @@ spec in `audiocpp.model_spec.*` metadata, so a standalone GGUF does not depend o
 `model_specs` directory or on the binary having that family compiled into its spec
 catalog.
 
-Runtime resolution is deterministic:
+Package/resource resolution is deterministic:
 
 ```text
 explicit --model-spec-override
@@ -25,6 +25,15 @@ compiled catalog (AUDIOCPP_DEPLOYMENT_BUILD=ON)
 external model_specs/<family>.json discovery
 ```
 
+Option validation, capabilities, and model-specific CLI help use a separate
+contract lookup order: explicit override, local `model_specs/<family>.json`
+discovered from the working directory and its parents, compiled deployment
+catalog, then the embedded GGUF spec. This allows contract updates without
+redistributing weights; package/resource resolution above is unchanged.
+Use external specs compatible with the installed runtime, not an arbitrary newer
+`main` revision. Legacy option aliases must remain supported. With `--log`,
+`runtime.model.contract_spec` identifies the selected contract.
+
 An explicit override is useful for testing a modified layout without rebuilding or
 reconverting:
 
@@ -37,6 +46,13 @@ The override may also be a directory containing `<family>.json`. The server supp
 the same command-line option and a `model_spec_override` field either at the top level
 or inside an individual model entry. A per-model field takes precedence over the
 server-wide value.
+
+Use `--model-spec-override embedded` (server config: `"model_spec_override":
+"embedded"`) to use the selected GGUF's embedded spec instead of external or
+compiled contracts. This requires a schema-v1 embedded contract; missing or legacy
+contracts fail without fallback. `--log` reports the selection as
+`runtime.model.contract_spec @gguf/<family>.json`. To select a local file or
+directory literally named `embedded`, use `./embedded` or its absolute path.
 
 ## Support And Test Status
 
@@ -78,6 +94,7 @@ Status labels:
 | `fun_asr_nano` | Done | Pass | --- | Pass | Pass |
 | `gigaam_asr` | Done | --- | Pass | Pass | --- |
 | `glm_tts` | Done | Pass (TTS + clone) | --- | --- | Pass (ASR match, drift) |
+| `gradium_phonon` | Done | Pass | Pass (BF16 source) | --- | Pass (drift) |
 | `heartmula` | Done | Pass | --- | Pass (drift) | Pass (drift) |
 | `higgs_audio_stt` | Done | Pass | --- | Pass | Pass |
 | `higgs_audio_tts` | Done | Pass | --- | Pass | Pass |
@@ -91,12 +108,15 @@ Status labels:
 | `kitten_tts` | Done | --- | Pass (drift) | --- | --- |
 | `kroko_asr` | Done | Pass | --- | --- | Pass |
 | `kugelaudio` | Done | --- | --- | Pass (ASR match, drift) | --- |
+| `latentsync` | Done | --- | Pass (short CUDA parity, Vulkan smoke) | Pass (F16; full CUDA video) | Pass (Q8/F16; full CUDA video) |
 | `magpie_tts` | Done | --- | Pass | --- | Pass |
 | `marblenet_vad` | Bundled (tiny model) | Pass | --- | --- | --- |
 | `maya1` | Done | --- | Pass | --- | --- |
 | `meanvc2` | Done | --- | --- | Pass | --- |
 | `mel_band_roformer` | Done | Pass | --- | Pass (drift) | Pass (drift) |
 | `micro_wake_word` | Done | --- | Pass (F32) | --- | --- |
+| `ming3_audio` | Done | --- | Pass (BF16; CUDA ASR, TTS, clone, S2S; Vulkan ASR + TTS + clone; drift) | Pass (BF16) | Pass (expert-only; full CUDA audio understanding, resident + offload; drift) |
+| `ming3_tts` | Done | --- | Pass (BF16; TTS + clone, drift) | Pass (BF16; TTS + clone, drift) | Pass (TTS + clone) |
 | `miocodec` | Done | Pass | Pass | Pass (drift) | Pass (drift) |
 | `miotts` | Done | Pass | Pass | Pass (drift) | Pass (ASR match, drift) |
 | `mms_forced_aligner` | Done | Pass | --- | Pass | Pass (bit-identical) |
@@ -110,11 +130,13 @@ Status labels:
 | `nemotron_asr` | Done | Pass | --- | Pass | Pass (minor filler drift) |
 | `neutts` | Done | Pass | --- | Pass | --- |
 | `omnivoice` | Done | Pass | --- | Pass (drift) | Pass (drift) |
+| `open_wake_word` | Done | --- | Pass (F32) | --- | --- |
 | `outetts` | Done | Pass (TTS + clone) | --- | --- | Pass (TTS + clone) |
 | `owsm` | Done | --- | Pass | --- | Pass (drift) |
 | `parakeet_tdt` | Done | Pass | Pass | Pass | Pass |
 | `personaplex` | Done | --- | --- | --- | Pass |
 | `piper_tts` | Done | Pass | Pass | --- | --- |
+| `plapre` | Done | --- | Pass (F32; TTS + clone) | Pass (BF16; TTS + clone) | --- |
 | `pocket_tts` | Done | Pass | --- | Pass | Pass (drift) |
 | `pulsevad` | Done | Pass | Pass | --- | --- |
 | `qwen3_asr` | Done | Pass | --- | Pass | Pass |
@@ -122,6 +144,7 @@ Status labels:
 | `qwen3_tts` base | Done | Pass | Pass | Pass (ASR match, drift) | Pass (ASR match, drift) |
 | `qwen3_tts` custom voice | Done | Pass | --- | Pass (ASR match, drift) | Pass (ASR match, drift) |
 | `qwen3_tts` voice design | Done | Pass | --- | Pass (ASR match, drift) | Pass (ASR match, drift) |
+| `realtime_reuse` | Done | --- | Pass (F32) | --- | --- |
 | `reuse` | Done | --- | Pass (drift) | Pass (drift) | Pass (drift) |
 | `rvc` | Done | --- | --- | Pass | --- |
 | `sam_audio` | Done | --- | Pass | --- | --- |
@@ -147,7 +170,7 @@ Status labels:
 | `voxcpm2` | Done | Pass | Pass | Pass (ASR match, drift) | Pass (ASR match, drift) |
 | `voxtral_realtime` | Done | Pass | --- | Pass | Pass |
 | `voxtral_tts` | Done | --- | --- | Pass (BF16) | Pass |
-| `whistle_asr` | Done | --- | --- | --- | --- |
+| `whistle_asr` | Done | --- | Pass (F32) | --- | --- |
 
 Additional lower-bit checks:
 
@@ -155,6 +178,7 @@ Additional lower-bit checks:
 |---|---|---|
 | `cohere_asr` | `q4_0` | Pass (drift) |
 | `meanvc2` | `q4_k` | Pass |
+| `ming3_audio` | `q4_k` | Pass (Q4_K experts, Q8_0 text head; CUDA resident + offload, long audio + chunked TTS; Vulkan ASR + TTS + clone) |
 | `moss_transcribe_diarize` | `q4_k` | No (long-audio segmentation/timestamp drift) |
 | `owsm` | `q4_k` | Pass (Small and Medium; transcript and timestamp drift) |
 | `personaplex` | `q4_k` | Pass |
@@ -172,6 +196,9 @@ Q8 packaging notes:
   tensors in Q8 in addition to the default converter selection. `conditioner.embed`,
   `cond_embed`, and Mimi conv tensors are not forced to Q8 because tested outputs
   drifted or the current conv path casts quantized conv weights back to F32.
+- `gradium_phonon` Q8 quantizes only the flow transformer linears. The flow net,
+  conditioner tables and input/EOS projections stay BF16 and Mimi stays F32; see the
+  [Gradium Phonon](models/gradium_phonon.md) conversion commands.
 - `dots_tts` Q8 keeps the vocoder in 16-bit storage and folds vocoder
   weight-norm conv tensors at conversion time. Use
   `--keep-type 'vocoder/*=f16' --fold-weight-norm 'vocoder/*'` for both SOAR

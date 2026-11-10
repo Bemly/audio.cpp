@@ -37,6 +37,8 @@ struct ServerModelConfig {
         std::optional<std::string> voice_id;
         std::optional<std::filesystem::path> voice_ref;
         std::optional<std::string> reference_text;
+        // Request options the preset supplies, passed to the model as given.
+        std::unordered_map<std::string, std::string> options;
     };
 
     std::string id;
@@ -46,6 +48,9 @@ struct ServerModelConfig {
     std::string task = "tts";
     std::string mode = "offline";
     bool lazy = false;
+    // Overrides ServerConfig::device for this model. When absent the server-wide
+    // device remains the default, preserving existing single-device configs.
+    std::optional<int> device;
     int slots = 1; // Capacity read only by the startup-selected parallel runtime.
     // Overrides ServerConfig::busy_timeout_ms for this model, and acts as the ceiling
     // a per-request busy_timeout_ms is clamped to. Model runtimes differ by orders of
@@ -70,8 +75,13 @@ struct ServerConfig {
     int port = 8080;
     std::string cors_origins = "";
     bool ui_enabled = true;
+    // Whether the UI was asked for (--ui, or "ui": true in the config file) rather
+    // than on by default.
+    bool ui_requested = false;
     bool ui_management = false;
+    std::optional<std::filesystem::path> models_root;
     engine::core::BackendType backend = engine::core::BackendType::Cuda;
+    std::string backend_impl;
     int device = 0;
     int threads = 1;
     bool lazy_load = false;
@@ -104,12 +114,18 @@ struct ServerConfig {
     // entirely (the default), so existing deployments see no behavior change
     // unless they opt in.
     int min_free_memory_mb = 0;
+    // Memory for cached resampling kernels in MiB, 0 disables the cache; unset keeps the library default.
+    std::optional<int> resample_kernel_cache_mb;
     // Fleet-wide bounds for incrementally delivered request bodies. The defaults are
     // in LiveIngestLimits; a model entry may override any subset of them.
     LiveIngestLimits live_ingest;
     std::string frontend_listener;
     ServerFrontendOptions frontend_options;
     std::optional<std::filesystem::path> model_spec_override;
+    // Session options for every model of a family that does not set them itself:
+    // the configured models and the ones loaded later through POST /v1/models/load
+    // (the WebUI). Keys are family-qualified, e.g. "irodori_tts.mem_saver".
+    std::unordered_map<std::string, std::string> default_session_options;
     // Voice library shared across all TTS models: *.wav files plus a `prompt_text`
     // mapping file (<basename>|<transcript>). A request `voice` name that is not a
     // model preset resolves to <voice_dir>/<name>.wav as the cloning reference.
@@ -120,5 +136,12 @@ struct ServerConfig {
 engine::core::BackendType parse_server_backend(const std::string & value);
 ServerConfig load_server_config(const std::filesystem::path & path);
 ServerConfig load_server_config(const std::filesystem::path & path, bool parallel_jobs);
+// Adds the config.default_session_options entries for model.family that the model's
+// own session_options do not set.
+void apply_default_session_options(const ServerConfig & config, ServerModelConfig & model);
+// A WebUI load describes a model only by what its request carries. For an id the
+// server config defines, takes the fields such a request cannot carry from that
+// definition, while the load is still the same kind of model (family and task).
+void inherit_configured_model_fields(const ServerModelConfig & configured, ServerModelConfig & model);
 
 }  // namespace minitts::server

@@ -1,7 +1,9 @@
 #pragma once
 
 #include "engine/framework/runtime/session.h"
+#include "engine/framework/assets/model_package.h"
 
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <memory>
@@ -75,6 +77,13 @@ struct ModelLoadRequest {
     std::unordered_map<std::string, std::string> options;
 };
 
+struct PackageLoadTarget {
+    std::string family;
+    std::filesystem::path model_path;
+    std::unordered_map<std::string, std::string> load_options;
+    std::unordered_map<std::string, std::string> session_options;
+};
+
 std::vector<NamedAsset> discover_named_assets(
     const std::filesystem::path & root,
     const std::vector<std::string> & relative_candidates);
@@ -116,6 +125,23 @@ struct LoaderAdvertisement {
     std::vector<std::string> api_endpoints;
 };
 
+/**
+ * One selected resource, with its model-reported resident cost in bytes.
+ */
+struct ModelEngineRequirement {
+    std::filesystem::path path;
+    size_t resident_bytes = 0;
+};
+
+/**
+ * Resources beyond weight files and their aggregate residency. The model applies its own
+ * residency policy; consumers use the paths for deduplication and add resident_bytes as given.
+ */
+struct ModelResourcePlan {
+    std::vector<ModelEngineRequirement> engines;
+    size_t resident_bytes = 0;
+};
+
 /** Map advertised capabilities to the HTTP surfaces they normally use. */
 std::vector<std::string> default_api_endpoints_for_capabilities(const CapabilitySet & capabilities);
 
@@ -138,6 +164,23 @@ public:
     virtual std::string advertised_instructions_policy() const;
     virtual std::vector<std::string> advertised_api_endpoints() const;
     LoaderAdvertisement advertise() const;
+
+    /**
+     * The artifacts this family will hold resident for one load of `model_path` under these
+     * session options, priced by the family. A family whose stages are all ggml graphs reports
+     * nothing: its host-consumer estimate is the weight files plus the caller's runtime factor.
+     */
+    virtual ModelResourcePlan model_resources(
+        const std::filesystem::path & model_path,
+        const std::unordered_map<std::string, std::string> & session_options) const {
+        (void)model_path;
+        (void)session_options;
+        return {};
+    }
+
+    // Translate selected package files into existing loading inputs. No weights
+    // are loaded here; path-based loading does not call this method.
+    virtual PackageLoadTarget resolve_package_load(const assets::ModelPackage & package) const;
 };
 
 }  // namespace engine::runtime

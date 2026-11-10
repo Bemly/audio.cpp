@@ -1,10 +1,15 @@
 #include "engine/framework/audio/resampling.h"
+#include "engine/framework/audio/streaming_resampler.h"
+
+#include <array>
 
 #include "engine/framework/debug/trace.h"
 #include "engine/framework/io/dynamic_library.h"
 
 #include <algorithm>
 #include <cmath>
+#include <list>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -69,7 +74,11 @@ public:
 
     SoxrApi() {
         handle_ = io::open_dynamic_library(
-            {"libsoxr.so.0", "libsoxr.so", "libsoxr.dylib", "soxr.dll", "libsoxr.dll"});
+            {"libsoxr.so.0", "libsoxr.so", "libsoxr.dylib", "soxr.dll", "libsoxr.dll",
+#if defined(__APPLE__)
+             "/opt/homebrew/lib/libsoxr.dylib", "/usr/local/lib/libsoxr.dylib",
+#endif
+            });
         if (handle_ == nullptr) {
             return;
         }
@@ -121,13 +130,13 @@ public:
         return runtime_spec_;
     }
 
-private:
     template <typename Fn>
-    Fn load_symbol(const char * name) {
+    Fn load_symbol(const char * name) const {
         void * symbol = io::dynamic_library_symbol(handle_, name);
         return reinterpret_cast<Fn>(symbol);
     }
 
+private:
     io::DynamicLibraryHandle handle_ = nullptr;
     OneShotFn oneshot_ = nullptr;
     IoSpecFn io_spec_ = nullptr;
@@ -197,7 +206,54 @@ struct TorchaudioSincHannResampleKernel {
     std::vector<double> values;
 };
 
-const TorchaudioSincHannResampleKernel & get_cached_torchaudio_sinc_hann_resample_kernel(
+struct TorchaudioSincHannCachedKernel {
+    TorchaudioSincHannResampleKey key;
+    std::shared_ptr<const TorchaudioSincHannResampleKernel> kernel;
+    size_t bytes = 0;
+};
+
+struct TorchaudioSincHannResampleKernelCache {
+    std::mutex mutex;
+    size_t budget_bytes = 32 * 1024 * 1024;
+    size_t bytes = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    // Most recently used first.
+    std::list<TorchaudioSincHannCachedKernel> entries;
+    std::unordered_map<
+        TorchaudioSincHannResampleKey,
+        std::list<TorchaudioSincHannCachedKernel>::iterator,
+        TorchaudioSincHannResampleKeyHash>
+        index;
+};
+
+TorchaudioSincHannResampleKernelCache & torchaudio_sinc_hann_resample_kernel_cache() {
+    static TorchaudioSincHannResampleKernelCache cache;
+    return cache;
+}
+
+// Callers hold cache.mutex.
+std::shared_ptr<const TorchaudioSincHannResampleKernel> touch_cached_torchaudio_sinc_hann_resample_kernel(
+    TorchaudioSincHannResampleKernelCache & cache,
+    const TorchaudioSincHannResampleKey & key) {
+    const auto it = cache.index.find(key);
+    if (it == cache.index.end()) {
+        return nullptr;
+    }
+    cache.entries.splice(cache.entries.begin(), cache.entries, it->second);
+    return it->second->kernel;
+}
+
+// Callers hold cache.mutex; callers still using an evicted kernel keep it alive.
+void evict_torchaudio_sinc_hann_resample_kernels(TorchaudioSincHannResampleKernelCache & cache, size_t incoming_bytes) {
+    while (!cache.entries.empty() && cache.bytes + incoming_bytes > cache.budget_bytes) {
+        cache.bytes -= cache.entries.back().bytes;
+        cache.index.erase(cache.entries.back().key);
+        cache.entries.pop_back();
+    }
+}
+
+std::shared_ptr<const TorchaudioSincHannResampleKernel> get_cached_torchaudio_sinc_hann_resample_kernel(
     int source_sample_rate_hz,
     int target_sample_rate_hz,
     const TorchaudioSincHannResampleOptions & options) {
@@ -208,12 +264,7 @@ const TorchaudioSincHannResampleKernel & get_cached_torchaudio_sinc_hann_resampl
         throw std::runtime_error("torchaudio Hann resampling requires rolloff in (0, 1]");
     }
 
-    static std::mutex mutex;
-    static std::unordered_map<
-        TorchaudioSincHannResampleKey,
-        TorchaudioSincHannResampleKernel,
-        TorchaudioSincHannResampleKeyHash>
-        cache;
+    auto & cache = torchaudio_sinc_hann_resample_kernel_cache();
 
     const TorchaudioSincHannResampleKey key{
         source_sample_rate_hz,
@@ -223,11 +274,12 @@ const TorchaudioSincHannResampleKernel & get_cached_torchaudio_sinc_hann_resampl
         options.kernel_mode,
     };
     {
-        std::lock_guard<std::mutex> lock(mutex);
-        const auto it = cache.find(key);
-        if (it != cache.end()) {
-            return it->second;
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (auto cached = touch_cached_torchaudio_sinc_hann_resample_kernel(cache, key)) {
+            ++cache.hits;
+            return cached;
         }
+        ++cache.misses;
     }
 
     const int64_t rate_gcd = std::gcd(source_sample_rate_hz, target_sample_rate_hz);
@@ -279,13 +331,88 @@ const TorchaudioSincHannResampleKernel & get_cached_torchaudio_sinc_hann_resampl
         }
     }
 
-    std::lock_guard<std::mutex> lock(mutex);
-    const auto [it, inserted] = cache.emplace(key, std::move(kernel));
-    (void) inserted;
-    return it->second;
+    auto built = std::make_shared<const TorchaudioSincHannResampleKernel>(std::move(kernel));
+    const size_t bytes = built->values.size() * sizeof(double);
+    // Allocate the list node up front so a throwing index insert leaves the cache untouched.
+    std::list<TorchaudioSincHannCachedKernel> staged;
+    staged.push_back({key, built, bytes});
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (auto cached = touch_cached_torchaudio_sinc_hann_resample_kernel(cache, key)) {
+        return cached;
+    }
+    if (bytes > cache.budget_bytes) {
+        return built;
+    }
+    cache.index.emplace(key, staged.begin());
+    evict_torchaudio_sinc_hann_resample_kernels(cache, bytes);
+    cache.entries.splice(cache.entries.begin(), staged);
+    cache.bytes += bytes;
+    return built;
 }
 
 }  // namespace
+
+class StreamingSoxrResampler::Impl {
+public:
+    using Create = void * (*)(double, double, unsigned, const char **, const SoxrIoSpec *, const SoxrQualitySpec *, const SoxrRuntimeSpec *);
+    using Process = const char * (*)(void *, const void *, size_t, size_t *, void *, size_t, size_t *);
+    using Delete = void (*)(void *);
+    Impl(int source, int target) : passthrough(source == target) {
+        if (source <= 0 || target <= 0) throw std::runtime_error("streaming resampling requires positive sample rates");
+        if (passthrough) return;
+        const auto & api = get_soxr_api();
+        if (!api.available() || !api.supports_profile(SoxrResampleProfile::ExplicitFloat32Runtime))
+            throw std::runtime_error("streaming resampling requires libsoxr");
+        const auto create = api.load_symbol<Create>("soxr_create");
+        process = api.load_symbol<Process>("soxr_process");
+        destroy = api.load_symbol<Delete>("soxr_delete");
+        if (!create || !process || !destroy) throw std::runtime_error("libsoxr is missing streaming entry points");
+        const auto io = api.io_spec()(kSoxrFloat32Interleaved, kSoxrFloat32Interleaved);
+        const auto quality = api.quality_spec()(4, 0);
+        const auto runtime = api.runtime_spec()(1);
+        const char * error = nullptr;
+        handle = create(source, target, 1, &error, &io, &quality, &runtime);
+        if (error || !handle) {
+            if (handle) destroy(handle);
+            throw std::runtime_error(std::string("soxr_create: ") + (error ? error : "no resampler"));
+        }
+    }
+    ~Impl() { if (handle) destroy(handle); }
+    void * handle = nullptr;
+    Process process = nullptr;
+    Delete destroy = nullptr;
+    bool passthrough, finished = false;
+};
+
+StreamingSoxrResampler::StreamingSoxrResampler(int source, int target) : impl_(std::make_unique<Impl>(source, target)) {}
+StreamingSoxrResampler::~StreamingSoxrResampler() = default;
+std::vector<float> StreamingSoxrResampler::process(const std::vector<float> & samples, bool final) {
+    if (impl_->finished) throw std::runtime_error("streaming resampler is already finalized");
+    if (impl_->passthrough) { impl_->finished = final; return samples; }
+    std::vector<float> output;
+    std::array<float, 4096> block;
+    size_t offset = 0;
+    while (offset < samples.size()) {
+        size_t used = 0, made = 0;
+        const auto error = impl_->process(impl_->handle, samples.data() + offset, samples.size() - offset,
+            &used, block.data(), block.size(), &made);
+        if (error) throw std::runtime_error(std::string("soxr_process: ") + error);
+        if (!used && !made) throw std::runtime_error("soxr_process made no progress");
+        offset += used;
+        output.insert(output.end(), block.begin(), block.begin() + made);
+    }
+    if (final) {
+        size_t made;
+        do {
+            made = 0;
+            const auto error = impl_->process(impl_->handle, nullptr, 0, nullptr, block.data(), block.size(), &made);
+            if (error) throw std::runtime_error(std::string("soxr flush: ") + error);
+            output.insert(output.end(), block.begin(), block.begin() + made);
+        } while (made);
+        impl_->finished = true;
+    }
+    return output;
+}
 
 std::optional<std::vector<float>> try_resample_mono_soxr(
     const std::vector<float> & mono_samples,
@@ -423,10 +550,11 @@ std::vector<float> resample_mono_torchaudio_sinc_hann(
         return mono_samples;
     }
 
-    const auto & kernel = get_cached_torchaudio_sinc_hann_resample_kernel(
+    const auto kernel_ref = get_cached_torchaudio_sinc_hann_resample_kernel(
         source_sample_rate_hz,
         target_sample_rate_hz,
         options);
+    const auto & kernel = *kernel_ref;
     const int64_t input_length = static_cast<int64_t>(mono_samples.size());
     const int64_t target_length = static_cast<int64_t>(
         std::ceil(static_cast<double>(kernel.new_freq * input_length) /
@@ -506,6 +634,19 @@ std::vector<float> resample_mono_torchaudio_sinc_hann(
         }
     }
     return out;
+}
+
+void set_resample_kernel_cache_budget_bytes(size_t bytes) {
+    auto & cache = torchaudio_sinc_hann_resample_kernel_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.budget_bytes = bytes;
+    evict_torchaudio_sinc_hann_resample_kernels(cache, 0);
+}
+
+ResampleKernelCacheStats resample_kernel_cache_stats() {
+    auto & cache = torchaudio_sinc_hann_resample_kernel_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    return {cache.entries.size(), cache.bytes, cache.hits, cache.misses};
 }
 
 }  // namespace engine::audio

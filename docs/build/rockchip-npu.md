@@ -58,13 +58,32 @@ cmake --build build --parallel --target audiocpp_cli
 ```
 
 `ENGINE_ENABLE_RKNN` is `OFF` by default and nothing in the default build links `librknnrt`. With
-the flag off, passing `qwen3_tts.rknn_decoder` fails with
+the flag off, selecting RKNN in `qwen3_tts.exec_plan` fails with
 `Qwen3 speech decoder RKNN: built without ENGINE_ENABLE_RKNN` rather than falling back silently.
+
+The same build ships as a Docker image: `.devops/rockchip.Dockerfile` (arm64-only; the
+`librknnrt.so` + headers are fetched at build time from the pinned SDK tag), and the container
+reaches the NPU through the driver's own device nodes — see `docs/docker.md`.
 
 ## Model preparation
 
-The `.rknn` is not downloadable and nothing in the runtime produces it. Build it on the host from
-the `Qwen/Qwen3-TTS-12Hz-0.6B-Base` checkpoint (the `speech_tokenizer` subdirectory, the same
+Prebuilt engines for RK3588 ship as `rknn` packages in the model specs, for the three families
+whose engines are validated on that board — install them like any other package and name the
+files by bare file name in the plan:
+
+```bash
+python3 tools/model_manager_v2.py install piper_lessac_medium_decoder_rk3588
+python3 tools/model_manager_v2.py install kokoro_82m_generator_rk3588
+python3 tools/model_manager_v2.py install qwen3_tts_0_6b_base_speech_decoder_rk3588
+```
+
+Each installs into the family's GGUF weight directory, so an `exec_plan` artifact can name it by
+file alone. The engines are compiled per SoC: these are RK3588 images, and the converter runs
+below are the path for any other target (and for rebuilding from the source checkpoints).
+
+Outside those packages, a `.rknn` is not downloadable and nothing in the runtime produces it.
+Build it on the host from the `Qwen/Qwen3-TTS-12Hz-0.6B-Base` checkpoint (the `speech_tokenizer`
+subdirectory, the same
 weights the GGUF package was converted from):
 
 ```bash
@@ -169,6 +188,84 @@ board — `Resize` does not lower to a target the board runtime accepts, so the 
 `ConvTranspose1d` of all ones (exact nearest, and the same operator the decoder already runs on the
 NPU).
 
+### Piper duration encoder
+
+The same script with `--encoder` compiles the other half — the text encoder plus the duration
+discriminator — for a fixed phoneme-token width: it slices at `enc_p.proj` (the 2x inter_channels
+prior stats) and `dp.proj` (the flow conditioning), the two arrays the runtime's flow graphs and
+length regulator consume, right-pads tokens to `--frames` and compiles one engine per width. The
+slice is deterministic (all three piper `scales` scalars feed sampling, the duration ceiling and
+the discriminator's flow noise, strictly downstream of the seam), and piper's exported masks are
+pad-safe: a padded run reproduces the exact-length run on the real frames at 117-130 dB fp32,
+checked by the self-check on the graph the engine is compiled from. `scales` is not an input.
+
+```bash
+<rknn-venv>/bin/python tools/rknn/prepare_piper_tts_rknn_vocoder.py \
+  --voice-onnx en_US-lessac-medium.onnx --encoder --frames 128
+```
+
+With the frame axis pinned the graph constant-folds (992 to 463 nodes at the BASIC level), and
+what remains in every attention layer is a relative-shift chain: `Pad + Reshape + Slice` shifting
+the [N, 2N-1] relative-position slabs by one step per query row, unrolled N times. The RKNN
+kernels compute exactly those chains as garbage on the board — probes show the flatten-Pad tails
+filled with uninitialized memory (NaN, ±65504), one attention layer alone drags the engine to
+0.4 dB end to end, and a chain probe segfaults the runtime — while the PC simulator computes the
+same graph at 56 dB. The simulator is therefore not a gate for this export; a board probe is. The
+converter rewrites the chains into exact constant-index gathers (rel-logit bias via
+`GatherElements`, rel-value sum via `Gather + Mul + ReduceSum`, verified 121-131 dB fp32 against
+the raw slice), the engine computes 40-48 dB on the NPU, and the fold self-checks run on the
+rewritten graph.
+
+The gathers cost O(N^3) weight bytes: the index initializers are constants, so the toolkit folds
+them into per-row Toeplitz expansions — 137 MB at 128 tokens, 402 MB at 192, 2.9 GB at 384, and
+512 exhausts 31 GB of converter RAM. Compile narrow bins only. The sidecar walks the sorted ladder
+to the smallest engine that fits the token count and falls back to the ggml encoder above the
+widest: the wide widths are where the fp16 duration drift hurts most (see the measurements
+below), so the fallback is a quality gate, not a convenience.
+
+### Inflect v2 (Micro/Nano) decoder
+
+`tools/rknn/prepare_inflect_v2_rknn_decoder.py` slices the official `decode.onnx` at the same kind
+of seam — the inverse-flow input `z [1,192,N]` and its frame mask `y_mask [1,1,N]`, the pre-flow
+latent the runtime's decoder graph (`reverse_flow(latent)` into `dec`) already has on hand — checks
+the fixed-window decode against a full-length one, and compiles the slice:
+
+```bash
+<export-venv>/bin/python tools/rknn/prepare_inflect_v2_rknn_decoder.py \
+  --decode-onnx decode.onnx --duration-onnx duration.onnx --skip-rknn --output decoder_z.onnx
+<converter-venv>/bin/python tools/rknn/prepare_inflect_v2_rknn_decoder.py \
+  --onnx decoder_z.onnx --decode-onnx decode.onnx --duration-onnx duration.onnx --target rk3588
+```
+
+The head of `decode.onnx` (`z = m_p + exp(logs) * zp_noise * noise_scale`) stays outside the slice,
+so the engine has no noise input and no `noise_scale`: the runtime draws the noise with its own
+`variation` knob and hands the engine the finished latent. Because the slice is pinned to the
+compiled window, the self-check needs `decode.onnx` itself for a full-length reference decode;
+without it the check degrades to one window-length latent decoded against itself.
+
+The slice is folded before it is compiled (`onnxslim`, with the input shapes pinned to the window):
+the export sizes its spline-flow tensors from the latent length through `Shape` →
+`ConstantOfShape` → `Slice`, and handing that to `rknn.build` aborts the build inside
+`fold_constant` with a core dump and no traceback — the same failure the qwen3 export stage warns
+about, arriving here from the vendor graph rather than from a too-new `torch`. Folding first takes
+979 nodes with 24 `Shape` and 24 `ConstantOfShape` down to 409 plain conv nodes, and the build
+finishes (23.9 MB engine, 14.9 MB of it weights).
+
+The window is 256 latent slices: 192 emitted per step, 32 slices of real context on each side, a
+short window zero-padded and mask-zeroed at the end that has no data, and the window that reaches
+the end of the latent extends its left context to fill the window. The 32 is measured on the model's
+own prior samples at 480 slices against a full-length decode: 5.1 dB with no context, 40.0 dB at
+20, 82.1 dB at 24, 128.8 dB at 32.
+
+Unlike VITS's `dec`, this decoder half is masked in the flow and unmasked in the decoder, so the
+slice carries the decoder-half muls by default (`mask_decoder_graph`, the same construction as
+piper's opt-in `--dec-mask`): without them a latent whose decode is dominated by the window that
+reaches the end of the latent scores 7.5-17.9 dB against a full-length decode (30, 47, 91 and 210
+slices), with them 94.9-120.2 dB, and the interior windows are unchanged (they run with mask 1
+everywhere, where every injected `Mul` is an exact fp32 identity). A 480-slice latent is unaffected
+either way, because its tail window is long enough that the implicit-zero end is buried.
+`--no-dec-mask` drops the muls.
+
 ### Kokoro (iSTFTNet) generator
 
 `tools/rknn/prepare_kokoro_tts_rknn_generator.py` re-traces the generator the GGUF weights describe
@@ -199,6 +296,11 @@ logs none. What kills the engine is the magnitude — `value: 0x7800` is 30720, 
 field, repeated ~800k times. `tools/rknn/rknn_build_log.py` is the gate that separates the two regimes:
 it captures fds 1/2 around `rknn.build`, because those lines come from the C++ compiler and not from
 Python logging, and aborts past 100 000 lines.
+
+The call sequence that gate has to wrap — `config`, `load_onnx`, `build`, `export_rknn`, `release` —
+is the same in all five converters and lives in `tools/rknn/rknn_build.py` (`build_engine`). What
+stays per converter is the ONNX surgery, the input names and shapes it declares, and the
+simulator-side verification.
 
 The field is per axis and per op, and the ceiling is escapable: slicing the fine-rate axis inside
 the graph takes W=256 from 403 587 REGTASK lines to 0, and the re-traced module keeps every gate —
@@ -310,6 +412,63 @@ gate measures the export and not the approximation.
   from at 124.6 dB.
 
 
+## Component execution plans
+
+Each participating model exposes one JSON-valued session option. Its keys name
+the configurable components:
+
+| Component | Option | Implementations | Artifact roles |
+|---|---|---|---|
+| Piper `decoder` | `piper_tts.exec_plan` | `ggml`, `rknn` | RKNN: required `main` |
+| Piper `duration_encoder` | `piper_tts.exec_plan` | `ggml`, `rknn` | RKNN: required `main` (comma-separated ladder of per-width engines) |
+| Piper `duration_flows` | `piper_tts.exec_plan` | `ggml` | None (`backend` may name `cpu`) |
+| Kokoro `generator` | `kokoro_tts.exec_plan` | `ggml`, `rknn` | RKNN: required `main` |
+| Qwen3 `speech_decoder` | `qwen3_tts.exec_plan` | `ggml`, `rknn` | RKNN: required `main`, optional `first`, `window` |
+| sanoTTS `decoder` | `sanotts.exec_plan` | `default`, `ggml`, `neon` | None |
+| Inflect v2 `decoder` | `inflect_v2.exec_plan` | `ggml`, `rknn` | RKNN: required `main` |
+| CosyVoice3 `flow` | `cosyvoice3.exec_plan` | `ggml`, `rknn` | RKNN: required `main` (comma-separated ladder of per-length engines) |
+
+These options also work with older GGUFs whose embedded specs do not declare
+`exec_plan`; the model validates the plan without requiring a spec override.
+The replaced RKNN/NEON option names are not retained as aliases.
+
+Each component uses the same optional fields: `impl`, `backend`, `artifacts`
+(an object of named file paths), and `params` (an object of implementation-specific
+settings). Omit the option, use `{}`, omit a component, or give it an empty object
+or `impl=default` to retain that component's existing selection. Explicit RKNN
+selection requires its compiled files and an RKNN-enabled build; files alone
+do not select RKNN. Unknown fields, unsupported implementations/backends, missing
+required artifacts, unknown components/artifact roles, and unsupported params are errors.
+An artifact path is used as given, except that a name that exists under the model's own
+directory — the directory `--model` names, the same root a GGUF sidecar is found under —
+resolves to it. So an engine installed with the weights is nameable by file
+(`"main":"vocoder_stateful_64b_fp16.rknn"`), while a board path, or a path relative to the
+process working directory, keeps working as before.
+Kokoro's RKNN generator accepts `params.overlap` (nonnegative integer, default 0)
+and `params.gain` (boolean, default false). The other implementations currently
+accept no params. Parameter types and bounds are checked by the model, including
+the engine-dependent emitted-window limit for overlap.
+
+The current GGML components retain their session placement: an explicit `backend`
+must match the session's backend selection. The Piper duration stages are the
+exception: they accept the session backend or `cpu`, which is how a device session
+runs the small duration path on the host. NEON requires an AArch64 CPU session.
+RKNN selects the NPU through its implementation; omit `backend` rather than naming
+a ggml backend. This is not a global backend switch or a generic pipeline system.
+
+CLI session options carry JSON text. Server configs also accept a JSON object:
+
+```json
+"session_options": {
+  "piper_tts.exec_plan": {
+    "decoder": {
+      "impl": "rknn",
+      "artifacts": {"main": "/models/decoder.rknn"}
+    }
+  }
+}
+```
+
 ## Run
 
 ```bash
@@ -317,13 +476,22 @@ gate measures the export and not the approximation.
   --model models/Qwen3-TTS-12Hz-0.6B-Base-GGUF --text "..." --voice-ref ref.wav \
   --out out.wav \
   --session-option qwen3_tts.conv_weight_type=f16 \
-  --session-option qwen3_tts.rknn_decoder=/root/tts-rknn/vocoder/vocoder_stateful_64b_fp16.rknn \
-  --session-option qwen3_tts.rknn_decoder_first=/root/tts-rknn/vocoder/vocoder_stateful_16_fp16.rknn
+  --session-option 'qwen3_tts.exec_plan={"speech_decoder":{"impl":"rknn","artifacts":{"main":"/root/tts-rknn/vocoder/vocoder_stateful_64b_fp16.rknn","first":"/root/tts-rknn/vocoder/vocoder_stateful_16_fp16.rknn"}}}'
 ```
 
-`rknn_decoder_first` is optional and only affects streaming: the first token group runs on the
+`artifacts.first` is optional and only affects streaming: the first token group runs on the
 small-batch model, which is what cuts time-to-first-audio. When the RKNN decoder is active the
 ggml decoder weights are not loaded at all, which is where most of the memory saving comes from.
+
+`artifacts.window` switches streaming to the ggml path's window semantics: every event runs a
+full decode of its whole `[left context + new]` window from a zeroed cache (the stateful graph
+again, so `cache_out` is ignored) and the left context's audio is dropped. The stateful default
+voices each token once, which is why it beats the CPU streaming decoder on speed and misses it on
+waveform; the window role re-voices the context and reproduces the CPU streaming function
+per chunk. It costs one engine step of `25 + frames_per_event` tokens per event. Naming the main
+engine (`"window":"vocoder_stateful_64b_fp16.rknn"`) aliases it — the resident B=64 step covers
+the default 25 + 12 window at one resident context; a dedicated smaller export compiled with
+`--codes-length 25+stream_frames_per_event` is cheaper per event. Offline decoding is unaffected.
 
 Piper takes one option and is offline only:
 
@@ -331,20 +499,34 @@ Piper takes one option and is offline only:
 ./build/bin/audiocpp_cli --task tts --family piper_tts \
   --model models/Piper-TTS-GGUF/piper-en-us-lessac-medium-orig.gguf \
   --text "..." --text-chunk-size 60 --out out.wav \
-  --session-option piper_tts.rknn_decoder=/root/tts-rknn/piper-lessac-w93.rknn
+  --session-option 'piper_tts.exec_plan={"decoder":{"impl":"rknn","artifacts":{"main":"/root/tts-rknn/piper-lessac-w93.rknn"}}}'
+```
+
+The same option pins the duration stages to the host, with the decoder untouched:
+
+```bash
+  --session-option 'piper_tts.exec_plan={"duration_encoder":{"backend":"cpu"},"duration_flows":{"backend":"cpu"}}'
+```
+
+and it moves the duration encoder to the NPU, over a comma-separated ladder of per-width engines
+(the same producer as the decoder, `--encoder`; short chunks pick the narrow engine, chunks wider
+than the ladder stay on the ggml encoder):
+
+```bash
+  --session-option 'piper_tts.exec_plan={"decoder":{"impl":"rknn","artifacts":{"main":"/root/tts-rknn/piper-lessac-w93.rknn"}},"duration_encoder":{"impl":"rknn","artifacts":{"main":"/root/tts-rknn/enc/encoder_n128.rknn,/root/tts-rknn/enc/encoder_n192.rknn"}}}'
 ```
 
 The engine is per voice: a `.rknn` compiled from lessac's latent is validated against the loaded
 voice's channel count at init and fails with a message naming the producer if it does not match.
 
-Kokoro takes the engine plus two measured knobs on its window walk and is offline only
-(`kokoro_tts.rknn_generator_overlap`, `kokoro_tts.rknn_generator_gain`):
+Kokoro takes the engine plus two measured parameters on its window walk and is offline only
+(`generator.params.overlap`, `generator.params.gain` inside the execution plan):
 
 ```bash
 ./build/bin/audiocpp_cli --task tts --family kokoro_tts \
   --model models/Kokoro-82M-GGUF/kokoro-82m-q8_0.gguf \
   --text "..." --seed 1234 --out out.wav \
-  --session-option kokoro_tts.rknn_generator=/root/tts-rknn/gen_w128.rknn
+  --session-option 'kokoro_tts.exec_plan={"generator":{"impl":"rknn","artifacts":{"main":"/root/tts-rknn/gen_w128.rknn"},"params":{"overlap":0,"gain":false}}}'
 ```
 
 The engine is per model, not per voice: the generator weights are in the GGUF, and the engine is
@@ -358,6 +540,18 @@ latent and is also what enables the near-Nyquist cap in the Kokoro measurements 
 +601 MB RSS, because the ggml generator graph stays loaded and runs once per utterance). Both default
 to the shipping walk.
 
+Inflect v2 takes one option and is offline only:
+
+```bash
+./build/bin/audiocpp_cli --task tts --family inflect_v2 \
+  --model models/Inflect-Micro-v2-GGUF/inflect-micro-v2-q8_0.gguf \
+  --text "..." --seed 1234 --out out.wav \
+  --session-option 'inflect_v2.exec_plan={"decoder":{"impl":"rknn","artifacts":{"main":"/root/tts-rknn/inflect-v2-micro-decoder-rk3588.rknn"}}}'
+```
+
+The engine is per model (Micro and Nano differ in latent width), validated against the loaded
+model's latent channel count and its samples-per-frame hop at init.
+
 ## Measured on RK3588
 
 300 Russian characters, greedy decoding, `conv_weight_type=f16`, all other stages on CPU:
@@ -368,13 +562,34 @@ to the shipping walk.
 | offline, RKNN B=64 | 2.17 | 2560 MB | 64.1 |
 | streaming, ggml decoder | 151.2 s | - | 365 |
 | streaming, RKNN 16+64 | 57.7 s, first audio 0.88 s | - | 62.4 |
+| streaming, RKNN 16+64 window (main aliased) | 93.2 s, first chunk 3.07 s | - | 47.9 |
 
 Streaming gains more than offline because the ggml streaming decoder re-voices the left-context
-tokens in every window, while the stateful model voices each token once.
+tokens in every window, while the stateful model voices each token once. The window role buys the
+quality back at that same price: the same run re-voicing every window costs the extra 48 s of
+decoder and lands at 47.4 dB against the ggml streaming render instead of 16.4 dB.
 
-Quality: offline ggml-vs-RKNN output SNR 27 dB, with the per-second dips confined to
-near-silence (the fp16 noise floor), and no discontinuity at the group boundaries. The two
-batch sizes agree to 57 dB.
+Quality, split by what varies, because the numbers below are not comparable to each other and one
+of the rows is not about the NPU at all:
+
+| pair | SNR | envelope corr |
+|---|---|---|
+| backend, offline, 185 chars | 27 dB | - |
+| backend, offline, 307 chars | 25.1 dB | 0.9999 |
+| backend, streaming, 307 chars | 16.4 dB | 0.9988 |
+| backend, streaming window, 307 chars | 47.4 dB | - |
+| backend, RKNN B=16 vs B=64 | 57 dB | - |
+| mode, same backend (streaming vs offline), 307 chars | -2.2 dB | 0.187 |
+
+The last row is not a sidecar cost. It measures the same on the CPU graph path (-2.24 dB on CPU
+against -2.23 dB on RKNN, one binary, one voice reference, `seed=42`, `conv_weight_type=f16`, 307
+Russian characters), so it is the streaming mode, not the NPU. Cross-correlation alignment moves it
+by 0.1 dB at a -120 ms lag, so it is not a time shift either: the 20 ms RMS envelope correlation of
+0.187 says the prosody and timing diverge across the whole phrase, which is what two valid
+syntheses of one text look like. GigaAM v3 CTC (16 kHz) transcribes all five renders of that matrix
+to the input text exactly (CER 0.00%). The backend rows are the same signal: in the offline row the
+per-second dips are confined to near-silence (the fp16 noise floor) and there is no discontinuity
+at the group boundaries.
 
 ### Piper, measured on the same board
 
@@ -395,6 +610,19 @@ Quality: ggml-vs-RKNN output SNR 24.1 dB global, 40 dB median per 256-sample sli
 drift (best lag 0 samples in every window), and the max sample-to-sample step is unchanged
 (13384 vs 13412), so no seam clicks. The dips are near-silence (LSB noise) and one loud plosive
 onset, i.e. the fp16 noise floor, not the stitching.
+
+The duration encoder ladder is a small, width-limited win, and the width limit is the quality
+story. On a 557-character mixed RU/EN text (8 chunks, 109-459 tokens each), the narrow bins are
+faster than the ggml encoder (63-71 ms vs 84-89 ms at 109-115 tokens, 1.25-1.35x) and the wide
+bin is slower (688-773 ms vs 440-758 ms at 285-373 tokens: 2.9 GB of Toeplitz weights saturate
+DRAM bandwidth), so a `{128,192}` ladder with a ggml fallback above 192 is the shape worth
+shipping: it moves 3 of the 8 chunks and costs nothing on the rest. Per-bin engines score 40-48 dB
+against fp32 on the board (stats and conditioning, n in {17, N-1, N}). Quality: the fp16 engine
+shifts each chunk's duration sum by the sum of its per-token sampling errors, so the drift grows
+with width — ±7% latent frames on the 128-bin chunks (the scale of the flow's own seeded sampling
+noise) against a one-sided −21…−23% on the 384-bin chunks, a 25% tempo shift, audible. GigaAM/
+Whisper transcribe the narrow-bin render and the ggml render to the same text. The wide bins are
+fp16-exact per frame and systematically bad per utterance: keep the ladder narrow.
 
 ### Kokoro, measured on the same board
 
@@ -437,7 +665,7 @@ where the graph's activations peak, the top iSTFT bins run 10-24x the CPU render
 there. They are fp16 rounding in the convolutional accumulation, not the sine and not the seams -
 the clip sine, the range-reduced sine, the exact `Sin` node, the unfolded Snake (`--no-snake-fold`,
 which bounds the convolution input) and the w128/w136 grids all leave the same columns at the same
-magnitude - and RKNN 2.3.2 has no per-layer dtype knob. `kokoro_tts.rknn_generator_gain=1` caps the
+magnitude - and RKNN 2.3.2 has no per-layer dtype knob. `params.gain=true` in the generator plan caps the
 top five log-magnitude rows at the full-length CPU decode's level at every column: on a 25.9 s
 render the worst of the top eight columns goes 14.7x -> 2.8x (shipping, no gain: 23.3x), for 1.9x
 wall and +601 MB RSS, because the ggml generator graph stays loaded and runs once per utterance. The
@@ -506,6 +734,73 @@ max|d| against the CPU render, and the observed NPU-to-NPU spread is of the same
 NPU-to-CPU one (the two Kokoro sine engines differ by 28.2 dB from each other). Not characterized
 here: the per-core fp16 difference itself, which would need the same engine run with a
 single-core mask and the outputs compared.
+
+## The IOVA ceiling, i.e. how big an engine can be
+
+An engine is mapped into the NPU's I/O address space, and on RK3588 that space is a 32-bit arena. A
+single mapping above ~4 GB is refused at `rknn_init`, before the first step, and the driver says so
+in dmesg:
+
+```
+rknn_init failed with code -4
+RKNPU: failed to allocate IOVA: -12
+rknpu_gem_get_pages: dma map 4710850560 fail
+failed to malloc npu memory, size: 6189218496, flags: 0x2
+```
+
+Measured on this board (31 GiB RAM, `6.1.115-vendor-rk35xx`) with a flow-matching DiT estimator
+compiled at fixed `S=900`, `S=1100` and `S=2000`, fp16, `optimization_level=3`: the requests are
+4.71 GB, 4.66 GB and 5.77 GB, and all three fail. It is not host memory (`MemTotal 32 GiB`;
+`CmaTotal 256 MiB` is not the pool the driver runs out of), and it is not the multicore workspace -
+`AUDIOCPP_RKNN_CORE_MASK=1` and `=7` fail identically, so the request is the engine's own mapping.
+The request grows with `S`, so the ceiling is a length ceiling for this shape: the same estimator
+loads and runs at `S<=500`, and above the ceiling the only path is the CPU graph, which costs the
+same `S^2` it always did (1378 frames: 186.7 s of estimator for 26.9 s of audio).
+
+Three consequences for anyone extending this path:
+
+- Engine size is a design constraint, not a download-size constraint. The three shipped sidecars sit
+  at 20-260 MB per engine and never approach the ceiling. A graph whose intermediates grow with the
+  sequence length - attention at fixed `S`, so S^2 - reaches it in the low hundreds of frames, long
+  before the weight set does.
+- A ladder of engines has to be lazy. Four engines that each load on their own fail at `rknn_init`
+  when all four are resident at once, so the ladder loads on demand and evicts. How many rungs share
+  the aperture is a measurement, not a rule: the driver reports what a context will occupy (`rknn::
+  engine_memory_mib`: a `RKNN_FLAG_COLLECT_MODEL_INFO_ONLY` init plus `RKNN_QUERY_MEM_SIZE`, ~0.5 s
+  per engine, no network built), and for this estimator that is 786 MiB at S=110, 1129 at 200, 1426
+  at 250, 2615 at 400, 3752 at 500 and 1039 at 900 -- all of them 661-714 MB images, so a context
+  costs its graph and not its image, and the cost is not a function of the compiled length (S=900
+  costs less than S=500). Against a 3900 MiB per-process ceiling, measured by initializing the sets
+  in one process, the sets that admit are 110+200+250 (3341), 110 x4 (3144), 200 x3 (3387),
+  250+250+110 (3638), 110+400 (3401) and 200+400 (3744), while 250+400 (4041), 110+500 (4538) and
+  every set holding an S>=900 engine return -4. The accounting for that is shared
+  (`rknn::ApertureBudget`, `include/engine/framework/rknn/engine.h`) and the numbers are not: the
+  per-engine cost and the budget are measurements of one engine on one board, and they live with the
+  sidecar that measured them.
+- The failure is at init, so it is cheap to detect and cannot corrupt output: `rknn_init` returns -4
+  and dmesg names the byte count.
+
+## Who refused: the versions a failure names
+
+Every `RKNN_*` failure a sidecar reports goes through one formatter, and once any context in the
+process has initialized, the message carries the versions the driver gave it. Measured on this board,
+with the aperture accounting switched off so the ladder pins every rung it declares:
+
+```
+CosyVoice3 flow estimator RKNN: rknn_init failed with code -6 (driver 0.9.8, api 2.3.2 (429f97ae6b@2025-04-09T09:09:27))
+```
+
+The code names what was refused and nobody: `-13` is a target-platform mismatch, `-4` and `-6` are
+the driver refusing an init (the IOVA ceiling above, an aperture overrun here). `api` is the runtime
+library the sidecar links (`librknnrt`), `driver` is the kernel NPU driver, and Rockchip versions
+them apart -- the pair above is a working RK3588 on SDK 2.3.2, not a skew. The third version an
+operator has to line up, the `rknn-toolkit2` that compiled the `.rknn`, is not queryable from the
+board, so this line is the half of the comparison the board can state; the other half is what the
+converter reported when it built the image.
+
+The report is taken from the first context the driver builds (`RKNN_QUERY_SDK_VERSION` is
+per-context) and cached for the ones that fail to build, so the first engine of a process fails
+without it and every failure after it carries it.
 
 ## What this path is not for
 

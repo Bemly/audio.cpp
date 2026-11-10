@@ -12,6 +12,7 @@
 
 #include "../cli/request.h"
 #include "../common/base64.h"
+#include "../common/build_info.h"
 #include "../streaming/pcm_source.h"
 #include "../streaming/streaming.h"
 
@@ -54,7 +55,35 @@ using minitts::app::base64_encode;
 
 using Clock = std::chrono::steady_clock;
 
-#if defined(AUDIOCPP_HAS_NATIVE_MODEL_MANAGER)
+class CallbackRecipeModelExecutor final : public minitts::app::IRecipeModelExecutor {
+public:
+    using Run = std::function<engine::runtime::TaskResult(
+        std::string_view,
+        const engine::runtime::TaskSpec &,
+        const engine::runtime::TaskRequest &)>;
+
+    using Stream = std::function<engine::runtime::TaskResult(std::string_view,
+        const engine::runtime::TaskSpec &, const engine::runtime::TaskRequest &,
+        const minitts::app::RecipeEventSink &, const minitts::app::AudioChunkStream *)>;
+    CallbackRecipeModelExecutor(Run run, Stream stream) : run_(std::move(run)), stream_(std::move(stream)) {}
+
+    engine::runtime::TaskResult run(
+        std::string_view role,
+        const engine::runtime::TaskSpec & task,
+        const engine::runtime::TaskRequest & request) override {
+        return run_(role, task, request);
+    }
+
+    engine::runtime::TaskResult stream(std::string_view role, const engine::runtime::TaskSpec & task,
+        const engine::runtime::TaskRequest & request, const minitts::app::RecipeEventSink & sink,
+        const minitts::app::AudioChunkStream * source) override {
+        return stream_(role, task, request, sink, source);
+    }
+private:
+    Run run_;
+    Stream stream_;
+};
+
 void materialize_embedded_demo_voices(const std::filesystem::path & voice_dir) {
     std::filesystem::create_directories(voice_dir);
     for (const auto & voice : embedded_demo_voices()) {
@@ -79,7 +108,6 @@ void materialize_embedded_demo_voices(const std::filesystem::path & voice_dir) {
         throw std::runtime_error("failed to write embedded demo voice prompt_text");
     }
 }
-#endif
 }  // namespace
 
 ServerState::ServerState(
@@ -87,7 +115,8 @@ ServerState::ServerState(
     std::filesystem::path request_base,
     std::filesystem::path ui_resource_anchor)
     : config_(std::move(config)),
-      request_base_(std::filesystem::absolute(std::move(request_base)).lexically_normal()) {
+      request_base_(std::filesystem::absolute(std::move(request_base)).lexically_normal()),
+      recipes_(minitts::app::make_recipe_registry()) {
 #if !defined(AUDIOCPP_HAS_NATIVE_MODEL_MANAGER)
     (void) ui_resource_anchor;
 #endif
@@ -110,23 +139,28 @@ ServerState::ServerState(
         const auto binary_directory = ui_resource_anchor.empty()
             ? request_base_
             : std::filesystem::absolute(ui_resource_anchor).lexically_normal();
-        default_models_root_ = (binary_directory / "models").lexically_normal();
+        default_models_root_ = std::filesystem::absolute(
+            config_.models_root.value_or(binary_directory / "models")).lexically_normal();
         models_root_ = default_models_root_;
         request_base_ = binary_directory;
         std::filesystem::create_directories(models_root_);
         std::cerr
             << "native WebUI model root: " << models_root_ << "\n"
             << "native WebUI package resources: " << repository_root_ << "\n";
-        if (!config_.voice_dir.has_value()) {
-            const auto embedded_voices = upload_root_ / "demo_voices";
-            materialize_embedded_demo_voices(embedded_voices);
-            config_.voice_dir = embedded_voices;
-        }
         model_installer_ = std::make_unique<ModelInstaller>(
             repository_root_,
             models_root_);
     }
 #endif
+    // Demo voices start the WebUI's voice list when the server has no voice
+    // library. Without UI management they are added only when the UI was asked
+    // for, so a server that has the UI on by default does not gain voices.
+    if ((config_.ui_management || (config_.ui_enabled && config_.ui_requested)) &&
+        !config_.voice_dir.has_value()) {
+        const auto embedded_voices = upload_root_ / "demo_voices";
+        materialize_embedded_demo_voices(embedded_voices);
+        config_.voice_dir = embedded_voices;
+    }
     register_static_server_frontends(frontends_);
     load_models();
     if (config_.idle_unload_ms > 0) {
@@ -175,7 +209,16 @@ std::unique_ptr<ServerFrontendListener> ServerState::make_frontend_listener(std:
 }
 
 HttpResponse ServerState::handle_request(const HttpRequest & request, bool use_frontends) {
-    return RequestDispatcher::handle(*this, request, use_frontends);
+    return RequestDispatcher::handle(*this, request, use_frontends,
+        [this](const HttpRequest & extra) -> std::optional<HttpResponse> {
+            if (extra.method == "GET" && extra.path == "/v1/recipes") {
+                return json_response(recipes_json());
+            }
+            if (extra.method == "POST" && extra.path == "/v1/recipes/run") {
+                return handle_recipe_run(extra.body);
+            }
+            return std::nullopt;
+        });
 }
 
 HttpResponse ServerState::handle_health() const {
@@ -188,12 +231,16 @@ HttpResponse ServerState::handle_health() const {
         "{\"status\":\"ok\",\"backend\":\"" + std::string(backend_name(config_.backend)) +
         "\",\"models\":" + std::to_string(model_count) +
         ",\"ui\":" + (config_.ui_enabled ? "true" : "false") +
-        ",\"ui_management\":" + (config_.ui_management ? "true" : "false") + "}");
+        ",\"ui_management\":" + (config_.ui_management ? "true" : "false") +
+        ",\"version\":" + json_quote(minitts::app::build_version()) +
+        ",\"git\":" + json_quote(minitts::app::build_git_sha()) +
+        ",\"git_date\":" + json_quote(minitts::app::build_git_date()) + "}");
 }
 
 void ServerState::load_models() {
     int eager_loaded = 0;
     for (auto & config : config_.models) {
+        configured_models_.emplace(config.id, config);
         auto loaded = make_model(std::move(config));
         if (!model_index_.emplace(loaded->config.id, models_.size()).second) {
             throw std::runtime_error("duplicate server model id: " + loaded->config.id);
@@ -285,6 +332,10 @@ HttpResponse ServerState::handle_model_load(const std::string & body_text) {
     }
     auto requested = model_config_from_json(body, request_base_, false);
     requested.path = resolve_ui_model_path(engine::io::json::require_string(body, "path"));
+    apply_default_session_options(config_, requested);
+    if (const auto configured = configured_models_.find(requested.id); configured != configured_models_.end()) {
+        inherit_configured_model_fields(configured->second, requested);
+    }
 
     LoadedModel * existing = nullptr;
     {
@@ -298,11 +349,18 @@ HttpResponse ServerState::handle_model_load(const std::string & body_text) {
     if (existing != nullptr) {
         BusyGuard::Lock run_lock = acquire_model_run(*existing, std::nullopt);
         std::unique_lock<std::shared_mutex> metadata_lock(existing->metadata_mutex);
+        // The WebUI re-posts model metadata when it loads a configured model.
+        // Treat an omitted device as "keep the registration's assignment" so
+        // that action cannot silently move the model back to the server default.
+        if (!requested.device.has_value()) {
+            requested.device = existing->config.device;
+        }
         const bool changed =
             existing->config.path != requested.path ||
             existing->config.family != requested.family ||
             existing->config.task != requested.task ||
             existing->config.mode != requested.mode ||
+            existing->config.device != requested.device ||
             existing->config.load_options != requested.load_options ||
             existing->config.session_options != requested.session_options ||
             existing->config.model_spec_override != requested.model_spec_override;
@@ -378,6 +436,36 @@ HttpResponse ServerState::handle_ui_upload(const HttpRequest & request) {
 }
 
 #if defined(AUDIOCPP_HAS_NATIVE_MODEL_MANAGER)
+// Resolves a "package_id" to the installed package's load target before
+// handing the request to handle_model_load, which only ever sees a path.
+// Path-based loads never touch the installer or its mutex.
+HttpResponse ServerState::handle_package_model_load(const std::string & body_text) {
+    if (!config_.ui_management) {
+        return handle_model_load(body_text);
+    }
+    const auto body = engine::io::json::parse(body_text);
+    std::string package_id;
+    if (auto error = ui_model_load_package_id(body, package_id)) {
+        return *error;
+    }
+    if (package_id.empty()) {
+        return handle_model_load(body_text);
+    }
+    std::optional<engine::package_manager::PackageInfo> info;
+    {
+        std::lock_guard<std::mutex> lock(model_installer_mutex_);
+        if (!model_installer_) {
+            return error_response(403, "UI model management is disabled", "forbidden");
+        }
+        info = model_installer_->package_info(package_id);
+    }
+    std::string resolved_body;
+    if (auto error = resolve_ui_package_model_load(body, package_id, info, resolved_body)) {
+        return *error;
+    }
+    return handle_model_load(resolved_body);
+}
+
 HttpResponse ServerState::handle_model_install(const std::string & body_text) {
     if (!config_.ui_management) {
         return error_response(403, "UI model installation is disabled", "forbidden");
@@ -538,6 +626,7 @@ RuntimeVoicePreset ServerState::load_runtime_voice_preset(
     RuntimeVoicePreset out;
     out.voice_id = preset.voice_id;
     out.reference_text = preset.reference_text;
+    out.options = preset.options;
     if (preset.voice_ref.has_value()) {
         out.audio = minitts::cli::read_audio_buffer(*preset.voice_ref);
     }
@@ -644,7 +733,8 @@ void ServerState::ensure_model_loaded_locked(LoadedModel & model) {
 
     engine::runtime::SessionOptions session_options;
     session_options.backend.type = config_.backend;
-    session_options.backend.device = config_.device;
+    session_options.backend.impl = config_.backend_impl;
+    session_options.backend.device = model.config.device.value_or(config_.device);
     session_options.backend.threads = config_.threads;
     session_options.options = model.config.session_options;
 
@@ -774,7 +864,7 @@ ServerState::TimedTaskResult ServerState::run_streaming_model_impl(
     const engine::runtime::TaskRequest & request,
     const minitts::app::AudioChunkStream * audio,
     const std::function<void(const engine::runtime::StreamEvent &)> & event_sink,
-    std::optional<int> busy_timeout_ms) {
+    std::optional<int> busy_timeout_ms, bool include_artifacts) {
     BusyGuard::Lock lock = acquire_model_run(model, busy_timeout_ms);
     ensure_model_loaded_locked(model);
     if (model.streaming == nullptr) {
@@ -786,7 +876,7 @@ ServerState::TimedTaskResult ServerState::run_streaming_model_impl(
     const bool diarization = model.task.task == engine::runtime::VoiceTaskKind::Diarization;
     const auto sink = [&](const engine::runtime::StreamEvent & event) {
         if (!timed_result.ttft_ms.has_value() &&
-            (stream_event_has_output(event) || (diarization && !event.speaker_turns.empty()))) {
+            (stream_event_has_output(event, include_artifacts) || (diarization && !event.speaker_turns.empty()))) {
             timed_result.ttft_ms = elapsed_ms(started);
         }
         if (event_sink) {
@@ -813,8 +903,8 @@ ServerState::TimedTaskResult ServerState::run_streaming_model(
     LoadedModel & model,
     const engine::runtime::TaskRequest & request,
     const std::function<void(const engine::runtime::StreamEvent &)> & event_sink,
-    std::optional<int> busy_timeout_ms) {
-    return run_streaming_model_impl(model, request, nullptr, event_sink, busy_timeout_ms);
+    std::optional<int> busy_timeout_ms, bool include_artifacts) {
+    return run_streaming_model_impl(model, request, nullptr, event_sink, busy_timeout_ms, include_artifacts);
 }
 
 ServerState::TimedTaskResult ServerState::run_streaming_model_from(
@@ -2093,6 +2183,7 @@ HttpResponse ServerState::handle_generic_stream(const std::string & body_text) {
     const auto body = engine::io::json::parse(body_text);
     auto & model = require_model(body);
     const bool sse = task_stream_sse_requested(body);
+    const bool include_artifacts = bool_field(body, "include_artifacts", false);
     const auto * request_json = body.find("request");
     const auto & effective_json = request_json != nullptr ? *request_json : body;
     auto request = apply_default_request_options(
@@ -2113,15 +2204,15 @@ HttpResponse ServerState::handle_generic_stream(const std::string & body_text) {
         // response puts in "events", and the result follows as the object it
         // puts under "result". The model lock is taken inside the stream, as on
         // the other streamed routes, so a busy model is an error event here.
-        return sse_response([this, model_ptr, request = std::move(request), busy_timeout_ms, diarization](
+        return sse_response([this, model_ptr, request = std::move(request), busy_timeout_ms, diarization, include_artifacts](
                                 HttpStreamWriter & writer) {
             const auto timed_result = run_streaming_model(
                 *model_ptr,
                 request,
                 [&](const engine::runtime::StreamEvent & event) {
-                    write_sse(writer, task_stream_event_line(stream_event_json(event, diarization)));
+                    write_sse(writer, task_stream_event_line(stream_event_json(event, diarization, include_artifacts)));
                 },
-                busy_timeout_ms);
+                busy_timeout_ms, include_artifacts);
             const bool silent_diarization = diarization && !timed_result.ttft_ms.has_value();
             write_sse(writer, task_stream_done_line(
                                   silent_diarization
@@ -2137,7 +2228,7 @@ HttpResponse ServerState::handle_generic_stream(const std::string & body_text) {
         [&](const engine::runtime::StreamEvent & event) {
             events.push_back(event);
         },
-        parse_busy_timeout_override(body));
+        parse_busy_timeout_override(body), include_artifacts);
     std::ostringstream out;
     std::shared_lock<std::shared_mutex> metadata_lock(model.metadata_mutex);
     const bool diarization = model.task.task == engine::runtime::VoiceTaskKind::Diarization;
@@ -2146,13 +2237,143 @@ HttpResponse ServerState::handle_generic_stream(const std::string & body_text) {
         if (i != 0) {
             out << ",";
         }
-        out << stream_event_json(events[i], diarization);
+        out << stream_event_json(events[i], diarization, include_artifacts);
     }
     const bool silent_diarization = diarization && !timed_result.ttft_ms.has_value();
     out << "],\"result\":" << (silent_diarization
         ? task_result_json_with_timing(timed_result.result, "{\"ttft_ms\":null}")
         : streaming_task_result_json(timed_result.result, timed_result.ttft_ms)) << "}";
     return json_response(out.str());
+}
+
+ServerState::TimedTaskResult ServerState::run_recipe(
+    const Value & body,
+    const minitts::app::RecipeEventSink & event_sink) {
+    const auto recipe_id = engine::io::json::require_string(body, "recipe");
+    const minitts::app::IRecipe * recipe_ptr = nullptr;
+    try {
+        recipe_ptr = &recipes_.require(recipe_id);
+    } catch (const std::runtime_error &) {
+        throw engine::runtime::InvalidRequestError("unknown recipe: " + recipe_id);
+    }
+    const auto & recipe = *recipe_ptr;
+    const auto * models = body.find("models");
+    if (models == nullptr || !models->is_object()) {
+        throw engine::runtime::InvalidRequestError("recipe request requires a 'models' object");
+    }
+
+    std::unordered_map<std::string, std::string> model_ids;
+    for (const auto & role : recipe.roles()) {
+        const auto * value = models->find(role.name);
+        if (value == nullptr || !value->is_string() || value->as_string().empty()) {
+            throw engine::runtime::InvalidRequestError(
+                "recipe '" + recipe_id + "' requires model role '" + role.name + "'");
+        }
+        model_ids.emplace(role.name, value->as_string());
+    }
+
+    const auto * request_json = body.find("request");
+    if (request_json == nullptr || !request_json->is_object()) {
+        throw engine::runtime::InvalidRequestError("recipe request requires a 'request' object");
+    }
+    auto request = minitts::cli::build_request_from_json(*request_json, request_base_);
+    const auto busy_timeout_ms = parse_busy_timeout_override(body);
+
+    const auto execute = [
+        this,
+        &model_ids,
+        busy_timeout_ms](
+            std::string_view role,
+            const engine::runtime::TaskSpec & task,
+            const engine::runtime::TaskRequest & stage_request,
+            const minitts::app::RecipeEventSink & sink, const minitts::app::AudioChunkStream * source) {
+        const auto selected = model_ids.find(std::string(role));
+        if (selected == model_ids.end()) {
+            throw std::runtime_error("recipe requested an undeclared model role: " + std::string(role));
+        }
+        Value::Object model_field;
+        model_field.emplace("model", Value::make_string(selected->second));
+        auto & model = require_model(Value::make_object(std::move(model_field)));
+        engine::runtime::TaskRequest effective_request;
+        {
+            std::shared_lock<std::shared_mutex> metadata_lock(model.metadata_mutex);
+            if (model.task.task != task.task || model.task.mode != task.mode) {
+                throw engine::runtime::InvalidRequestError(
+                    "recipe role '" + std::string(role) + "' requires " +
+                    engine::runtime::to_string(task.task) + "/" +
+                    engine::runtime::to_string(task.mode) + ", but model '" +
+                    model.config.id + "' is configured as " +
+                    engine::runtime::to_string(model.task.task) + "/" +
+                    engine::runtime::to_string(model.task.mode));
+            }
+            effective_request = apply_default_request_options(model.config.default_request_options, stage_request);
+        }
+        if (task.mode == engine::runtime::RunMode::Streaming) {
+            return run_streaming_model_impl(model, effective_request, source, sink, busy_timeout_ms, true).result;
+        }
+        return run_model(model, effective_request, busy_timeout_ms).result;
+    };
+    CallbackRecipeModelExecutor executor(
+        [&](std::string_view role, const engine::runtime::TaskSpec & task,
+            const engine::runtime::TaskRequest & stage_request) {
+            return execute(role, task, stage_request, {}, nullptr);
+        }, execute);
+
+    const auto started = Clock::now();
+    auto result = recipe.run(executor, request, event_sink);
+    return TimedTaskResult{std::move(result), elapsed_ms(started), std::nullopt};
+}
+
+HttpResponse ServerState::handle_recipe_run(const std::string & body_text) {
+    const auto body = engine::io::json::parse(body_text);
+    if (!bool_field(body, "stream", false)) {
+        const auto timed = run_recipe(body);
+        return json_response(task_result_json(timed.result, timed.wall_ms));
+    }
+
+    return sse_response([this, body_text](HttpStreamWriter & writer) {
+        const auto stream_body = engine::io::json::parse(body_text);
+        const auto timed = run_recipe(
+            stream_body,
+            [&](const engine::runtime::StreamEvent & event) {
+                write_sse(writer, task_stream_event_line(stream_event_json(event, false,
+                    bool_field(stream_body, "include_artifacts", false))));
+            });
+        write_sse(
+            writer,
+            task_stream_done_line(task_result_json_with_timing(
+                timed.result,
+                "{\"wall_ms\":" + std::to_string(timed.wall_ms) + "}")));
+        write_sse_done(writer);
+    });
+}
+
+std::string ServerState::recipes_json() const {
+    std::ostringstream out;
+    out << "{\"object\":\"list\",\"data\":[";
+    const auto ids = recipes_.ids();
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (i != 0) {
+            out << ",";
+        }
+        const auto & recipe = recipes_.require(ids[i]);
+        out << "{\"id\":" << json_quote(ids[i])
+            << ",\"description\":" << json_quote(recipe.description())
+            << ",\"roles\":[";
+        const auto roles = recipe.roles();
+        for (size_t r = 0; r < roles.size(); ++r) {
+            if (r != 0) {
+                out << ",";
+            }
+            out << "{\"name\":" << json_quote(roles[r].name)
+                << ",\"task\":" << json_quote(engine::runtime::to_string(roles[r].task.task))
+                << ",\"mode\":" << json_quote(engine::runtime::to_string(roles[r].task.mode))
+                << "}";
+        }
+        out << "]}";
+    }
+    out << "]}";
+    return out.str();
 }
 
 // Cached-voice discovery for the "voice"/cached_voice_id request field. Families that
@@ -2233,7 +2454,9 @@ std::string ServerState::models_json(bool include_session_options, bool include_
             << ",\"family\":" << json_quote(model.config.family)
             << ",\"task\":" << json_quote(engine::runtime::to_string(model.task.task))
             << ",\"mode\":" << json_quote(engine::runtime::to_string(model.task.mode))
+            << ",\"device\":" << model.config.device.value_or(config_.device)
             << ",\"loaded\":" << (model.loaded.load() ? "true" : "false")
+            << ",\"configured\":" << (configured_models_.count(model.config.id) != 0 ? "true" : "false")
             << ",\"path\":" << json_quote(model.config.path.string());
         if (include_session_options) {
             out << ",\"session_options\":" << options_json(model.config.session_options);
@@ -2359,7 +2582,7 @@ void ServerState::ensure_model_fits_memory(const ServerModelConfig & model) {
     engine::core::ensure_backends_loaded();
     const engine::core::BackendMemorySnapshot device =
         engine::core::query_backend_memory(engine::core::BackendConfig{
-            config_.backend, config_.device, config_.threads});
+            config_.backend, model.device.value_or(config_.device), config_.threads});
     if (device.available && *estimate + headroom > static_cast<size_t>(device.free_bytes)) {
         throw InsufficientMemoryError(
             "cannot load model '" + model.id + "': estimated " + format_bytes(*estimate) +

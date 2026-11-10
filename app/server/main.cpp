@@ -4,8 +4,10 @@
 #include "parallel_runtime.h"
 #include "parallel_http.h"
 
+#include "../cli/args.h"
 #include "../common/build_info.h"
 
+#include "engine/framework/audio/resampling.h"
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/load_progress.h"
 #include "engine/framework/debug/trace.h"
@@ -87,22 +89,25 @@ std::filesystem::path executable_directory(const char * argv0) {
 void print_help() {
     std::cout
         << "audiocpp_server [--config <server.json>] [--ui] [--host <ip>] [--port <port>] [--backend <backend>]\n"
-        << "                [--device <id>] [--list-devices] [--threads <n>] [--busy-timeout-ms <ms>]\n"
+        << "                [--device <id>] [--list-devices [--json]] [--threads <n>] [--busy-timeout-ms <ms>]\n"
         << "                [--max-loaded-models <n>] [--idle-unload-ms <ms>] [--min-free-memory-mb <mb>]\n"
-        << "                [--model-spec-override <json-or-directory>] [--voice-dir <directory>]\n"
+        << "                [--model-spec-override <json-or-directory|embedded>] [--voice-dir <directory>]\n"
         << "                [--frontend-listener <name>] [--frontend-option key=value]\n"
         << "                [--log] [--log-file <path>] [--load-progress 0|1]\n"
-        << "                [--cors-origins <origins>]\n"
+        << "                [--cors-origins <origins>] [--resample-kernel-cache-mb <mb>]\n"
         << "  --version                        print build version, commit, compiler, platform, and enabled backends\n"
         << "  --parallel-jobs                  opt into the experimental parallel runtime; per-model slots default to 1\n"
         << "  --ui                             serve the embedded WebUI\n"
         << "  --no-ui                          disable the embedded WebUI\n"
         << "  --ui-management                  allow WebUI model management and downloads; requires\n"
         << "                                   AUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON at build time\n"
+        << "  --models-root <directory>         default WebUI models folder; overrides config models_root\n"
         << "  --host <ip>                      server bind address; default 127.0.0.1\n"
         << "  --port <port>                    server listening port; default 8080\n"
-        << "  --backend cpu|cuda|hip|rocm|vulkan|metal  default cuda (rocm is an alias for hip)\n"
-        << "  --list-devices                   list available backend devices and exit\n"
+        << "  --backend cpu|cuda|hip|rocm|vulkan|metal|webgpu|sycl  default cuda (rocm is an alias for hip)\n"
+        << "  --backend-impl <name>             optional backend implementation; default preserves existing dispatch\n"
+        << "  --list-devices                   list available backend devices and exit; add --json\n"
+        << "                                   for PCI ids and free/total memory as JSON\n"
         << "  --busy-timeout-ms <ms>           fail a request with 503 when the model has been\n"
         << "                                   busy this long; default 300000, 0 disables\n"
         << "  --max-loaded-models <n>          keep at most n models resident in memory, unloading\n"
@@ -114,6 +119,9 @@ void print_help() {
         << "  --min-free-memory-mb <mb>        refuse a model load unless host and GPU each keep at\n"
         << "                                   least this many MiB free after the load; default 0\n"
         << "                                   (guard disabled)\n"
+        << "  --resample-kernel-cache-mb <mb>  keep at most this many MiB of resampling kernels cached,\n"
+        << "                                   evicting the least recently used; default 32, 0 disables;\n"
+        << "                                   a kernel larger than this is rebuilt on every call\n"
         << "  --voice-dir <directory>          override the shared reference voice library directory\n"
         << "  --frontend-listener <name>       opt-in frontend transport listener, e.g. https or websocket\n"
         << "  --frontend-option key=value      listener-specific option; may be repeated\n"
@@ -127,14 +135,16 @@ void print_help() {
         << "  GET  /                           embedded WebUI (enabled by default with a config)\n"
         << "  GET  /health\n"
         << "  GET  /v1/models\n"
-        << "  POST /v1/models/load             available with --ui-management\n"
+        << "  GET  /v1/recipes\n"
+        << "  POST /v1/models/load             available with --ui-management; path, or\n"
+        << "                                   package_id with the native model manager\n"
         << "  POST /v1/models/unload           available with --ui-management\n"
         << "  POST /v1/ui/upload               temporary browser upload for WebUI requests\n"
         << "  POST /v1/ui/models/install       background package download/preparation\n"
         << "  POST /v1/ui/models/install/stop  stop one active package download\n"
         << "  POST /v1/ui/models/clean-partial remove abandoned package staging files\n"
         << "  POST /v1/ui/models/delete        remove one installed package precision\n"
-        << "  GET  /v1/ui/models-root          current and binary-local default models folders\n"
+        << "  GET  /v1/ui/models-root          current and default models folders\n"
         << "  POST /v1/ui/models-root          select a models folder (empty path restores default)\n"
         << "  POST /v1/ui/browse-directories   list local folders for the native folder picker\n"
         << "  GET  /v1/ui/models/install-status[?id=<package>]\n"
@@ -156,7 +166,9 @@ void print_help() {
         << "  POST /v1/tasks/run\n"
         << "  POST /v1/tasks/batch\n"
         << "  POST /v1/tasks/stream\n"
-        << "       events and result in one JSON body, or as SSE with stream_format=sse\n";
+        << "       events and result in one JSON body, or as SSE with stream_format=sse\n"
+        << "  POST /v1/recipes/run\n"
+        << "       run a built-in multi-model recipe; set stream=true for SSE\n";
 }
 
 }  // namespace
@@ -164,7 +176,11 @@ void print_help() {
 int main(int argc, char ** argv) {
     try {
         if (has_arg(argc, argv, "--list-devices")) {
-            engine::core::print_backend_devices(std::cout);
+            if (has_arg(argc, argv, "--json")) {
+                engine::core::print_backend_devices_json(std::cout);
+            } else {
+                engine::core::print_backend_devices(std::cout);
+            }
             return 0;
         }
         if (has_arg(argc, argv, "--version")) {
@@ -215,12 +231,21 @@ int main(int argc, char ** argv) {
         }
         if (ui_requested) {
             config.ui_enabled = true;
+            config.ui_requested = true;
         }
         if (has_arg(argc, argv, "--no-ui")) {
             config.ui_enabled = false;
+            config.ui_requested = false;
         }
         if (has_arg(argc, argv, "--ui-management")) {
             config.ui_management = true;
+        }
+        if (has_arg(argc, argv, "--models-root")) {
+            const auto models_root = arg_value(argc, argv, "--models-root");
+            if (!models_root || models_root->empty() || models_root->rfind("--", 0) == 0) {
+                throw std::runtime_error("--models-root requires a non-empty directory");
+            }
+            config.models_root = std::filesystem::path(*models_root);
         }
 #if !defined(AUDIOCPP_HAS_NATIVE_MODEL_MANAGER)
         if (config.ui_management) {
@@ -241,6 +266,9 @@ int main(int argc, char ** argv) {
         if (const auto backend = arg_value(argc, argv, "--backend")) {
             config.backend = minitts::server::parse_server_backend(*backend);
         }
+        if (const auto impl = arg_value(argc, argv, "--backend-impl")) {
+            config.backend_impl = *impl;
+        }
         if (const auto device = arg_value(argc, argv, "--device")) {
             config.device = std::stoi(*device);
         }
@@ -258,6 +286,10 @@ int main(int argc, char ** argv) {
         }
         if (const auto min_free_memory_mb = arg_value(argc, argv, "--min-free-memory-mb")) {
             config.min_free_memory_mb = std::stoi(*min_free_memory_mb);
+        }
+        if (const auto resample_kernel_cache_mb = arg_value(argc, argv, "--resample-kernel-cache-mb")) {
+            config.resample_kernel_cache_mb =
+                minitts::cli::parse_non_negative_int(*resample_kernel_cache_mb, "--resample-kernel-cache-mb");
         }
         if (const auto model_spec = arg_value(argc, argv, "--model-spec-override")) {
             config.model_spec_override = std::filesystem::path(*model_spec);
@@ -292,6 +324,10 @@ int main(int argc, char ** argv) {
         }
         if (config.min_free_memory_mb < 0) {
             throw std::runtime_error("--min-free-memory-mb must be >= 0 (0 disables the memory guard)");
+        }
+        if (config.resample_kernel_cache_mb.has_value()) {
+            engine::audio::set_resample_kernel_cache_budget_bytes(
+                static_cast<size_t>(*config.resample_kernel_cache_mb) * 1024ull * 1024ull);
         }
 
         const auto ui_resource_anchor = executable_directory(argc > 0 ? argv[0] : nullptr);

@@ -236,6 +236,37 @@ void add_runtime_special_tokens(const std::vector<LlamaBpeAddedToken> & tokens, 
     }
 }
 
+// tokenizer.ggml.token_type values (gguf-py TokenType). Control and
+// user-defined tokens get the attrs load_added_tokens_from_tokenizer_json
+// gives HF added tokens with and without special. Unused ids, the [PADn]
+// filler llama.cpp's converter writes past the vocabulary, are skipped as
+// tokenizer.json has no such ids.
+void load_gguf_vocabulary(const LlamaBpeGgufVocabulary & source, BpeVocabulary & vocab) {
+    constexpr int32_t kUnknown = 2;
+    constexpr int32_t kControl = 3;
+    constexpr int32_t kUserDefined = 4;
+    constexpr int32_t kUnused = 5;
+    if (source.tokens.empty() || source.merges.empty() || source.token_types.size() != source.tokens.size()) {
+        throw std::runtime_error("llama BPE GGUF vocabulary is incomplete");
+    }
+    for (size_t id = 0; id < source.tokens.size(); ++id) {
+        const int32_t type = source.token_types[id];
+        if (type == kUnused) {
+            continue;
+        }
+        const uint32_t attr = type == kControl       ? vendor::TOKEN_ATTR_USER_DEFINED | vendor::TOKEN_ATTR_CONTROL
+                              : type == kUserDefined ? vendor::TOKEN_ATTR_USER_DEFINED
+                              : type == kUnknown     ? vendor::TOKEN_ATTR_UNKNOWN
+                                                     : 0u;
+        vocab.token_to_id[source.tokens[id]] = static_cast<int32_t>(id);
+        vocab.id_to_token[static_cast<int32_t>(id)] = TokenData{source.tokens[id], attr};
+    }
+    for (size_t rank = 0; rank < source.merges.size(); ++rank) {
+        add_merge(vocab, source.merges[rank], static_cast<int32_t>(rank));
+    }
+    vocab.ignore_merges = source.ignore_merges;
+}
+
 void load_merges(const std::filesystem::path & merges_path, BpeVocabulary & vocab) {
     std::ifstream merges(merges_path);
     if (!merges) {
@@ -273,22 +304,29 @@ struct LlamaBpeTokenizer::Impl {
     explicit Impl(const LlamaBpeTokenizerSpec & spec) {
         normalizer_space_replacement = spec.normalizer_space_replacement;
         vocab.pre_type = convert_pre_type(spec.pre_type);
+        vocab.pre_tokenize = spec.pre_tokenize;
         const bool has_vocab = !spec.vocab_path.empty();
         const bool has_merges = !spec.merges_path.empty();
         if (has_vocab != has_merges) {
             throw std::runtime_error("llama BPE tokenizer requires both vocab and merges paths");
         }
-        if (has_vocab) {
+        if (spec.gguf_vocabulary.has_value()) {
+            load_gguf_vocabulary(*spec.gguf_vocabulary, vocab);
+        } else if (has_vocab) {
             load_vocab_json(spec.vocab_path, vocab);
             load_merges(spec.merges_path, vocab);
         } else if (spec.tokenizer_json_path.has_value()) {
             const auto tokenizer_json = engine::io::json::parse_file(*spec.tokenizer_json_path);
             load_model_from_tokenizer_json(tokenizer_json, vocab);
             load_added_tokens_from_tokenizer_json(tokenizer_json, vocab);
+            if (spec.honor_ignore_merges) {
+                const auto * ignore_merges = tokenizer_json.require("model").find("ignore_merges");
+                vocab.ignore_merges = ignore_merges != nullptr && ignore_merges->is_bool() && ignore_merges->as_bool();
+            }
         } else {
             throw std::runtime_error("llama BPE tokenizer requires vocab/merges or tokenizer.json");
         }
-        if (has_vocab && spec.tokenizer_json_path.has_value()) {
+        if (!spec.gguf_vocabulary.has_value() && has_vocab && spec.tokenizer_json_path.has_value()) {
             const auto tokenizer_json = engine::io::json::parse_file(*spec.tokenizer_json_path);
             load_added_tokens_from_tokenizer_json(tokenizer_json, vocab);
         }
@@ -332,6 +370,10 @@ std::optional<int32_t> LlamaBpeTokenizer::find_token_id(const std::string & toke
         return std::nullopt;
     }
     return it->second;
+}
+
+bool LlamaBpeTokenizer::contains_token_id(int32_t token_id) const noexcept {
+    return impl_->vocab.id_to_token.find(token_id) != impl_->vocab.id_to_token.end();
 }
 
 bool LlamaBpeTokenizer::is_special_token_id(const int32_t token_id) const {

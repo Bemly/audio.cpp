@@ -74,6 +74,14 @@ private:
     AdaLNResidualMLPConfig config_;
 };
 
+// Normalization closing the timestep embedding MLP.
+enum class TimestepEmbeddingNorm {
+    // x * w / sqrt(var(x) + eps), centered with the unbiased (n - 1) variance.
+    VarianceRms,
+    // x * w / sqrt(mean(x^2) + eps), the plain uncentered RMS norm.
+    Rms,
+};
+
 struct ConditionedFlowMLPConfig {
     int64_t input_size = 0;
     int64_t hidden_size = 0;
@@ -82,6 +90,7 @@ struct ConditionedFlowMLPConfig {
     int64_t layers = 0;
     float eps = 1e-6f;
     bool use_bias = true;
+    TimestepEmbeddingNorm time_embedding_norm = TimestepEmbeddingNorm::VarianceRms;
 };
 
 struct TimestepEmbeddingWeights {
@@ -95,6 +104,7 @@ struct TimestepEmbeddingConfig {
     int64_t frequency_embedding_size = 0;
     int64_t hidden_size = 0;
     float rms_eps = 1e-5f;
+    TimestepEmbeddingNorm norm = TimestepEmbeddingNorm::VarianceRms;
 };
 
 class TimestepEmbeddingModule {
@@ -218,6 +228,7 @@ enum class AdaptiveLayerNormMode {
     Affine,
     RmsAffine,
     Scale,
+    LayerAffine,
 };
 
 struct AdaptiveLayerNormConfig {
@@ -232,6 +243,15 @@ struct AdaptiveLayerNormWeights {
     core::TensorValue table;
 };
 
+// Prepared, zero-centered modulation, broadcastable to the input. Affine
+// modes apply norm(input) * (1 + scale) + shift; Scale applies input * scale.
+// Affine accepts pre-normalized input; LayerAffine/RmsAffine normalize here.
+// Table indices in the config apply only to the table-backed overload.
+struct AdaptiveLayerNormParameters {
+    core::TensorValue shift;
+    core::TensorValue scale;
+};
+
 class AdaptiveLayerNormModule {
 public:
     explicit AdaptiveLayerNormModule(AdaptiveLayerNormConfig config);
@@ -243,6 +263,10 @@ public:
         const core::TensorValue & input,
         const core::TensorValue & conditioning,
         const AdaptiveLayerNormWeights & weights) const;
+    core::TensorValue build(
+        core::ModuleBuildContext & ctx,
+        const core::TensorValue & input,
+        const AdaptiveLayerNormParameters & parameters) const;
     static const core::ModuleSchema & static_schema() noexcept;
 
 private:

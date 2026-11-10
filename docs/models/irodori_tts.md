@@ -11,10 +11,14 @@ The default downloadable package is the GGUF v4 Small Q8_0 checkpoint. v4 Small 
 | 500M v3 | `Irodori-TTS-500M-v3-GGUF` | `tts`, `clon` | Uses the shared llm-jp tokenizer layout in the original safetensors package. |
 | 600M v3 VoiceDesign | `Irodori-TTS-600M-v3-VoiceDesign-GGUF` | `tts`, `clon`, `vdes` | Adds instruction/caption conditioning for voice design. |
 | v4 Small | `Irodori-TTS-v4-Small-GGUF` | `tts`, `clon`, `vdes` | Bundles its v4 tokenizer and supports instruction/caption conditioning in the same checkpoint. |
+| v4.1 Small MeanFlow | `Irodori-TTS-v4-Small-GGUF` | `tts`, `clon`, `vdes` | Distilled checkpoint; four sampling steps by default, with training-time CFG. |
+| v4 Large | convert locally | `tts`, `clon`, `vdes` | 3.29B; T5Gemma 2 text encoder. No published package. See [v4 Large](#v4-large). |
 
 v4 GGUF packages are published in both `q8_0` and `f16`. v3 GGUF packages are also available in `q8_0` and `f16`.
 
 **Checkpoints without a duration predictor** (`use_duration_predictor` absent or `false` in the model config, such as the original 500M v2 safetensors) also load. With no `duration_sec`, they generate 30 seconds and `trim_tail` cuts the trailing silence, as the Python runtime does; `duration_scale` has no effect. The fallback always samples 30 seconds, so passing `duration_sec` is faster when the length is known.
+
+**Input text** is normalized as in Python Irodori-TTS (`normalize_text`): symbol cleanup, wave dashes (`〜`, `～`) to `ー`, removal of brackets that enclose the whole text, NFKC (half-width katakana to full width, full-width Latin letters and digits to ASCII), and `...` to `…`.
 
 > **v4 reference-conditioning note:** Fresh v4 voice-clone or reference+instruction generations may occasionally add a short extra phrase near the end of the clip. This behavior is also reproducible in the upstream Python path with the same reference/text/seed, so it is treated as a current v4 model/runtime limitation rather than a GGUF-only issue. No-reference and instruction-only paths are usually cleaner; for reference-conditioned use, try a different seed, instruction, or explicit `duration_sec` if the tail matters.
 
@@ -102,7 +106,7 @@ v4 uses the normalized schema-v1 option names directly. New requests should use 
 | `no_ref` | bool | `true` unless a reference is provided | Use no-reference generation. Set `false` with `--voice-ref` for reference conditioning. |
 | `speaker_embedding_file` | path | unset | Speaker Inversion embedding (`*.speaker.safetensors`) used instead of reference audio. Legacy `speaker_embedding_path` remains accepted. See [Speaker Inversion Embeddings](#speaker-inversion-embeddings). |
 | `reference_duration_sec` | seconds | checkpoint | Trim reference audio to this length before encoding it; `0` keeps the whole reference. Legacy `max_ref_sec` remains accepted. See [Reference Length](#reference-length). |
-| `num_inference_steps` | positive integer | `40` | RF diffusion steps. |
+| `num_inference_steps` | positive integer | checkpoint | Sampling steps: `40` for RF, `4` for MeanFlow. |
 | `t_schedule_mode` | `linear`, `sway` | `linear` | Euler timestep schedule. |
 | `sway_coeff` | finite float | `-1.0` | Sway coefficient; grid must strictly decrease. |
 | `duration_sec` | seconds | unset | Target duration in seconds; omitted or nonpositive values select predicted duration. |
@@ -110,7 +114,7 @@ v4 uses the normalized schema-v1 option names directly. New requests should use 
 | `min_duration_sec` | seconds > 0 | `0.5` | Minimum generated duration; must not exceed `max_duration_sec`. |
 | `max_duration_sec` | seconds > 0 | `30` | Maximum generated duration; must be at least `min_duration_sec`. |
 | `text_chunk_mode` | `word_budget`, `tag_aware`, `japanese`, `endline` | `endline` | Text chunk policy; word_budget also accepts the legacy spelling default. |
-| `text_chunk_size` | integer | model text window | Maximum characters per outer chunk. |
+| `text_chunk_size` | integer | `100` | Maximum characters per outer chunk; the model text window if that is smaller. Each chunk is generated within `max_duration_sec`, so a much longer chunk is squeezed into it and garbled. |
 | `text_guidance_scale` | float | `3.0` | Text classifier-free guidance scale; default 3.0. Nonpositive values disable the corresponding CFG branch. |
 | `speaker_guidance_scale` | float | `5.0` | Speaker classifier-free guidance scale; default 5.0. Nonpositive values disable the corresponding CFG branch. |
 | `caption_guidance_scale` | float | `3.0` | Caption classifier-free guidance scale; default 3.0. Nonpositive values disable the corresponding CFG branch. |
@@ -174,6 +178,75 @@ The runtime accepts the old option names below for existing local scripts and ol
 | `max_seconds` | `max_duration_sec` |
 | `mem_saver` | `irodori_tts.mem_saver` |
 | `reference_cache_slots` | `irodori_tts.reference_cache_slots` |
+
+## MeanFlow
+
+[Irodori-TTS-v4.1-Small-MF](https://huggingface.co/Aratako/Irodori-TTS-v4.1-Small-MF)
+uses a separate MeanFlow sampler selected by the checkpoint's
+`flow_parameterization=meanflow` metadata. RF checkpoints keep their existing
+sampler and 40-step default. No sampler-selection option is needed.
+
+```bash
+audiocpp_cli --task tts --family irodori_tts \
+  --model models/Irodori-TTS-v4-Small-GGUF/irodori-tts-v4.1-small-mf-q8_0.gguf \
+  --backend cuda --text "こんにちは、私はAIです。これは音声合成のテストです。" \
+  --request-option no_ref=true --out meanflow.wav
+```
+
+MeanFlow defaults to four steps; `num_inference_steps` overrides the count.
+Reference audio, instructions, duration controls, and streaming codec output keep
+their normal roles. Runtime CFG scales, guidance mode/time bounds, and Sway
+settings are ignored, matching upstream: guidance is learned during distillation.
+Using fewer steps with an RF checkpoint does not turn it into MeanFlow.
+
+To convert a downloaded inference checkpoint, including its tokenizer, and the
+DACVAE safetensors:
+
+```bash
+python tools/models/convert_irodori_gguf.py \
+  --model models/Irodori-TTS-v4.1-Small-MF/model.safetensors \
+  --codec models/Semantic-DACVAE-Japanese-32dim/weights.safetensors \
+  --type q8_0 \
+  --output models/Irodori-TTS-v4-Small-GGUF/irodori-tts-v4.1-small-mf-q8_0.gguf
+```
+
+The converter preserves the checkpoint's configuration and interval-conditioning
+weights and embeds the required sidecars. Use `--type f16` for the F16 package.
+
+## v4 Large
+
+[Irodori-TTS-v4-Large](https://huggingface.co/Aratako/Irodori-TTS-v4-Large)
+scales the v4 architecture to 3.29B parameters and replaces the ModernBERT text
+encoder with the encoder half of
+[T5Gemma 2](https://huggingface.co/google/t5gemma-2-1b-1b), shared by the text
+and caption paths. Its weights are under the Gemma Terms of Use, so there is no
+published package; convert the downloaded checkpoint. The checkpoint carries the
+T5Gemma 2 weights and configuration, and its `tokenizer/` folder holds the Gemma
+tokenizer, so the gated T5Gemma 2 repository is not needed:
+
+```bash
+python tools/models/convert_irodori_gguf.py \
+  --model models/Irodori-TTS-v4-Large/model.safetensors \
+  --codec models/Semantic-DACVAE-Japanese-32dim/weights.safetensors \
+  --type q8_0 \
+  --output models/Irodori-TTS-v4-Large-GGUF/irodori-tts-v4-large-q8_0.gguf
+```
+
+`--type q6_k`, `q5_k` and `q4_k` make smaller files. The k-quants need input
+widths that are multiples of 256, so the converter stores T5Gemma 2's
+1152-wide projections as Q8_0 instead of leaving them in F32; embeddings stay
+F16 as for every quantized type. Q8_0 follows the Python model most closely and
+Q6_K is close to it; Q5_K and Q4_K can change the delivery of a line.
+
+| Type | File | Peak GPU, 6 s line without reference |
+|---|---|---|
+| `q8_0` | 4.2 GB | 5.4 GB |
+| `q6_k` | 3.6 GB | 4.9 GB |
+| `q5_k` | 3.3 GB | 4.6 GB |
+| `q4_k` | 3.0 GB | 4.3 GB |
+
+Measured with CUDA and 40 steps; a 35-second reference adds about 2.3 GB while it
+is encoded. Requests are the same as for v4 Small.
 
 ## RF Sampling: Linear and Sway
 

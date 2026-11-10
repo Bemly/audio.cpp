@@ -5,6 +5,7 @@
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/backend_weight_store.h"
 #include "engine/framework/core/execution_context.h"
+#include "engine/framework/debug/trace.h"
 #include "engine/framework/modules/activation_modules.h"
 #include "engine/framework/modules/attention_modules.h"
 #include "engine/framework/modules/attention/streaming_frame_attention_cache.h"
@@ -29,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <list>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -98,11 +100,30 @@ struct CodecStreamingState {
                 ggml_backend_tensor_set(history.first, zeros.data(), 0, zeros.size() * sizeof(float));
             }
         }
-        const int32_t position = static_cast<int32_t>(frames);
-        ggml_backend_tensor_set(positions, &position, 0, sizeof(position));
-        std::vector<ggml_fp16_t> values(128, ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
-        std::fill(values.begin() + std::max<int64_t>(0, 127 - frames), values.end(), ggml_fp32_to_fp16(0.0F));
+        const int64_t count = ggml_nelements(positions);
+        std::vector<int32_t> positions_data(static_cast<size_t>(count));
+        std::iota(positions_data.begin(), positions_data.end(), static_cast<int32_t>(frames));
+        ggml_backend_tensor_set(positions, positions_data.data(), 0, positions_data.size() * sizeof(int32_t));
+        const int64_t keys = 127 + count;
+        std::vector<ggml_fp16_t> values(static_cast<size_t>(count * keys),
+            ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
+        for (int64_t row = 0; row < count; ++row) {
+            const auto start = values.begin() + row * keys;
+            std::fill(start + std::max<int64_t>(row, 127 - frames), start + 128 + row, ggml_fp32_to_fp16(0.0F));
+        }
         ggml_backend_tensor_set(mask, values.data(), 0, values.size() * sizeof(ggml_fp16_t));
+    }
+
+    void import_from(ggml_backend_t backend, const CodecStreamingState & source) {
+        if (histories.size() != source.histories.size()) {
+            throw std::runtime_error("Fish DAC streaming convolution state count mismatch");
+        }
+        attention.import_from(backend, source.attention);
+        for (size_t index = 0; index < histories.size(); ++index) {
+            ggml_backend_tensor_copy_async(backend, backend, source.histories[index].second, histories[index].first);
+        }
+        ggml_backend_synchronize(backend);
+        frames = source.frames;
     }
 
     void expand(ggml_cgraph * graph) {
@@ -117,7 +138,7 @@ struct CodecStreamingState {
             ggml_backend_tensor_copy_async(backend, backend, history.second, history.first);
         }
         ggml_backend_synchronize(backend);
-        ++frames;
+        frames += ggml_nelements(positions);
     }
 };
 
@@ -188,6 +209,7 @@ struct QuantizerUnitWeights {
 };
 
 struct FishCodecWeights {
+    bool encoder_bf16_compute = false;
     std::shared_ptr<core::BackendWeightStore> store;
     modules::Conv1dWeights encoder_first;
     std::vector<EncoderBlockWeights> encoder_blocks;
@@ -224,7 +246,7 @@ int64_t ceil_div(int64_t a, int64_t b) {
     return (a + b - 1) / b;
 }
 
-std::vector<float> normalized_rows(const std::vector<float> & values, int64_t rows, int64_t cols) {
+std::vector<float> normalized_rows(const std::vector<float> & values, int64_t rows, int64_t cols, bool bf16 = false) {
     if (static_cast<int64_t>(values.size()) != rows * cols) {
         throw std::runtime_error("Fish Audio normalized_rows shape mismatch");
     }
@@ -235,7 +257,13 @@ std::vector<float> normalized_rows(const std::vector<float> & values, int64_t ro
             const float value = values[static_cast<size_t>(row * cols + col)];
             sum += static_cast<double>(value) * static_cast<double>(value);
         }
-        const float inv = sum > 0.0 ? static_cast<float>(1.0 / std::sqrt(sum)) : 0.0F;
+        float inv;
+        if (bf16) {
+            const float norm = ggml_bf16_to_fp32(ggml_fp32_to_bf16(static_cast<float>(std::sqrt(sum))));
+            inv = 1.0F / std::max(norm, 1.0e-12F);
+        } else {
+            inv = sum > 0.0 ? static_cast<float>(1.0 / std::sqrt(sum)) : 0.0F;
+        }
         for (int64_t col = 0; col < cols; ++col) {
             const size_t index = static_cast<size_t>(row * cols + col);
             out[index] = values[index] * inv;
@@ -314,7 +342,8 @@ core::TensorValue causal_conv1d(
     int stride,
     int dilation,
     bool use_bias,
-    CodecStreamingState * stream = nullptr) {
+    CodecStreamingState * stream = nullptr,
+    bool bf16_compute = false) {
     const int64_t effective_kernel = (kernel - 1) * dilation + 1;
     const int64_t left_pad = effective_kernel - stride;
     const int64_t right_pad = extra_padding_for_conv1d(input.shape.dims[2], effective_kernel, stride, left_pad);
@@ -328,6 +357,7 @@ core::TensorValue causal_conv1d(
         0,
         dilation,
         use_bias,
+        bf16_compute,
     }).build(ctx, padded, weights);
 }
 
@@ -384,13 +414,19 @@ core::TensorValue causal_conv_transpose1d(
     return slice_frames(ctx, out, start, out.shape.dims[2] - start - padding_right);
 }
 
-core::TensorValue l2_normalize_last(core::ModuleBuildContext & ctx, const core::TensorValue & input) {
-    const bool materialize_input = ctx.backend_type == core::BackendType::Metal;
+core::TensorValue l2_normalize_last(core::ModuleBuildContext & ctx, const core::TensorValue & input, bool bf16 = false) {
+    const bool materialize_input = ctx.backend_type == core::BackendType::Metal || ctx.backend_type == core::BackendType::Cpu;
     const auto normalized_input = materialize_input
         ? core::ensure_backend_addressable_layout(ctx, input)
         : input;
     auto squared = modules::MulModule{}.build(ctx, normalized_input, normalized_input);
     auto sum = modules::ReduceSumModule({static_cast<int>(input.shape.rank - 1)}).build(ctx, squared);
+    if (bf16) {
+        auto * norm = ggml_round_bf16(ctx.ggml, ggml_sqrt(ctx.ggml, sum.tensor));
+        norm = ggml_clamp(ctx.ggml, norm, 1.0e-12F, std::numeric_limits<float>::max());
+        return core::wrap_tensor(ggml_round_bf16(ctx.ggml,
+            ggml_div(ctx.ggml, normalized_input.tensor, norm)), input.shape, GGML_TYPE_F32);
+    }
     auto shifted = core::wrap_tensor(ggml_scale_bias(ctx.ggml, sum.tensor, 1.0F, 1.0e-12F), sum.shape, GGML_TYPE_F32);
     auto denom = modules::SqrtModule{}.build(ctx, shifted);
     auto repeated = modules::RepeatModule({normalized_input.shape}).build(ctx, denom);
@@ -400,15 +436,22 @@ core::TensorValue l2_normalize_last(core::ModuleBuildContext & ctx, const core::
 core::TensorValue build_mlp(
     core::ModuleBuildContext & ctx,
     const core::TensorValue & input,
-    const modules::DecoderMLPWeights & weights) {
+    const modules::DecoderMLPWeights & weights,
+    bool bf16 = false) {
     auto gate = modules::LinearModule({kCodecDim, kCodecIntermediate, false, GGML_PREC_F32})
                     .build(ctx, input, weights.gate_proj);
+    if (bf16) gate = core::wrap_tensor(ggml_round_bf16(ctx.ggml, gate.tensor), gate.shape, GGML_TYPE_F32);
     gate = modules::SiluModule{}.build(ctx, gate);
+    if (bf16) gate = core::wrap_tensor(ggml_round_bf16(ctx.ggml, gate.tensor), gate.shape, GGML_TYPE_F32);
     auto up = modules::LinearModule({kCodecDim, kCodecIntermediate, false, GGML_PREC_F32})
                   .build(ctx, input, weights.up_proj);
+    if (bf16) up = core::wrap_tensor(ggml_round_bf16(ctx.ggml, up.tensor), up.shape, GGML_TYPE_F32);
     auto hidden = modules::MulModule{}.build(ctx, gate, up);
-    return modules::LinearModule({kCodecIntermediate, kCodecDim, false, GGML_PREC_F32})
+    if (bf16) hidden = core::wrap_tensor(ggml_round_bf16(ctx.ggml, hidden.tensor), hidden.shape, GGML_TYPE_F32);
+    auto out = modules::LinearModule({kCodecIntermediate, kCodecDim, false, GGML_PREC_F32})
         .build(ctx, hidden, weights.down_proj);
+    if (bf16) out = core::wrap_tensor(ggml_round_bf16(ctx.ggml, out.tensor), out.shape, GGML_TYPE_F32);
+    return out;
 }
 
 core::TensorValue reshape_heads(core::ModuleBuildContext & ctx, const core::TensorValue & input) {
@@ -488,31 +531,74 @@ core::TensorValue build_transformer_layer(
     const core::TensorValue & positions,
     const core::TensorValue & attention_mask,
     const CodecTransformerLayerWeights & weights,
-    CodecStreamingState * stream = nullptr) {
-    auto normed = modules::RMSNormModule({kCodecDim, kCodecNormEps, true, false}).build(ctx, input, weights.attention_norm);
+    CodecStreamingState * stream = nullptr,
+    const core::TensorValue * rotary_cos = nullptr,
+    const core::TensorValue * rotary_sin = nullptr) {
+    const bool bf16 = rotary_cos != nullptr;
+    auto x = input;
+    if (bf16) {
+        x = core::ensure_backend_addressable_layout(ctx, x);
+        x = core::wrap_tensor(ggml_round_bf16(ctx.ggml, x.tensor), x.shape, GGML_TYPE_F32);
+    }
+    auto normed = modules::RMSNormModule({kCodecDim, kCodecNormEps, !bf16, false}).build(ctx, x, weights.attention_norm);
+    if (bf16) {
+        auto * base = ggml_round_bf16(ctx.ggml, normed.tensor);
+        auto * gain = ggml_round_bf16(ctx.ggml, weights.attention_norm.weight->tensor);
+        normed = core::wrap_tensor(ggml_round_bf16(ctx.ggml, ggml_mul(ctx.ggml, base, gain)), normed.shape, GGML_TYPE_F32);
+    }
     auto q = modules::LinearModule({kCodecDim, kCodecDim, false, GGML_PREC_F32})
                  .build(ctx, normed, {weights.attention.q_weight, std::nullopt});
     auto k = modules::LinearModule({kCodecDim, kCodecDim, false, GGML_PREC_F32})
                  .build(ctx, normed, {weights.attention.k_weight, std::nullopt});
     auto v = modules::LinearModule({kCodecDim, kCodecDim, false, GGML_PREC_F32})
                  .build(ctx, normed, {weights.attention.v_weight, std::nullopt});
-    q = modules::RoPEModule({kCodecHeadDim, GGML_ROPE_TYPE_NORMAL, kCodecRopeTheta}).build(ctx, reshape_heads(ctx, q), positions);
-    k = modules::RoPEModule({kCodecHeadDim, GGML_ROPE_TYPE_NORMAL, kCodecRopeTheta}).build(ctx, reshape_heads(ctx, k), positions);
+    const auto rotate = [&](core::TensorValue value) {
+        if (!bf16) return modules::RoPEModule({kCodecHeadDim, GGML_ROPE_TYPE_NORMAL, kCodecRopeTheta})
+            .build(ctx, reshape_heads(ctx, value), positions);
+        value = core::wrap_tensor(ggml_round_bf16(ctx.ggml, value.tensor), value.shape, GGML_TYPE_F32);
+        auto heads = reshape_heads(ctx, value);
+        auto pairs = core::reshape_tensor(ctx, heads, core::TensorShape::from_dims(
+            {input.shape.dims[0] * input.shape.dims[1], kCodecTransformerHeads, kCodecHeadDim / 2, 2}));
+        auto even = modules::SliceModule({3, 0, 1}).build(ctx, pairs);
+        auto odd = modules::SliceModule({3, 1, 1}).build(ctx, pairs);
+        auto rotated = modules::RopeInterleavedPairsModule{}.build(ctx, even, odd, *rotary_cos, *rotary_sin);
+        rotated = core::wrap_tensor(ggml_round_bf16(ctx.ggml, rotated.tensor), rotated.shape, GGML_TYPE_F32);
+        return core::reshape_tensor(ctx, rotated, heads.shape);
+    };
+    q = rotate(q);
+    k = rotate(k);
+    if (bf16) v = core::wrap_tensor(ggml_round_bf16(ctx.ggml, v.tensor), v.shape, GGML_TYPE_F32);
     v = reshape_heads(ctx, v);
     auto context = attention_from_heads(ctx, q, k, v, attention_mask, stream);
     context = core::ensure_backend_addressable_layout(ctx, context);
+    if (bf16) context = core::wrap_tensor(ggml_round_bf16(ctx.ggml, context.tensor), context.shape, GGML_TYPE_F32);
     context = core::reshape_tensor(
         ctx,
         context,
         core::TensorShape::from_dims({input.shape.dims[0], input.shape.dims[1], kCodecDim}));
     auto attn = modules::LinearModule({kCodecDim, kCodecDim, false, GGML_PREC_F32})
                     .build(ctx, context, {weights.attention.out_weight, std::nullopt});
-    attn = modules::LayerScaleModule{}.build(ctx, attn, weights.attention_scale);
-    auto hidden = modules::AddModule{}.build(ctx, input, attn);
-    auto ffn_in = modules::RMSNormModule({kCodecDim, kCodecNormEps, true, false}).build(ctx, hidden, weights.ffn_norm);
-    auto ff = build_mlp(ctx, ffn_in, weights.feed_forward);
-    ff = modules::LayerScaleModule{}.build(ctx, ff, weights.ffn_scale);
-    return modules::AddModule{}.build(ctx, hidden, ff);
+    if (bf16) attn = core::wrap_tensor(ggml_round_bf16(ctx.ggml, attn.tensor), attn.shape, GGML_TYPE_F32);
+    auto attention_scale = weights.attention_scale;
+    if (bf16) attention_scale.scale = core::wrap_tensor(ggml_round_bf16(ctx.ggml, attention_scale.scale.tensor), attention_scale.scale.shape, GGML_TYPE_F32);
+    attn = modules::LayerScaleModule{}.build(ctx, attn, attention_scale);
+    if (bf16) attn = core::wrap_tensor(ggml_round_bf16(ctx.ggml, attn.tensor), attn.shape, GGML_TYPE_F32);
+    auto hidden = modules::AddModule{}.build(ctx, x, attn);
+    if (bf16) hidden = core::wrap_tensor(ggml_round_bf16(ctx.ggml, hidden.tensor), hidden.shape, GGML_TYPE_F32);
+    auto ffn_in = modules::RMSNormModule({kCodecDim, kCodecNormEps, !bf16, false}).build(ctx, hidden, weights.ffn_norm);
+    if (bf16) {
+        auto * base = ggml_round_bf16(ctx.ggml, ffn_in.tensor);
+        auto * gain = ggml_round_bf16(ctx.ggml, weights.ffn_norm.weight->tensor);
+        ffn_in = core::wrap_tensor(ggml_round_bf16(ctx.ggml, ggml_mul(ctx.ggml, base, gain)), ffn_in.shape, GGML_TYPE_F32);
+    }
+    auto ff = build_mlp(ctx, ffn_in, weights.feed_forward, bf16);
+    auto ffn_scale = weights.ffn_scale;
+    if (bf16) ffn_scale.scale = core::wrap_tensor(ggml_round_bf16(ctx.ggml, ffn_scale.scale.tensor), ffn_scale.scale.shape, GGML_TYPE_F32);
+    ff = modules::LayerScaleModule{}.build(ctx, ff, ffn_scale);
+    if (bf16) ff = core::wrap_tensor(ggml_round_bf16(ctx.ggml, ff.tensor), ff.shape, GGML_TYPE_F32);
+    auto out = modules::AddModule{}.build(ctx, hidden, ff);
+    if (bf16) out = core::wrap_tensor(ggml_round_bf16(ctx.ggml, out.tensor), out.shape, GGML_TYPE_F32);
+    return out;
 }
 
 core::TensorValue make_positions(
@@ -547,22 +633,49 @@ core::TensorValue build_window_transformer(
     const core::TensorValue & input_bct,
     const CodecTransformerWeights & weights,
     int64_t window_size,
-    CodecStreamingState * stream = nullptr) {
+    CodecStreamingState * stream = nullptr,
+    bool bf16 = false) {
     auto x = modules::TransposeModule({{0, 2, 1, 3}, 3}).build(ctx, input_bct);
     auto positions = stream == nullptr ? make_positions(ctx, constants, x.shape.dims[1])
-        : core::make_tensor(ctx, GGML_TYPE_I32, core::TensorShape::from_dims({1}));
+        : core::make_tensor(ctx, GGML_TYPE_I32, core::TensorShape::from_dims({x.shape.dims[1]}));
     auto mask = stream == nullptr ? make_causal_mask(ctx, constants, x.shape.dims[1], window_size)
-        : core::make_tensor(ctx, GGML_TYPE_F16, core::TensorShape::from_dims({1, window_size}));
+        : core::make_tensor(ctx, GGML_TYPE_F16, core::TensorShape::from_dims({x.shape.dims[1], window_size - 1 + x.shape.dims[1]}));
     if (stream != nullptr) {
         stream->positions = positions.tensor;
         stream->mask = mask.tensor;
         ggml_set_input(positions.tensor);
         ggml_set_input(mask.tensor);
     }
-    for (const auto & layer : weights.layers) {
-        x = build_transformer_layer(ctx, x, positions, mask, layer, stream);
+    core::TensorValue rotary_cos, rotary_sin;
+    if (bf16) {
+        const int64_t frames = x.shape.dims[1];
+        std::vector<float> cos(static_cast<size_t>(frames * kCodecHeadDim / 2)), sin(cos.size());
+        for (int64_t t = 0; t < frames; ++t) {
+            for (int64_t d = 0; d < kCodecHeadDim / 2; ++d) {
+                const float frequency = 1.0F / std::pow(kCodecRopeTheta, static_cast<float>(2 * d) / kCodecHeadDim);
+                const float angle = static_cast<float>(t) * frequency;
+                const auto index = static_cast<size_t>(t * (kCodecHeadDim / 2) + d);
+                cos[index] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(std::cos(angle)));
+                sin[index] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(std::sin(angle)));
+            }
+        }
+        const auto shape = core::TensorShape::from_dims({frames, 1, kCodecHeadDim / 2, 1});
+        rotary_cos = constants.make_tensor(shape, GGML_TYPE_F32, cos.data(), cos.size() * sizeof(float));
+        rotary_sin = constants.make_tensor(shape, GGML_TYPE_F32, sin.data(), sin.size() * sizeof(float));
+        const auto expanded = core::TensorShape::from_dims({x.shape.dims[0] * frames, kCodecTransformerHeads, kCodecHeadDim / 2, 1});
+        rotary_cos = modules::RepeatModule({expanded}).build(ctx, rotary_cos);
+        rotary_sin = modules::RepeatModule({expanded}).build(ctx, rotary_sin);
     }
-    x = modules::RMSNormModule({kCodecDim, kCodecNormEps, true, false}).build(ctx, x, weights.norm);
+    for (const auto & layer : weights.layers) {
+        x = build_transformer_layer(ctx, x, positions, mask, layer, stream,
+            bf16 ? &rotary_cos : nullptr, bf16 ? &rotary_sin : nullptr);
+    }
+    x = modules::RMSNormModule({kCodecDim, kCodecNormEps, !bf16, false}).build(ctx, x, weights.norm);
+    if (bf16) {
+        auto * base = ggml_round_bf16(ctx.ggml, x.tensor);
+        auto * gain = ggml_round_bf16(ctx.ggml, weights.norm.weight->tensor);
+        x = core::wrap_tensor(ggml_round_bf16(ctx.ggml, ggml_mul(ctx.ggml, base, gain)), x.shape, GGML_TYPE_F32);
+    }
     return modules::TransposeModule({{0, 2, 1, 3}, 3}).build(ctx, x);
 }
 
@@ -572,16 +685,21 @@ core::TensorValue build_residual_unit(
     const ResidualUnitWeights & weights,
     int64_t channels,
     int dilation,
-    CodecStreamingState * stream = nullptr) {
+    CodecStreamingState * stream = nullptr,
+    bool bf16_compute = false) {
     auto y = modules::Snake1dModule({channels}).build(ctx, input, weights.snake1);
-    y = causal_conv1d(ctx, y, weights.conv1, channels, channels, 7, 1, dilation, true, stream);
+    if (bf16_compute) y = core::wrap_tensor(ggml_round_bf16(ctx.ggml, y.tensor), y.shape, GGML_TYPE_F32);
+    y = causal_conv1d(ctx, y, weights.conv1, channels, channels, 7, 1, dilation, true, stream, bf16_compute);
     y = modules::Snake1dModule({channels}).build(ctx, y, weights.snake2);
-    y = causal_conv1d(ctx, y, weights.conv2, channels, channels, 1, 1, 1, true);
+    if (bf16_compute) y = core::wrap_tensor(ggml_round_bf16(ctx.ggml, y.tensor), y.shape, GGML_TYPE_F32);
+    y = causal_conv1d(ctx, y, weights.conv2, channels, channels, 1, 1, 1, true, nullptr, bf16_compute);
     core::TensorValue x = input;
     if (x.shape.dims[2] != y.shape.dims[2]) {
         x = slice_frames(ctx, x, 0, y.shape.dims[2]);
     }
-    return modules::AddModule{}.build(ctx, x, y);
+    auto out = modules::AddModule{}.build(ctx, x, y);
+    if (bf16_compute) out = core::wrap_tensor(ggml_round_bf16(ctx.ggml, out.tensor), out.shape, GGML_TYPE_F32);
+    return out;
 }
 
 core::TensorValue build_convnext(
@@ -589,20 +707,64 @@ core::TensorValue build_convnext(
     const core::TensorValue & input,
     const ConvNeXtBlockWeights & weights,
     int64_t channels,
-    CodecStreamingState * stream = nullptr) {
-    auto y = causal_depthwise_conv1d(ctx, input, weights.dwconv, channels, 7, 1, 1, true, stream);
+    CodecStreamingState * stream = nullptr,
+    bool bf16 = false) {
+    auto depthwise = weights.dwconv;
+    if (bf16) depthwise.weight = core::wrap_tensor(ggml_round_bf16(ctx.ggml,
+        ggml_cast(ctx.ggml, depthwise.weight.tensor, GGML_TYPE_F32)), depthwise.weight.shape, GGML_TYPE_F32);
+    auto y = causal_depthwise_conv1d(ctx, input, depthwise, channels, 7, 1, 1, !bf16, stream);
+    if (bf16) {
+        auto bias = core::wrap_tensor(ggml_round_bf16(ctx.ggml, weights.dwconv.bias->tensor), weights.dwconv.bias->shape, GGML_TYPE_F32);
+        bias = core::reshape_tensor(ctx, bias, core::TensorShape::from_dims({1, channels, 1}));
+        bias = modules::RepeatModule({y.shape}).build(ctx, bias);
+        y = modules::AddModule{}.build(ctx, y, bias);
+        y = core::wrap_tensor(ggml_round_bf16(ctx.ggml, y.tensor), y.shape, GGML_TYPE_F32);
+    }
     y = modules::TransposeModule({{0, 2, 1, 3}, 3}).build(ctx, y);
-    y = modules::LayerNormModule({channels, kConvNextNormEps, true, true}).build(ctx, y, weights.norm);
-    y = modules::LinearModule({channels, channels * 4, true, GGML_PREC_F32}).build(ctx, y, weights.pwconv1);
+    auto norm = weights.norm;
+    auto expansion = weights.pwconv1;
+    auto projection = weights.pwconv2;
+    auto scale = weights.gamma;
+    if (bf16) {
+        norm.weight = core::wrap_tensor(ggml_round_bf16(ctx.ggml, norm.weight->tensor), norm.weight->shape, GGML_TYPE_F32);
+        norm.bias = core::wrap_tensor(ggml_round_bf16(ctx.ggml, norm.bias->tensor), norm.bias->shape, GGML_TYPE_F32);
+        expansion.bias = core::wrap_tensor(ggml_round_bf16(ctx.ggml, expansion.bias->tensor), expansion.bias->shape, GGML_TYPE_F32);
+        projection.bias = core::wrap_tensor(ggml_round_bf16(ctx.ggml, projection.bias->tensor), projection.bias->shape, GGML_TYPE_F32);
+        scale.scale = core::wrap_tensor(ggml_round_bf16(ctx.ggml, scale.scale.tensor), scale.scale.shape, GGML_TYPE_F32);
+    }
+    y = modules::LayerNormModule({channels, kConvNextNormEps, true, true}).build(ctx, y, norm);
+    if (bf16) y = core::wrap_tensor(ggml_round_bf16(ctx.ggml, y.tensor), y.shape, GGML_TYPE_F32);
+    y = modules::LinearModule({channels, channels * 4, true, GGML_PREC_F32}).build(ctx, y, expansion);
+    if (bf16) y = core::wrap_tensor(ggml_round_bf16(ctx.ggml, y.tensor), y.shape, GGML_TYPE_F32);
     y = modules::GeluModule({modules::GeluApproximation::ExactErf}).build(ctx, y);
-    y = modules::LinearModule({channels * 4, channels, true, GGML_PREC_F32}).build(ctx, y, weights.pwconv2);
-    y = modules::LayerScaleModule{}.build(ctx, y, weights.gamma);
+    if (bf16) y = core::wrap_tensor(ggml_round_bf16(ctx.ggml, y.tensor), y.shape, GGML_TYPE_F32);
+    y = modules::LinearModule({channels * 4, channels, true, GGML_PREC_F32}).build(ctx, y, projection);
+    if (bf16) y = core::wrap_tensor(ggml_round_bf16(ctx.ggml, y.tensor), y.shape, GGML_TYPE_F32);
+    y = modules::LayerScaleModule{}.build(ctx, y, scale);
+    if (bf16) y = core::wrap_tensor(ggml_round_bf16(ctx.ggml, y.tensor), y.shape, GGML_TYPE_F32);
     y = modules::TransposeModule({{0, 2, 1, 3}, 3}).build(ctx, y);
     core::TensorValue x = input;
     if (x.shape.dims[2] != y.shape.dims[2]) {
         x = slice_frames(ctx, x, 0, y.shape.dims[2]);
     }
-    return modules::AddModule{}.build(ctx, x, y);
+    auto out = modules::AddModule{}.build(ctx, x, y);
+    if (bf16) out = core::wrap_tensor(ggml_round_bf16(ctx.ggml, out.tensor), out.shape, GGML_TYPE_F32);
+    return out;
+}
+
+core::TensorValue build_encoder_conv_block(
+    core::ModuleBuildContext & ctx,
+    const core::TensorValue & input,
+    const EncoderBlockWeights & block,
+    int64_t channels,
+    int stride,
+    bool bf16_input) {
+    auto x = build_residual_unit(ctx, input, block.residual1, channels, 1, nullptr, bf16_input);
+    x = build_residual_unit(ctx, x, block.residual3, channels, 3, nullptr, bf16_input);
+    x = build_residual_unit(ctx, x, block.residual9, channels, 9, nullptr, bf16_input);
+    x = modules::Snake1dModule({channels}).build(ctx, x, block.snake);
+    if (bf16_input) x = core::wrap_tensor(ggml_round_bf16(ctx.ggml, x.tensor), x.shape, GGML_TYPE_F32);
+    return causal_conv1d(ctx, x, block.conv, channels, channels * 2, 2 * stride, stride, 1, true, nullptr, bf16_input);
 }
 
 core::TensorValue build_encoder(
@@ -610,23 +772,75 @@ core::TensorValue build_encoder(
     core::ConstantTensorCache & constants,
     const core::TensorValue & input,
     const FishCodecWeights & weights) {
-    auto x = causal_conv1d(ctx, input, weights.encoder_first, 1, 64, 7, 1, 1, true);
+    const bool bf16_input = weights.encoder_bf16_compute &&
+        (weights.encoder_first.weight.type == GGML_TYPE_BF16 || weights.encoder_first.weight.type == GGML_TYPE_F16);
+    auto encoder_input = bf16_input
+        ? core::wrap_tensor(ggml_round_bf16(ctx.ggml, input.tensor), input.shape, GGML_TYPE_F32)
+        : input;
+    auto x = causal_conv1d(ctx, encoder_input, weights.encoder_first, 1, 64, 7, 1, 1, true, nullptr, bf16_input);
     int64_t channels = 64;
     const int strides[] = {2, 4, 8, 8};
     for (size_t index = 0; index < weights.encoder_blocks.size(); ++index) {
         const auto & block = weights.encoder_blocks[index];
-        x = build_residual_unit(ctx, x, block.residual1, channels, 1);
-        x = build_residual_unit(ctx, x, block.residual3, channels, 3);
-        x = build_residual_unit(ctx, x, block.residual9, channels, 9);
-        x = modules::Snake1dModule({channels}).build(ctx, x, block.snake);
-        x = causal_conv1d(ctx, x, block.conv, channels, channels * 2, 2 * strides[index], strides[index], 1, true);
+        x = build_encoder_conv_block(ctx, x, block, channels, strides[index], bf16_input);
         channels *= 2;
         if (block.transformer.has_value()) {
-            x = build_window_transformer(ctx, constants, x, *block.transformer, 512);
+            x = build_window_transformer(ctx, constants, x, *block.transformer, 512, nullptr, bf16_input);
         }
     }
     x = modules::Snake1dModule({channels}).build(ctx, x, weights.encoder_final_snake);
-    return causal_conv1d(ctx, x, weights.encoder_final, channels, kCodecDim, 3, 1, 1, true);
+    if (bf16_input) x = core::wrap_tensor(ggml_round_bf16(ctx.ggml, x.tensor), x.shape, GGML_TYPE_F32);
+    return causal_conv1d(ctx, x, weights.encoder_final, channels, kCodecDim, 3, 1, 1, true, nullptr, bf16_input);
+}
+
+// Bound convolution workspace with overlapping causal windows. The transformer
+// and quantizer still process the complete feature sequence.
+constexpr int64_t kEncoderConvHop = 512;            // product of encoder strides {2, 4, 8, 8}
+constexpr int64_t kEncodeContextSamples = 16384;    // >= conv receptive field (~6.4k samples)
+
+bool encoder_is_chunkable(const FishCodecWeights & weights) {
+    for (size_t index = 0; index + 1 < weights.encoder_blocks.size(); ++index) {
+        if (weights.encoder_blocks[index].transformer.has_value()) {
+            return false;
+        }
+    }
+    return !weights.encoder_blocks.empty();
+}
+
+core::TensorValue build_encoder_convs(
+    core::ModuleBuildContext & ctx,
+    const core::TensorValue & input,
+    const FishCodecWeights & weights,
+    bool bf16_input) {
+    auto encoder_input = bf16_input
+        ? core::wrap_tensor(ggml_round_bf16(ctx.ggml, input.tensor), input.shape, GGML_TYPE_F32)
+        : input;
+    auto x = causal_conv1d(ctx, encoder_input, weights.encoder_first, 1, 64, 7, 1, 1, true, nullptr, bf16_input);
+    int64_t channels = 64;
+    const int strides[] = {2, 4, 8, 8};
+    for (size_t index = 0; index < weights.encoder_blocks.size(); ++index) {
+        const auto & block = weights.encoder_blocks[index];
+        x = build_encoder_conv_block(ctx, x, block, channels, strides[index], bf16_input);
+        channels *= 2;
+    }
+    return x;
+}
+
+core::TensorValue build_encoder_tail(
+    core::ModuleBuildContext & ctx,
+    core::ConstantTensorCache & constants,
+    const core::TensorValue & features,
+    const FishCodecWeights & weights,
+    bool bf16_input) {
+    auto x = features;
+    const auto & last = weights.encoder_blocks.back();
+    if (last.transformer.has_value()) {
+        x = build_window_transformer(ctx, constants, x, *last.transformer, 512, nullptr, bf16_input);
+    }
+    const int64_t channels = features.shape.dims[1];
+    x = modules::Snake1dModule({channels}).build(ctx, x, weights.encoder_final_snake);
+    if (bf16_input) x = core::wrap_tensor(ggml_round_bf16(ctx.ggml, x.tensor), x.shape, GGML_TYPE_F32);
+    return causal_conv1d(ctx, x, weights.encoder_final, channels, kCodecDim, 3, 1, 1, true, nullptr, bf16_input);
 }
 
 core::TensorValue build_decoder(
@@ -656,14 +870,24 @@ core::TensorValue build_quantizer_out(
     const core::TensorValue & ids_bt,
     const QuantizerUnitWeights & weights,
     int64_t codebook_size,
-    bool streaming = false) {
+    bool streaming = false,
+    const core::TensorValue * projected_bf16 = nullptr) {
     auto emb_btd = modules::CodebookLookupModule({codebook_size, 8}).build(ctx, ids_bt, weights.codebook);
     auto emb_bdt = modules::TransposeModule({{0, 2, 1, 3}, 3}).build(ctx, emb_btd);
+    if (projected_bf16 != nullptr) {
+        auto * embedding = ggml_cast(ctx.ggml,
+            core::ensure_backend_addressable_layout(ctx, emb_bdt).tensor, GGML_TYPE_F32);
+        embedding = ggml_round_bf16(ctx.ggml, embedding);
+        auto * delta = ggml_round_bf16(ctx.ggml, ggml_sub(ctx.ggml, embedding, projected_bf16->tensor));
+        emb_bdt = core::wrap_tensor(ggml_round_bf16(ctx.ggml,
+            ggml_add(ctx.ggml, projected_bf16->tensor, delta)), emb_bdt.shape, GGML_TYPE_F32);
+    }
     if (streaming) {
         // Singleton time axes can be contiguous while retaining a non-unit stride.
         emb_bdt = core::wrap_tensor(ggml_cont(ctx.ggml, emb_bdt.tensor), emb_bdt.shape, emb_bdt.type);
     }
-    return modules::Conv1dModule({8, kCodecDim, 1, 1, 0, 1, true}).build(ctx, emb_bdt, weights.out_proj);
+    return modules::Conv1dModule({8, kCodecDim, 1, 1, 0, 1, true, projected_bf16 != nullptr})
+        .build(ctx, emb_bdt, weights.out_proj);
 }
 
 core::TensorValue build_zq_from_codes(
@@ -719,31 +943,67 @@ core::TensorValue build_encode_quantizer(
     std::vector<ggml_tensor *> & code_outputs,
     core::TensorValue * z_q_out) {
     auto x = encoder_latent;
+    const bool bf16 = weights.encoder_bf16_compute &&
+        (weights.pre_module.layers.front().attention.q_weight.type == GGML_TYPE_BF16 ||
+         weights.pre_module.layers.front().attention.q_weight.type == GGML_TYPE_F16);
     for (const auto & stage : weights.downsample) {
-        x = causal_conv1d(ctx, x, stage.first, kCodecDim, kCodecDim, 2, 2, 1, true);
-        x = build_convnext(ctx, x, stage.second, kCodecDim);
+        x = causal_conv1d(ctx, x, stage.first, kCodecDim, kCodecDim, 2, 2, 1, true, nullptr, bf16);
+        x = build_convnext(ctx, x, stage.second, kCodecDim, nullptr, bf16);
     }
-    x = build_window_transformer(ctx, constants, x, weights.pre_module, 128);
+    x = build_window_transformer(ctx, constants, x, weights.pre_module, 128, nullptr, bf16);
+    if (ctx.backend_type == core::BackendType::Cpu) {
+        x = core::ensure_backend_addressable_layout(ctx, x);
+    }
 
     auto residual = x;
     auto quantize_one = [&](const QuantizerUnitWeights & quantizer, int64_t codebook_size) {
-        auto projected = modules::Conv1dModule({kCodecDim, 8, 1, 1, 0, 1, true}).build(ctx, residual, quantizer.in_proj);
-        auto projected_btd = l2_normalize_last(ctx, modules::TransposeModule({{0, 2, 1, 3}, 3}).build(ctx, projected));
+        const bool bf16 = weights.encoder_bf16_compute &&
+            (quantizer.in_proj.weight.type == GGML_TYPE_BF16 || quantizer.in_proj.weight.type == GGML_TYPE_F16);
+        if (bf16) {
+            residual = core::ensure_backend_addressable_layout(ctx, residual);
+            residual = core::wrap_tensor(ggml_round_bf16(ctx.ggml, residual.tensor), residual.shape, GGML_TYPE_F32);
+        }
+        auto projected = modules::Conv1dModule({kCodecDim, 8, 1, 1, 0, 1, true, bf16}).build(ctx, residual, quantizer.in_proj);
+        auto projected_btd = l2_normalize_last(ctx, modules::TransposeModule({{0, 2, 1, 3}, 3}).build(ctx, projected), bf16);
         auto logits = modules::LinearModule({8, codebook_size, false, GGML_PREC_F32})
                           .build(ctx, projected_btd, {quantizer.normalized_codebook, std::nullopt});
         auto flat_logits = core::reshape_tensor(
             ctx,
             core::ensure_backend_addressable_layout(ctx, logits),
             core::TensorShape::from_dims({logits.shape.dims[1], codebook_size}));
-        auto * ids_raw = ggml_argmax(ctx.ggml, flat_logits.tensor);
+        auto * scores = flat_logits.tensor;
+        if (bf16) {
+            auto * encodings = core::ensure_backend_addressable_layout(ctx, projected_btd).tensor;
+            auto * codebook = ggml_cast(ctx.ggml, quantizer.normalized_codebook.tensor, GGML_TYPE_F32);
+            auto * encoding_norms = ggml_round_bf16(ctx.ggml,
+                ggml_sum_rows(ctx.ggml, ggml_round_bf16(ctx.ggml, ggml_sqr(ctx.ggml, encodings))));
+            auto * codebook_norms = ggml_cont(ctx.ggml, ggml_transpose(ctx.ggml,
+                ggml_round_bf16(ctx.ggml, ggml_sum_rows(ctx.ggml,
+                    ggml_round_bf16(ctx.ggml, ggml_sqr(ctx.ggml, codebook))))));
+            auto * twice_dot = ggml_scale(ctx.ggml, ggml_round_bf16(ctx.ggml, scores), 2.0F);
+            auto * distance = ggml_round_bf16(ctx.ggml,
+                ggml_sub(ctx.ggml, ggml_repeat(ctx.ggml, encoding_norms, scores), twice_dot));
+            scores = ggml_neg(ctx.ggml, ggml_round_bf16(ctx.ggml, ggml_add(ctx.ggml, distance, codebook_norms)));
+            auto * maximum = ggml_pool_2d(ctx.ggml, scores, GGML_OP_POOL_MAX,
+                codebook_size, 1, codebook_size, 1, 0, 0);
+            auto * tied = ggml_scale_bias(ctx.ggml,
+                ggml_step(ctx.ggml, ggml_sub(ctx.ggml, ggml_repeat(ctx.ggml, maximum, scores), scores)), -1.0F, 1.0F);
+            std::vector<float> priorities(static_cast<size_t>(codebook_size));
+            for (int64_t i = 0; i < codebook_size; ++i) priorities[static_cast<size_t>(i)] = static_cast<float>(codebook_size - i);
+            auto priority = constants.make_tensor(core::TensorShape::from_dims({codebook_size}), GGML_TYPE_F32,
+                priorities.data(), priorities.size() * sizeof(float));
+            scores = ggml_mul(ctx.ggml, tied, priority.tensor);
+        }
+        auto * ids_raw = ggml_argmax(ctx.ggml, scores);
         ggml_set_output(ids_raw);
         code_outputs.push_back(ids_raw);
         auto ids = core::reshape_tensor(
             ctx,
             core::wrap_tensor(ids_raw, core::TensorShape::from_dims({logits.shape.dims[1]}), GGML_TYPE_I32),
             core::TensorShape::from_dims({1, logits.shape.dims[1]}));
-        auto quantized = build_quantizer_out(ctx, ids, quantizer, codebook_size);
+        auto quantized = build_quantizer_out(ctx, ids, quantizer, codebook_size, false, bf16 ? &projected : nullptr);
         residual = core::wrap_tensor(ggml_sub(ctx.ggml, residual.tensor, quantized.tensor), residual.shape, GGML_TYPE_F32);
+        if (bf16) residual = core::wrap_tensor(ggml_round_bf16(ctx.ggml, residual.tensor), residual.shape, GGML_TYPE_F32);
     };
     quantize_one(weights.semantic_quantizer, 4096);
     for (const auto & quantizer : weights.residual_quantizers) {
@@ -756,7 +1016,20 @@ core::TensorValue build_encode_quantizer(
     return x;
 }
 
-modules::Snake1dWeights load_snake(core::BackendWeightStore & store, const assets::TensorSource & source, const std::string & name, int64_t channels) {
+modules::Snake1dWeights load_snake(core::BackendWeightStore & store, const assets::TensorSource & source, const std::string & name, int64_t channels, bool bf16 = false) {
+    if (bf16) {
+        auto alpha = source.require_f32(name + ".alpha", {1, channels, 1});
+        core::round_f32_to_bf16_in_place(alpha);
+        std::vector<float> inverse(alpha.size());
+        for (size_t i = 0; i < alpha.size(); ++i) {
+            // TorchScript fuses Snake in F32 and rounds only its output.
+            const float denominator = alpha[i] + ggml_bf16_to_fp32(ggml_fp32_to_bf16(1.0e-9F));
+            inverse[i] = 1.0F / denominator;
+        }
+        const auto shape = core::TensorShape::from_dims({1, channels, 1});
+        return {store.make_f32(shape, std::move(alpha)),
+            store.make_f32(shape, std::move(inverse))};
+    }
     return {store.make_f32(
         core::TensorShape::from_dims({channels}),
         source.require_f32(name + ".alpha", {1, channels, 1}))};
@@ -795,16 +1068,17 @@ ResidualUnitWeights load_residual_unit(
     const assets::TensorSource & source,
     const std::string & prefix,
     assets::TensorStorageType storage_type,
-    int64_t channels) {
+    int64_t channels,
+    bool bf16 = false) {
     ResidualUnitWeights out;
-    out.snake1 = load_snake(store, source, prefix + ".block.0", channels);
+    out.snake1 = load_snake(store, source, prefix + ".block.0", channels, bf16);
     out.conv1 = binding::conv1d_from_named_source(
         store,
         source,
         prefix + ".block.1.conv.weight",
         prefix + ".block.1.conv.bias",
         storage_type);
-    out.snake2 = load_snake(store, source, prefix + ".block.2", channels);
+    out.snake2 = load_snake(store, source, prefix + ".block.2", channels, bf16);
     out.conv2 = binding::conv1d_from_named_source(
         store,
         source,
@@ -841,7 +1115,8 @@ QuantizerUnitWeights load_quantizer_unit(
     const assets::TensorSource & source,
     const std::string & prefix,
     assets::TensorStorageType storage_type,
-    int64_t codebook_size) {
+    int64_t codebook_size,
+    bool encoder_bf16_compute) {
     QuantizerUnitWeights out;
     out.in_proj = binding::conv1d_from_named_source(
         store,
@@ -856,11 +1131,16 @@ QuantizerUnitWeights load_quantizer_unit(
         prefix + ".out_proj.bias",
         storage_type);
     const auto codebook = source.require_f32(prefix + ".codebook.weight", {codebook_size, 8});
+    // Reference encoding uses BF16 arithmetic independently of F16 GGUF storage.
+    const bool bf16 = encoder_bf16_compute &&
+        (out.in_proj.weight.type == GGML_TYPE_BF16 || out.in_proj.weight.type == GGML_TYPE_F16);
+    auto encoder_codebook = codebook;
+    if (bf16) core::round_f32_to_bf16_in_place(encoder_codebook);
     out.codebook = store.make_from_f32(core::TensorShape::from_dims({codebook_size, 8}), storage_type, codebook);
     out.normalized_codebook = store.make_from_f32(
         core::TensorShape::from_dims({codebook_size, 8}),
-        storage_type,
-        normalized_rows(codebook, codebook_size, 8));
+        bf16 ? assets::TensorStorageType::BF16 : storage_type,
+        normalized_rows(encoder_codebook, codebook_size, 8, bf16));
     return out;
 }
 
@@ -872,8 +1152,14 @@ std::shared_ptr<FishCodecWeights> load_weights(
     core::BackendType backend_type,
     size_t weight_context_bytes,
     assets::TensorStorageType matmul_storage_type,
-    assets::TensorStorageType conv_storage_type) {
+    assets::TensorStorageType conv_storage_type,
+    bool encoder_bf16_compute,
+    bool decoder_prepack_weights) {
     auto weights = std::make_shared<FishCodecWeights>();
+    const bool prepack = decoder_prepack_weights &&
+        (core::uses_ggml_cuda_or_hip_backend(backend_type) ||
+         backend_type == core::BackendType::Vulkan || backend_type == core::BackendType::Metal);
+    weights->encoder_bf16_compute = encoder_bf16_compute && backend_type == core::BackendType::Cuda;
     weights->store = std::make_shared<core::BackendWeightStore>(backend, backend_type, "Fish DAC codec", weight_context_bytes);
     auto & store = *weights->store;
     const auto & encoder = binding_config.encoder_prefix;
@@ -886,33 +1172,41 @@ std::shared_ptr<FishCodecWeights> load_weights(
         encoder + ".block.0.conv.weight",
         encoder + ".block.0.conv.bias",
         conv_storage_type);
+    const auto encoder_matmul_storage = weights->encoder_bf16_compute &&
+        (matmul_storage_type == assets::TensorStorageType::Native || matmul_storage_type == assets::TensorStorageType::F16) &&
+        (weights->encoder_first.weight.type == GGML_TYPE_BF16 || weights->encoder_first.weight.type == GGML_TYPE_F16)
+        ? assets::TensorStorageType::BF16 : matmul_storage_type;
+    const bool bf16_encoder = weights->encoder_bf16_compute &&
+        (weights->encoder_first.weight.type == GGML_TYPE_BF16 || weights->encoder_first.weight.type == GGML_TYPE_F16);
+    const auto encoder_conv_storage = bf16_encoder && conv_storage_type == assets::TensorStorageType::Native
+        ? assets::TensorStorageType::BF16 : conv_storage_type;
     int64_t encoder_channels = 64;
     for (int64_t block_index = 0; block_index < 4; ++block_index) {
         const std::string prefix = encoder + ".block." + std::to_string(block_index + 1) + ".block";
         EncoderBlockWeights block;
-        block.residual1 = load_residual_unit(store, source, prefix + ".0", conv_storage_type, encoder_channels);
-        block.residual3 = load_residual_unit(store, source, prefix + ".1", conv_storage_type, encoder_channels);
-        block.residual9 = load_residual_unit(store, source, prefix + ".2", conv_storage_type, encoder_channels);
-        block.snake = load_snake(store, source, prefix + ".3", encoder_channels);
+        block.residual1 = load_residual_unit(store, source, prefix + ".0", encoder_conv_storage, encoder_channels, bf16_encoder);
+        block.residual3 = load_residual_unit(store, source, prefix + ".1", encoder_conv_storage, encoder_channels, bf16_encoder);
+        block.residual9 = load_residual_unit(store, source, prefix + ".2", encoder_conv_storage, encoder_channels, bf16_encoder);
+        block.snake = load_snake(store, source, prefix + ".3", encoder_channels, bf16_encoder);
         block.conv = binding::conv1d_from_named_source(
             store,
             source,
             prefix + ".4.conv.weight",
             prefix + ".4.conv.bias",
-            conv_storage_type);
+            encoder_conv_storage);
         encoder_channels *= 2;
         if (block_index == 3) {
-            block.transformer = load_transformer(store, source, prefix + ".5", matmul_storage_type, 4);
+            block.transformer = load_transformer(store, source, prefix + ".5", encoder_matmul_storage, 4);
         }
         weights->encoder_blocks.push_back(std::move(block));
     }
-    weights->encoder_final_snake = load_snake(store, source, encoder + ".block.5", kCodecDim);
+    weights->encoder_final_snake = load_snake(store, source, encoder + ".block.5", kCodecDim, bf16_encoder);
     weights->encoder_final = binding::conv1d_from_named_source(
         store,
         source,
         encoder + ".block.6.conv.weight",
         encoder + ".block.6.conv.bias",
-        conv_storage_type);
+        encoder_conv_storage);
 
     for (int64_t i = 0; i < 2; ++i) {
         const std::string prefix = quantizer + ".downsample." + std::to_string(i);
@@ -923,16 +1217,16 @@ std::shared_ptr<FishCodecWeights> load_weights(
                 prefix + ".0.conv.weight",
                 prefix + ".0.conv.bias",
                 conv_storage_type),
-            load_convnext(store, source, prefix + ".1", matmul_storage_type, kCodecDim),
+            load_convnext(store, source, prefix + ".1", encoder_matmul_storage, kCodecDim),
         });
     }
-    weights->pre_module = load_transformer(store, source, quantizer + ".pre_module", matmul_storage_type, kCodecTransformerLayers);
+    weights->pre_module = load_transformer(store, source, quantizer + ".pre_module", encoder_matmul_storage, kCodecTransformerLayers);
     weights->semantic_quantizer = load_quantizer_unit(
         store,
         source,
         quantizer + ".semantic_quantizer.quantizers.0",
         matmul_storage_type,
-        config.semantic_codebook_size);
+        config.semantic_codebook_size, weights->encoder_bf16_compute);
     for (int64_t i = 0; i < config.quantizer_codebooks; ++i) {
         weights->residual_quantizers.push_back(
             load_quantizer_unit(
@@ -940,7 +1234,7 @@ std::shared_ptr<FishCodecWeights> load_weights(
                 source,
                 quantizer + ".quantizer.quantizers." + std::to_string(i),
                 matmul_storage_type,
-                config.residual_codebook_size));
+                config.residual_codebook_size, weights->encoder_bf16_compute));
     }
     weights->post_module = load_transformer(store, source, quantizer + ".post_module", matmul_storage_type, kCodecTransformerLayers);
     for (int64_t i = 0; i < 2; ++i) {
@@ -951,7 +1245,7 @@ std::shared_ptr<FishCodecWeights> load_weights(
                 source,
                 prefix + ".0.conv.weight",
                 prefix + ".0.conv.bias",
-                conv_storage_type),
+                conv_storage_type, prepack),
             load_convnext(store, source, prefix + ".1", matmul_storage_type, kCodecDim),
         });
     }
@@ -972,7 +1266,7 @@ std::shared_ptr<FishCodecWeights> load_weights(
             source,
             prefix + ".1.conv.weight",
             prefix + ".1.conv.bias",
-            conv_storage_type);
+            conv_storage_type, prepack);
         decoder_channels /= 2;
         block.residual1 = load_residual_unit(store, source, prefix + ".2", conv_storage_type, decoder_channels);
         block.residual3 = load_residual_unit(store, source, prefix + ".3", conv_storage_type, decoder_channels);
@@ -1007,7 +1301,7 @@ struct DecodeGraph {
           frame_capacity_(frames),
           constants_(backend_, threads_, "Fish DAC codec decode constants") {
         if (streaming) stream_ = std::make_unique<CodecStreamingState>();
-        ggml_init_params params{graph_arena_bytes, nullptr, true};
+        ggml_init_params params{streaming ? std::min(graph_arena_bytes, size_t{8 * 1024 * 1024}) : graph_arena_bytes, nullptr, true};
         ctx_.reset(ggml_init(params));
         if (ctx_ == nullptr) {
             throw std::runtime_error("failed to initialize Fish DAC codec decode graph context");
@@ -1023,7 +1317,7 @@ struct DecodeGraph {
         auto waveform = build_decoder(ctx, latent, *weights_, stream_.get());
         output_ = waveform.tensor;
         ggml_set_output(output_);
-        graph_ = ggml_new_graph_custom(ctx_.get(), 1048576, false);
+        graph_ = ggml_new_graph_custom(ctx_.get(), streaming ? 8192 : 1048576, false);
         ggml_build_forward_expand(graph_, output_);
         if (stream_) stream_->expand(graph_);
         constants_.finish_graph();
@@ -1031,6 +1325,11 @@ struct DecodeGraph {
         gallocr_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
         if (gallocr_ == nullptr || !ggml_gallocr_alloc_graph(gallocr_.get(), graph_)) {
             throw std::runtime_error("failed to allocate Fish DAC codec decode graph");
+        }
+        if (streaming) {
+            debug::timing_log_scalar("fish_codec.stream.graph_frames", frames);
+            debug::timing_log_scalar("fish_codec.stream.graph_buffer_mb",
+                static_cast<double>(ggml_gallocr_get_buffer_size(gallocr_.get(), 0)) / (1024 * 1024));
         }
     }
 
@@ -1042,15 +1341,13 @@ struct DecodeGraph {
         return frame_capacity_ >= frames && backend_ == backend && threads_ == std::max(1, threads);
     }
 
-    runtime::AudioBuffer run_stream(const FishDacCodes & codes) {
+    runtime::AudioBuffer run_stream(const FishDacCodes & codes, const DecodeGraph * previous) {
+        if (!previous) stream_->frames = 0;
+        else if (previous != this) stream_->import_from(backend_, *previous->stream_);
         stream_->prepare(backend_);
         auto audio = run(codes);
         stream_->commit(backend_);
         return audio;
-    }
-
-    void reset_stream() {
-        stream_->frames = 0;
     }
 
     runtime::AudioBuffer run(const FishDacCodes & codes) {
@@ -1205,6 +1502,23 @@ private:
     core::ConstantTensorCache constants_;
 };
 
+void set_encoder_matmul_precision(
+    ggml_cgraph * graph,
+    core::BackendType backend_type,
+    bool encoder_f32_accumulation) {
+    if (!encoder_f32_accumulation || backend_type != core::BackendType::Vulkan) {
+        return;
+    }
+    // Preserve F16 storage while avoiding F16 accumulation during reference encoding.
+    for (int node = 0; node < ggml_graph_n_nodes(graph); ++node) {
+        auto * tensor = ggml_graph_node(graph, node);
+        if (tensor->op == GGML_OP_MUL_MAT && tensor->src[0]->type == GGML_TYPE_F16 &&
+            tensor->src[1]->type == GGML_TYPE_F16) {
+            ggml_mul_mat_set_prec(tensor, GGML_PREC_F32);
+        }
+    }
+}
+
 struct EncodeGraph {
     EncodeGraph(
         FishDacCodecConfig config,
@@ -1213,7 +1527,8 @@ struct EncodeGraph {
         size_t graph_arena_bytes,
         int64_t samples,
         int64_t frames,
-        bool want_latents)
+        bool want_latents,
+        bool encoder_f32_accumulation)
         : config_(std::move(config)),
           weights_(std::move(weights)),
           backend_(execution_context.backend()),
@@ -1252,6 +1567,7 @@ struct EncodeGraph {
         for (ggml_tensor * code_output : code_outputs_) {
             ggml_build_forward_expand(graph_, code_output);
         }
+        set_encoder_matmul_precision(graph_, backend_type_, encoder_f32_accumulation);
         constants_.finish_graph();
         constants_.ensure_uploaded();
         gallocr_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
@@ -1341,6 +1657,171 @@ private:
     core::ConstantTensorCache constants_;
 };
 
+// One cached waveform window -> convolution features.
+struct EncodeConvGraph {
+    EncodeConvGraph(
+        std::shared_ptr<const FishCodecWeights> weights,
+        core::ExecutionContext & execution_context,
+        size_t graph_arena_bytes,
+        int64_t window_samples,
+        bool bf16_input,
+        bool encoder_f32_accumulation)
+        : weights_(std::move(weights)),
+          backend_(execution_context.backend()),
+          backend_type_(execution_context.backend_type()),
+          threads_(std::max(1, execution_context.config().threads)),
+          window_samples_(window_samples),
+          bf16_input_(bf16_input) {
+        ggml_init_params params{graph_arena_bytes, nullptr, true};
+        ctx_.reset(ggml_init(params));
+        if (ctx_ == nullptr) {
+            throw std::runtime_error("failed to initialize Fish DAC codec encode-conv graph context");
+        }
+        core::ModuleBuildContext ctx{ctx_.get(), "fish_audio.codec.encode_convs", backend_type_};
+        input_ = core::make_tensor(ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, 1, window_samples_}));
+        ggml_set_input(input_.tensor);
+        auto features = build_encoder_convs(ctx, input_, *weights_, bf16_input_);
+        channels_ = features.shape.dims[1];
+        frames_ = features.shape.dims[2];
+        output_ = core::ensure_backend_addressable_layout(ctx, features).tensor;
+        ggml_set_output(output_);
+        graph_ = ggml_new_graph_custom(ctx_.get(), 1048576, false);
+        ggml_build_forward_expand(graph_, output_);
+        set_encoder_matmul_precision(graph_, backend_type_, encoder_f32_accumulation);
+        gallocr_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
+        if (gallocr_ == nullptr || !ggml_gallocr_alloc_graph(gallocr_.get(), graph_)) {
+            throw std::runtime_error("failed to allocate Fish DAC codec encode-conv graph");
+        }
+    }
+
+    ~EncodeConvGraph() {
+        engine::core::release_backend_graph_resources(backend_, graph_);
+    }
+
+    bool matches(int64_t window_samples, ggml_backend_t backend, int threads) const {
+        return window_samples_ == window_samples && backend_ == backend && threads_ == std::max(1, threads);
+    }
+
+    int64_t window_samples() const { return window_samples_; }
+    int64_t channels() const { return channels_; }
+    int64_t frames() const { return frames_; }
+
+    // Returns channel-major features: value(c, t) at index c * frames() + t.
+    std::vector<float> run(const std::vector<float> & window) {
+        core::write_tensor_f32(input_, window);
+        core::set_backend_threads(backend_, threads_);
+        const ggml_status status = engine::core::compute_backend_graph(backend_, graph_);
+        ggml_backend_synchronize(backend_);
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Fish DAC codec encode-conv graph compute failed");
+        }
+        return core::read_tensor_f32(output_);
+    }
+
+private:
+    std::shared_ptr<const FishCodecWeights> weights_;
+    ggml_backend_t backend_ = nullptr;
+    core::BackendType backend_type_ = core::BackendType::Cpu;
+    int threads_ = 1;
+    int64_t window_samples_ = 0;
+    bool bf16_input_ = false;
+    int64_t channels_ = 0;
+    int64_t frames_ = 0;
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
+    core::TensorValue input_;
+    ggml_tensor * output_ = nullptr;
+    ggml_cgraph * graph_ = nullptr;
+    std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, GgmlGallocrDeleter> gallocr_;
+};
+
+// Complete convolution features -> reference codes.
+struct EncodeTailGraph {
+    EncodeTailGraph(
+        std::shared_ptr<const FishCodecWeights> weights,
+        core::ExecutionContext & execution_context,
+        size_t graph_arena_bytes,
+        int64_t channels,
+        int64_t feature_frames,
+        bool bf16_input,
+        bool encoder_f32_accumulation)
+        : weights_(std::move(weights)),
+          backend_(execution_context.backend()),
+          backend_type_(execution_context.backend_type()),
+          threads_(std::max(1, execution_context.config().threads)),
+          feature_frames_(feature_frames),
+          bf16_input_(bf16_input),
+          constants_(backend_, threads_, "Fish DAC codec encode-tail constants") {
+        ggml_init_params params{graph_arena_bytes, nullptr, true};
+        ctx_.reset(ggml_init(params));
+        if (ctx_ == nullptr) {
+            throw std::runtime_error("failed to initialize Fish DAC codec encode-tail graph context");
+        }
+        core::ModuleBuildContext ctx{ctx_.get(), "fish_audio.codec.encode_tail", backend_type_};
+        constants_.begin_graph();
+        input_ = core::make_tensor(ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, channels, feature_frames_}));
+        ggml_set_input(input_.tensor);
+        auto encoded = build_encoder_tail(ctx, constants_, input_, *weights_, bf16_input_);
+        build_encode_quantizer(ctx, constants_, encoded, *weights_, code_outputs_, nullptr);
+        graph_ = ggml_new_graph_custom(ctx_.get(), 1048576, false);
+        for (ggml_tensor * code_output : code_outputs_) {
+            ggml_build_forward_expand(graph_, code_output);
+        }
+        set_encoder_matmul_precision(graph_, backend_type_, encoder_f32_accumulation);
+        constants_.finish_graph();
+        constants_.ensure_uploaded();
+        gallocr_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
+        if (gallocr_ == nullptr || !ggml_gallocr_alloc_graph(gallocr_.get(), graph_)) {
+            throw std::runtime_error("failed to allocate Fish DAC codec encode-tail graph");
+        }
+    }
+
+    ~EncodeTailGraph() {
+        engine::core::release_backend_graph_resources(backend_, graph_);
+    }
+
+    bool matches(int64_t feature_frames, ggml_backend_t backend, int threads) const {
+        return feature_frames_ == feature_frames && backend_ == backend && threads_ == std::max(1, threads);
+    }
+
+    FishDacCodes run(const std::vector<float> & features, int64_t frames) {
+        core::write_tensor_f32(input_, features);
+        core::set_backend_threads(backend_, threads_);
+        const ggml_status status = engine::core::compute_backend_graph(backend_, graph_);
+        ggml_backend_synchronize(backend_);
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Fish DAC codec encode-tail graph compute failed");
+        }
+        FishDacCodes out;
+        out.codebooks = static_cast<int64_t>(code_outputs_.size());
+        out.frames = frames;
+        out.codes.resize(static_cast<size_t>(out.codebooks * out.frames));
+        for (int64_t codebook = 0; codebook < out.codebooks; ++codebook) {
+            auto values = core::read_tensor_i32(code_outputs_[static_cast<size_t>(codebook)]);
+            if (static_cast<int64_t>(values.size()) < frames) {
+                throw std::runtime_error("Fish DAC codec encode-tail produced too few frames");
+            }
+            for (int64_t frame = 0; frame < frames; ++frame) {
+                out.codes[static_cast<size_t>(codebook * frames + frame)] = values[static_cast<size_t>(frame)];
+            }
+        }
+        return out;
+    }
+
+private:
+    std::shared_ptr<const FishCodecWeights> weights_;
+    ggml_backend_t backend_ = nullptr;
+    core::BackendType backend_type_ = core::BackendType::Cpu;
+    int threads_ = 1;
+    int64_t feature_frames_ = 0;
+    bool bf16_input_ = false;
+    core::ConstantTensorCache constants_;
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
+    core::TensorValue input_;
+    std::vector<ggml_tensor *> code_outputs_;
+    ggml_cgraph * graph_ = nullptr;
+    std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, GgmlGallocrDeleter> gallocr_;
+};
+
 }  // namespace
 
 struct FishDacCodecComponent::Impl {
@@ -1354,13 +1835,25 @@ public:
         std::shared_ptr<const FishDacCodecComponent> component,
         core::BackendConfig backend,
         int threads,
-        size_t graph_arena_bytes)
+        size_t graph_arena_bytes,
+        bool encoder_f32_accumulation,
+        int64_t encoder_chunk_samples)
         : component_(std::move(component)),
           execution_(std::move(backend)),
           threads_(std::max(1, threads)),
-          graph_arena_bytes_(graph_arena_bytes) {
+          graph_arena_bytes_(graph_arena_bytes),
+          encoder_f32_accumulation_(encoder_f32_accumulation),
+          encoder_chunk_samples_(encoder_chunk_samples) {
         if (component_ == nullptr || component_->impl_ == nullptr || component_->impl_->weights == nullptr) {
             throw std::runtime_error("Fish DAC codec runtime requires a loaded codec component");
+        }
+        if (encoder_chunk_samples_ < 0 || encoder_chunk_samples_ % kEncoderConvHop != 0) {
+            throw std::invalid_argument("Fish DAC codec encoder_chunk_samples must be 0 or a positive multiple of 512 samples");
+        }
+        if (encoder_chunk_samples_ > 0 &&
+            (component_->impl_->config.frame_length % kEncoderConvHop != 0 ||
+             !encoder_is_chunkable(*component_->impl_->weights))) {
+            throw std::invalid_argument("Fish DAC codec chunked encoding requires hop-aligned frames and a convolution stack with no intermediate transformers");
         }
     }
 
@@ -1369,6 +1862,10 @@ public:
         auto mono = prepare_codec_mono(audio, config.sample_rate);
         const int64_t samples = ceil_div(static_cast<int64_t>(mono.size()), config.frame_length) * config.frame_length;
         const int64_t frames = ceil_div(static_cast<int64_t>(mono.size()), config.frame_length);
+        if (encoder_chunk_samples_ > 0 && samples > encoder_chunk_samples_ &&
+            samples - encoder_chunk_samples_ > kEncodeContextSamples) {
+            return encode_codes_chunked(std::move(mono), samples, frames, encoder_chunk_samples_);
+        }
         if (encode_graph_ == nullptr || !encode_graph_->matches(samples, frames, execution_.backend(), threads_, false)) {
             encode_graph_.reset();
             encode_graph_ = std::make_unique<EncodeGraph>(
@@ -1378,9 +1875,60 @@ public:
                 graph_arena_bytes_,
                 samples,
                 frames,
-                false);
+                false,
+                encoder_f32_accumulation_);
         }
         return encode_graph_->run(audio);
+    }
+
+    // Keep the first window's boundary padding; subsequent windows discard left context.
+    FishDacCodes encode_codes_chunked(std::vector<float> mono, int64_t samples, int64_t frames, int64_t chunk) {
+        const auto & weights = component_->impl_->weights;
+        const int64_t window = kEncodeContextSamples + chunk;
+        mono.resize(static_cast<size_t>(samples), 0.0F);
+        const bool bf16 = weights->encoder_bf16_compute &&
+            (weights->encoder_first.weight.type == GGML_TYPE_BF16 || weights->encoder_first.weight.type == GGML_TYPE_F16);
+        if (encode_conv_graph_ == nullptr || !encode_conv_graph_->matches(window, execution_.backend(), threads_)) {
+            encode_conv_graph_.reset();
+            encode_conv_graph_ = std::make_unique<EncodeConvGraph>(
+                weights, execution_, graph_arena_bytes_, window, bf16, encoder_f32_accumulation_);
+        }
+        const int64_t channels = encode_conv_graph_->channels();
+        const int64_t window_frames = encode_conv_graph_->frames();
+        if (window_frames * kEncoderConvHop != window) {
+            throw std::runtime_error("Fish DAC codec encode-conv window is not hop-aligned");
+        }
+        const int64_t total_frames = samples / kEncoderConvHop;
+        std::vector<float> features(static_cast<size_t>(channels * total_frames), 0.0F);
+        std::vector<float> buffer(static_cast<size_t>(window));
+        for (int64_t k = 0;; ++k) {
+            const int64_t start = k * chunk;
+            const int64_t keep_from = k == 0 ? 0 : kEncodeContextSamples / kEncoderConvHop;
+            const int64_t global0 = (start / kEncoderConvHop) + keep_from;
+            std::fill(buffer.begin(), buffer.end(), 0.0F);
+            const int64_t n = std::min(window, samples - start);
+            std::copy_n(mono.begin() + start, n, buffer.begin());
+            const auto values = encode_conv_graph_->run(buffer);
+            for (int64_t c = 0; c < channels; ++c) {
+                for (int64_t t = keep_from; t < window_frames; ++t) {
+                    const int64_t g = global0 + (t - keep_from);
+                    if (g >= total_frames) {
+                        break;
+                    }
+                    features[static_cast<size_t>(c * total_frames + g)] =
+                        values[static_cast<size_t>(c * window_frames + t)];
+                }
+            }
+            if (start + window >= samples) {
+                break;
+            }
+        }
+        if (encode_tail_graph_ == nullptr || !encode_tail_graph_->matches(total_frames, execution_.backend(), threads_)) {
+            encode_tail_graph_.reset();
+            encode_tail_graph_ = std::make_unique<EncodeTailGraph>(
+                weights, execution_, graph_arena_bytes_, channels, total_frames, bf16, encoder_f32_accumulation_);
+        }
+        return encode_tail_graph_->run(features, frames);
     }
 
     FishDacLatents encode_latents(const runtime::AudioBuffer & audio) {
@@ -1397,7 +1945,8 @@ public:
                 graph_arena_bytes_,
                 samples,
                 frames,
-                true);
+                true,
+                encoder_f32_accumulation_);
         }
         (void)encode_graph_->run(audio);
         return encode_graph_->read_latents(frames);
@@ -1417,19 +1966,29 @@ public:
     }
 
     runtime::AudioBuffer decode_stream(const FishDacCodes & codes) {
-        if (codes.frames != 1) {
-            throw std::runtime_error("Fish DAC streaming decode requires one codec frame");
+        if (codes.frames <= 0) {
+            throw std::runtime_error("Fish DAC streaming decode requires positive codec frames");
         }
-        if (!stream_decode_graph_) {
-            stream_decode_graph_ = std::make_unique<DecodeGraph>(
+        auto found = std::find_if(stream_decode_graphs_.begin(), stream_decode_graphs_.end(),
+            [&](const auto & entry) { return entry.first == codes.frames; });
+        if (found == stream_decode_graphs_.end()) {
+            auto graph = std::make_unique<DecodeGraph>(
                 component_->impl_->config, component_->impl_->weights,
-                execution_, graph_arena_bytes_, 1, true);
+                execution_, graph_arena_bytes_, codes.frames, true);
+            stream_decode_graphs_.emplace_front(codes.frames, std::move(graph));
+        } else {
+            stream_decode_graphs_.splice(stream_decode_graphs_.begin(), stream_decode_graphs_, found);
         }
-        return stream_decode_graph_->run_stream(codes);
+        auto * graph = stream_decode_graphs_.front().second.get();
+        auto audio = graph->run_stream(codes, stream_decode_last_);
+        stream_decode_last_ = graph;
+        // Growth shapes and one final partial batch stay cached between requests.
+        while (stream_decode_graphs_.size() > 6) stream_decode_graphs_.pop_back();
+        return audio;
     }
 
     void reset_decode_stream() {
-        if (stream_decode_graph_) stream_decode_graph_->reset_stream();
+        stream_decode_last_ = nullptr;
     }
 
     runtime::AudioBuffer decode_latents(const FishDacLatents & latents) {
@@ -1456,18 +2015,24 @@ public:
     void release_decode_graphs() {
         decode_graph_.reset();
         latent_decode_graph_.reset();
-        stream_decode_graph_.reset();
+        stream_decode_last_ = nullptr;
+        stream_decode_graphs_.clear();
     }
 
     void release_encode_graph() {
         encode_graph_.reset();
+        encode_conv_graph_.reset();
+        encode_tail_graph_.reset();
     }
 
     void release_runtime_graphs() {
         encode_graph_.reset();
+        encode_conv_graph_.reset();
+        encode_tail_graph_.reset();
         decode_graph_.reset();
         latent_decode_graph_.reset();
-        stream_decode_graph_.reset();
+        stream_decode_last_ = nullptr;
+        stream_decode_graphs_.clear();
     }
 
 private:
@@ -1475,9 +2040,14 @@ private:
     core::ExecutionContext execution_;
     int threads_ = 1;
     size_t graph_arena_bytes_ = 0;
+    bool encoder_f32_accumulation_ = false;
+    int64_t encoder_chunk_samples_ = 0;
     std::unique_ptr<EncodeGraph> encode_graph_;
+    std::unique_ptr<EncodeConvGraph> encode_conv_graph_;
+    std::unique_ptr<EncodeTailGraph> encode_tail_graph_;
     std::unique_ptr<DecodeGraph> decode_graph_;
-    std::unique_ptr<DecodeGraph> stream_decode_graph_;
+    std::list<std::pair<int64_t, std::unique_ptr<DecodeGraph>>> stream_decode_graphs_;
+    DecodeGraph * stream_decode_last_ = nullptr;
     std::unique_ptr<LatentDecodeGraph> latent_decode_graph_;
 };
 
@@ -1502,7 +2072,9 @@ std::shared_ptr<const FishDacCodecComponent> FishDacCodecComponent::load_from_te
         backend_type,
         options.weight_context_bytes,
         options.matmul_weight_storage_type,
-        options.conv_weight_storage_type);
+        options.conv_weight_storage_type,
+        options.encoder_bf16_compute,
+        options.decoder_prepack_weights);
     return std::shared_ptr<const FishDacCodecComponent>(new FishDacCodecComponent(std::move(impl)));
 }
 
@@ -1519,12 +2091,16 @@ FishDacCodecRuntime::FishDacCodecRuntime(
     std::shared_ptr<const FishDacCodecComponent> component,
     core::BackendConfig backend,
     int threads,
-    size_t graph_arena_bytes)
+    size_t graph_arena_bytes,
+    bool encoder_f32_accumulation,
+    int64_t encoder_chunk_samples)
     : impl_(std::make_unique<Impl>(
           std::move(component),
           std::move(backend),
           threads,
-          graph_arena_bytes)) {}
+          graph_arena_bytes,
+          encoder_f32_accumulation,
+          encoder_chunk_samples)) {}
 
 FishDacCodecRuntime::~FishDacCodecRuntime() = default;
 

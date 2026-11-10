@@ -20,7 +20,7 @@ class KokoroIstftNetDecoderRuntime {
 public:
     // `rknn_generator_path` (optional) routes the generator stage to a pre-compiled
     // RKNN engine; see engine/models/kokoro_tts/rknn_generator.h.
-    // `rknn_generator_overlap` / `rknn_generator_gain` are the measured knobs on that
+    // `rknn_generator_overlap` / `rknn_generator_gain` come from exec_plan.params on that
     // sidecar's window walk (overlap-blend / per-window loudness correction); both
     // default to the shipping walk.
     KokoroIstftNetDecoderRuntime(
@@ -32,7 +32,8 @@ public:
         KokoroIstftNetDecoderCapacityContract contract,
         const std::string & rknn_generator_path = {},
         int64_t rknn_generator_overlap = 0,
-        bool rknn_generator_gain = false);
+        bool rknn_generator_gain = false,
+        bool neon_generator = false);
     ~KokoroIstftNetDecoderRuntime();
 
     KokoroIstftNetDecoderRuntime(const KokoroIstftNetDecoderRuntime &) = delete;

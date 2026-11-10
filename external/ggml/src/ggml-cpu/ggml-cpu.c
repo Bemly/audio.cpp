@@ -394,6 +394,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+    [GGML_TYPE_TQ2_1] = {
+        .from_float               = quantize_row_tq2_1,
+        .vec_dot                  = ggml_vec_dot_tq2_1_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_TQ2_0] = {
         .from_float               = quantize_row_tq2_0,
         .vec_dot                  = ggml_vec_dot_tq2_0_q8_K,
@@ -2114,6 +2120,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
             } break;
+        case GGML_OP_SSM_CONV_CAUSAL_SILU:
+            {
+                ggml_compute_forward_ssm_conv_causal_silu(params, tensor);
+            } break;
+        case GGML_OP_SSM_SCAN_MAMBA1:
+            {
+                ggml_compute_forward_ssm_scan_mamba1(params, tensor);
+            } break;
         case GGML_OP_WIN_PART:
             {
                 ggml_compute_forward_win_part(params, tensor);
@@ -2515,6 +2529,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_SSM_CONV_CAUSAL_SILU:
+        case GGML_OP_SSM_SCAN_MAMBA1:
             {
                 n_tasks = n_threads;
             } break;

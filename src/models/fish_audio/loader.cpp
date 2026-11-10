@@ -45,10 +45,13 @@ runtime::ModelCliInterface cli(const FishAudioAssets &) {
         {"seed", "N", "Sampling seed for reproducible output; omitted uses a random seed.", false, std::nullopt, "0"},
     };
     out.session_options = {
+        {"fish_audio.lora", "path", "Prepared Fish Speech adapter checkpoint; merged into slow/fast decoder and embedding weights at session creation. Codec weights are unchanged.", false},
+        {"fish_audio.lora_scale", "float", "Multiplier for the adapter's alpha/r scaling; default 1.", false, "1"},
         {"fish_audio.mem_saver", "true|false", "Release cached AR runtime graphs after each request; default false.", false, "false"},
         {"fish_audio.reference_cache_slots", "n", "Prepared reference-audio cache slots; default 1.", false, "1", "0"},
         {"fish_audio.weight_type", "native|f32|f16|bf16|q8_0", "AR matmul weight storage type; default native.", false, "native"},
         {"fish_audio.codec_weight_type", "native|f32|f16|q8_0", "Codec conv/matmul weight storage type; default native.", false, "native"},
+        {"fish_audio.codec_encoder_bf16_compute", "true|false", "Use BF16 reference-encoder arithmetic on CUDA with F16/BF16 codec weights; default false. Decoding is unchanged.", false, "false"},
         {"fish_audio.ar_graph_arena_mb", "int", "AR runtime graph arena size in MiB; default 512.", false, "512", "1"},
         {"fish_audio.ar_weight_context_mb", "int", "AR weight context size in MiB; default 32.", false, "32", "1"},
         {"fish_audio.codec_graph_arena_mb", "int", "Codec encode/decode graph arena size in MiB; default 512.", false, "512", "1"},

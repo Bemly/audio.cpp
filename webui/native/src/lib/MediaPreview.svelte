@@ -1,16 +1,18 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
 
-  export let file: File | null = null;
+  export let file: Blob | null = null;
   export let src = '';
   export let name = '';
-  export let kind: 'audio' | 'video' = 'audio';
+  export let kind: 'audio' | 'video' | 'image' = 'audio';
   export let label = 'Preview';
 
   let objectUrl = '';
-  let lastFile: File | null = null;
+  let lastFile: Blob | null = null;
+  let failedUrl = '';
   $: previewUrl = objectUrl || src;
-  $: previewName = file?.name || name;
+  $: failed = Boolean(previewUrl) && failedUrl === previewUrl;
+  $: previewName = name || (file instanceof File ? file.name : '');
 
   function clearObjectUrl() {
     if (objectUrl) {
@@ -28,17 +30,19 @@
   onDestroy(clearObjectUrl);
 </script>
 
-{#if previewUrl}
+{#if previewUrl && !failed}
   <div class="media-preview">
     <div class="media-preview-header">
       <strong>{label}</strong>
       {#if previewName}<span>{previewName}</span>{/if}
     </div>
-    {#if kind === 'video'}
+    {#if kind === 'image'}
+      <img src={previewUrl} alt={label} on:error={() => (failedUrl = previewUrl)} />
+    {:else if kind === 'video'}
       <!-- svelte-ignore a11y_media_has_caption -->
-      <video controls preload="metadata" src={previewUrl}></video>
+      <video controls preload="metadata" src={previewUrl} on:error={() => (failedUrl = previewUrl)}></video>
     {:else}
-      <audio controls src={previewUrl}></audio>
+      <audio controls src={previewUrl} on:error={() => (failedUrl = previewUrl)}></audio>
     {/if}
   </div>
 {/if}
@@ -78,6 +82,13 @@
   audio {
     width: 100%;
     height: 38px;
+  }
+
+  img {
+    width: 100%;
+    max-height: 18rem;
+    object-fit: contain;
+    border-radius: .25rem;
   }
 
   video {

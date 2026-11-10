@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -89,6 +90,14 @@ struct LlamaBpeAddedToken {
     bool rstrip = false;
 };
 
+// A llama.cpp GGUF's tokenizer.ggml.tokens, .merges and .token_type.
+struct LlamaBpeGgufVocabulary {
+    std::vector<std::string> tokens;
+    std::vector<std::string> merges;
+    std::vector<int32_t> token_types;
+    bool ignore_merges = false;  // tokenizer.json model.ignore_merges, which the GGUF does not store
+};
+
 struct LlamaBpeTokenizerSpec {
     LlamaBpeTokenizerSpec(
         std::filesystem::path vocab_path_ = {},
@@ -97,14 +106,16 @@ struct LlamaBpeTokenizerSpec {
         std::optional<std::filesystem::path> tokenizer_json_path_ = std::nullopt,
         LlamaBpePreTokenizer pre_type_ = LlamaBpePreTokenizer::Gpt2,
         std::vector<LlamaBpeAddedToken> additional_special_tokens_ = {},
-        std::string normalizer_space_replacement_ = {})
+        std::string normalizer_space_replacement_ = {},
+        bool honor_ignore_merges_ = false)
         : vocab_path(std::move(vocab_path_)),
           merges_path(std::move(merges_path_)),
           tokenizer_config_path(std::move(tokenizer_config_path_)),
           tokenizer_json_path(std::move(tokenizer_json_path_)),
           pre_type(pre_type_),
           additional_special_tokens(std::move(additional_special_tokens_)),
-          normalizer_space_replacement(std::move(normalizer_space_replacement_)) {}
+          normalizer_space_replacement(std::move(normalizer_space_replacement_)),
+          honor_ignore_merges(honor_ignore_merges_) {}
 
     std::filesystem::path vocab_path;
     std::filesystem::path merges_path;
@@ -113,6 +124,17 @@ struct LlamaBpeTokenizerSpec {
     LlamaBpePreTokenizer pre_type = LlamaBpePreTokenizer::Gpt2;
     std::vector<LlamaBpeAddedToken> additional_special_tokens;
     std::string normalizer_space_replacement;
+    // Apply tokenizer.json model.ignore_merges (a pre-token that is a whole vocab entry is used as is). Off by
+    // default so families tuned against the merges-only behaviour keep their ids.
+    bool honor_ignore_merges = false;
+    // Used instead of the files when set.
+    std::optional<LlamaBpeGgufVocabulary> gguf_vocabulary;
+    // Optional model-owned splitter over raw UTF-8 fragments. Return pieces
+    // in the selected tokenizer's BPE representation, including its byte
+    // alphabet encoding when applicable. Added-token matching runs first.
+    // Empty preserves the selected pre_type.
+    // Shared tokenizer instances require a deterministic, thread-safe callback.
+    std::function<std::vector<std::string>(const std::string &)> pre_tokenize;
 };
 
 class LlamaBpeTokenizer final : public ITokenizer {
@@ -127,6 +149,7 @@ public:
     std::string decode(const std::vector<int32_t> & token_ids, bool skip_special_tokens = false) const;
 
     std::optional<int32_t> find_token_id(const std::string & token) const;
+    bool contains_token_id(int32_t token_id) const noexcept;
     bool is_special_token_id(int32_t token_id) const;
     bool is_control_token_id(int32_t token_id) const;
     std::optional<int32_t> configured_pad_token_id() const noexcept;

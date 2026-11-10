@@ -2,6 +2,7 @@
 
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/debug/trace.h"
+#include "engine/framework/runtime/kv_cache.h"
 #include "engine/framework/runtime/options.h"
 #include "engine/framework/sampling/torch_random.h"
 #include "engine/models/higgs_audio_tts/codebooks.h"
@@ -10,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -19,22 +21,6 @@ namespace engine::models::higgs_audio_tts {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-
-constexpr int64_t kInitialGeneratedCacheSteps = 128;
-constexpr int64_t kMinimumCacheBucketSteps = 128;
-
-int64_t bucketed_initial_cache_steps(int64_t prompt_steps, int64_t max_tokens) {
-    const int64_t maximum = prompt_steps + max_tokens;
-    const int64_t required = prompt_steps + std::min(max_tokens, kInitialGeneratedCacheSteps);
-    int64_t bucket = kMinimumCacheBucketSteps;
-    while (bucket < required && bucket <= maximum / 2) {
-        bucket *= 2;
-    }
-    if (bucket < required) {
-        bucket = required;
-    }
-    return std::min(bucket, maximum);
-}
 
 void validate_generation_options(const HiggsGenerationOptions & options) {
     if (options.max_tokens <= 0) {
@@ -391,7 +377,8 @@ HiggsGenerationResult HiggsGenerator::generate(
     engine::debug::trace_log_scalar("higgs_audio_tts.generator.reference_prefix_cache_hit", reference_cache_hit);
     engine::debug::trace_log_scalar("higgs_audio_tts.generator.reference_prefix_steps", prepared.prefix_steps);
     const int64_t max_cache_steps = prompt_steps + request.options.max_tokens;
-    const int64_t initial_cache_steps = bucketed_initial_cache_steps(prompt_steps, request.options.max_tokens);
+    const int64_t initial_cache_steps =
+        engine::runtime::bucketed_cache_steps(prompt_steps, request.options.max_tokens);
     const bool cache_rebuild =
         ar_kv_cache_ == nullptr || !ar_kv_cache_->can_run(*ar_, initial_cache_steps) ||
         ar_kv_cache_->cache_steps() != initial_cache_steps;
@@ -445,6 +432,7 @@ HiggsGenerationResult HiggsGenerator::generate(
     sampling.temperature = request.options.temperature;
     sampling.top_p = request.options.top_p;
     sampling.top_k = request.options.top_k;
+    sampling.filter_nan_logits = request.options.filter_nan_logits;
     // Python accepts repetition_penalty on the public speech request, but the
     // Higgs audio-codebook sampler does not consume it.
     sampling.has_seed = request.options.seed.has_value();
@@ -559,11 +547,21 @@ HiggsGenerationResult HiggsGenerator::generate(
     engine::debug::timing_log_scalar("higgs_audio_tts.generator.decode_ms",
                                      engine::debug::elapsed_ms(decode_start, Clock::now()));
     if (!state.generation_done) {
-        throw std::runtime_error(
+        if (!request.options.allow_incomplete_generation) {
+            throw std::runtime_error(
+                "Higgs TTS generation reached max_tokens (" + std::to_string(request.options.max_tokens) +
+                ") before EOC for this text chunk; raise it with --max-tokens on the CLI or "
+                "the \"max_tokens\" request option on the server, or lower --text-chunk-size / "
+                "\"text_chunk_size\" so each chunk needs fewer generated frames");
+        }
+        const std::string warning =
             "Higgs TTS generation reached max_tokens (" + std::to_string(request.options.max_tokens) +
-            ") before EOC for this text chunk; raise it with --max-tokens on the CLI or "
-            "the \"max_tokens\" request option on the server, or lower --text-chunk-size / "
-            "\"text_chunk_size\" so each chunk needs fewer generated frames");
+            ") before EOC for this text chunk; returning incomplete audio because "
+            "allow_incomplete_generation=true. Audio may be truncated or contain silence/noise.";
+        engine::debug::log_message(engine::debug::LogLevel::Warning, "higgs_audio_tts", warning);
+        if (!engine::debug::log_enabled()) {
+            std::cerr << "[warning][higgs_audio_tts] " << warning << '\n';
+        }
     }
 
     result.raw_codes = reverse_higgs_delay_pattern(

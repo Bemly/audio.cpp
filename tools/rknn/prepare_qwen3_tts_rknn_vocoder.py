@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build the stateful RKNN speech decoder (vocoder) for the Qwen3-TTS family.
 
-The runtime side (``src/models/qwen3_tts/rknn_speech_decoder.cpp``, session options
-``qwen3_tts.rknn_decoder`` / ``qwen3_tts.rknn_decoder_first``) runs one compiled RKNN step graph
+The runtime side (``src/models/qwen3_tts/rknn_speech_decoder.cpp``, session option
+``qwen3_tts.exec_plan``) runs one compiled RKNN step graph
 in place of the ggml speech tokenizer decoder. Nothing in this repository produces that graph, so
 this script is its only producer: it re-traces the WavTokenizer-v2 decoder from the
 ``Qwen/Qwen3-TTS-12Hz-0.6B-Base`` Hugging Face checkpoint (the ``speech_tokenizer`` subdirectory,
@@ -15,7 +15,7 @@ from continuous state and there are no chunk seams. Four inputs
 ``audio_codes [1,16,B] int64`` / ``freqs_in [B,head_dim/2] fp32`` / ``cache_valid [1] fp32`` /
 ``cache_in [N] fp32``, two outputs ``audio_values`` / ``cache_out``, ``1920`` samples per token at
 24 kHz. ``N`` does not depend on ``B``, so a small-B step's cache feeds a large-B step directly —
-that is what ``qwen3_tts.rknn_decoder_first`` uses.
+that is what the execution plan's optional ``artifacts.first`` uses.
 
 Requirements (host, x86_64, dedicated venv — the RKNN toolkit pins its own numpy/onnx/torch):
   pip install torch onnx onnxruntime numpy
@@ -31,6 +31,7 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -250,6 +251,7 @@ def build_stateful_decoder(dec, B):
 
 
 def export_onnx(args):
+    from rknn_build import report_engine
     import numpy as np
     import torch
 
@@ -305,6 +307,9 @@ def export_onnx(args):
         return None
 
     out = args.output or f"vocoder_stateful_{B}.onnx"
+    if out.endswith(".rknn"):
+        # --output names the compiled engine; the ONNX lands beside it.
+        out = os.path.splitext(out)[0] + ".onnx"
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     dummy_c = torch.randint(0, 2048, (1, 16, B), dtype=torch.int64)
     dummy_cache = torch.zeros(step.cache_numel, dtype=torch.float32)
@@ -321,7 +326,7 @@ def export_onnx(args):
         do_constant_folding=True,
         dynamo=False,
     )
-    print(f"saved {out} ({os.path.getsize(out) / 1e6:.1f} MB)")
+    report_engine(out)
 
     # Preflight for the converter stage: rknn-toolkit2 2.3.2's fold_constant aborts (core dump,
     # no Python traceback) on the decomposed LayerNorm/Softmax patterns a recent torch emits.
@@ -385,46 +390,39 @@ def graph_contract(onnx_path):
 
 
 def convert_rknn(args, onnx_path, cache_numel, head_dim, kv_len):
-    from rknn.api import RKNN
-
     out = args.output or (
         os.path.splitext(os.path.basename(onnx_path))[0] + f"_{args.target}.rknn"
     )
     print(f"=== {onnx_path} -> {out} ({args.target}) ===")
-    rknn = RKNN(verbose=True)
-    rknn.config(target_platform=args.target, optimization_level=args.opt_level)
-    ret = rknn.load_onnx(
-        model=onnx_path,
-        inputs=["audio_codes", "freqs_in", "cache_valid", "cache_in"],
-        input_size_list=[
+    # FP16 (w16a16), not quantized: the Snake activation makes Q8/INT8 audibly noisy
+    # (SNR 9.5-13.4 dB) for 1.75x the speed, while fp16 measures lossless (56.8 dB).
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from rknn_build import build_engine, report_engine
+
+    build_engine(
+        onnx_path,
+        out,
+        args.target,
+        names=["audio_codes", "freqs_in", "cache_valid", "cache_in"],
+        shapes=[
             [1, 16, args.codes_length],
             [args.codes_length, head_dim // 2],
             [1],
             [cache_numel],
         ],
+        opt_level=args.opt_level,
+        verbose=True,
+        gate_label=f"build {os.path.basename(out)}",
+        gate_log=out + ".build.log",
     )
-    if ret != 0:
-        sys.exit(f"ERROR: rknn load_onnx failed: {ret}")
-    # FP16 (w16a16), not quantized: the Snake activation makes Q8/INT8 audibly noisy
-    # (SNR 9.5-13.4 dB) for 1.75x the speed, while fp16 measures lossless (56.8 dB).
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from rknn_build_log import rknn_build_gate
-
-    with rknn_build_gate(f"build {os.path.basename(out)}", out + ".build.log"):
-        ret = rknn.build(do_quantization=False)
-    if ret != 0:
-        sys.exit(f"ERROR: rknn build failed: {ret}")
-    ret = rknn.export_rknn(out)
-    if ret != 0:
-        sys.exit(f"ERROR: rknn export failed: {ret}")
-    rknn.release()
-    print(f"saved {out} ({os.path.getsize(out) / 1e6:.1f} MB)")
+    report_engine(out)
     print(
         f"\nDeploy (per-SoC file, not portable between chips):\n"
         f"  scp {out} <board>:/root/tts-rknn/vocoder/\n"
         f"then run with\n"
-        f"  --session-option qwen3_tts.rknn_decoder=/root/tts-rknn/vocoder/"
-        f"{os.path.basename(out)}"
+        "  --session-option 'qwen3_tts.exec_plan="
+        + json.dumps({"speech_decoder": {"impl": "rknn", "artifacts": {"main": f"/root/tts-rknn/vocoder/{os.path.basename(out)}"}}})
+        + "'"
     )
 
 

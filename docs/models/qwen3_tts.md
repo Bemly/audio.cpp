@@ -32,7 +32,7 @@ audiocpp_cli --task tts --family qwen3_tts --model models/Qwen3-TTS-12Hz-1.7B-Ba
 | `--voice-ref` | WAV path | required | Voice clone reference audio. |
 | `--reference-text` | text | required by default | Transcript for reference audio; optional with `x_vector_only_mode=true`. |
 | `--language` | language code | empty string | Text language hint. |
-| `--text-chunk-size` | integer chars | `8192` | Long-form text chunk size. |
+| `--text-chunk-size` | integer chars | `8192` | Long-form text chunk size. Each chunk is voiced separately; with the session option `qwen3_tts.stitch_decode=true` the talker still runs per chunk but the codes of all chunks are voiced in one decoder pass. |
 | `--max-tokens` | positive integer | checkpoint generation config (`2048` if absent) | Maximum generated speech tokens per chunk. |
 
 ## Qwen3 TTS CustomVoice
@@ -61,7 +61,7 @@ audiocpp_cli --task tts --family qwen3_tts --model models/Qwen3-TTS-12Hz-1.7B-Cu
 | `--speaker` | packaged speaker name | required | Built-in speaker id, such as `Vivian` or `Ryan`. |
 | `--instruct` | text | empty string | Style or emotion instruction. |
 | `--language` | language code | empty string | Text language hint. |
-| `--text-chunk-size` | integer chars | `8192` | Long-form text chunk size. |
+| `--text-chunk-size` | integer chars | `8192` | Long-form text chunk size. Each chunk is voiced separately; with the session option `qwen3_tts.stitch_decode=true` the talker still runs per chunk but the codes of all chunks are voiced in one decoder pass. |
 | `--max-tokens` | positive integer | checkpoint generation config (`2048` if absent) | Maximum generated speech tokens per chunk. |
 
 ## Qwen3 TTS VoiceDesign
@@ -90,7 +90,7 @@ audiocpp_cli --task vdes --family qwen3_tts --model models/Qwen3-TTS-12Hz-1.7B-V
 | `--text` | text | required | Text to synthesize. |
 | `--instruct` | text | empty string | Optional voice design instruction. |
 | `--language` | language code | empty string | Text language hint. |
-| `--text-chunk-size` | integer chars | `8192` | Long-form text chunk size. |
+| `--text-chunk-size` | integer chars | `8192` | Long-form text chunk size. Each chunk is voiced separately; with the session option `qwen3_tts.stitch_decode=true` the talker still runs per chunk but the codes of all chunks are voiced in one decoder pass. |
 | `--max-tokens` | positive integer | checkpoint generation config (`2048` if absent) | Maximum generated speech tokens per chunk. |
 
 ## Qwen3 TTS Streaming
@@ -152,16 +152,36 @@ These sampling controls are shared by the Qwen3 TTS Base, VoiceDesign, and Custo
 These options apply to Base, VoiceDesign, and CustomVoice sessions. Arena and
 constant-context sizes are in MiB.
 
+`cuda_perf` is a preset. Explicit session options override its settings:
+
+```bash
+--session-option qwen3_tts.perf_mode=cuda_perf \
+--session-option qwen3_tts.attention=eager \
+--session-option qwen3_tts.packed_projections=false
+```
+
+In server configs, put the same keys and values in the model's `session_options`.
+
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
 | `qwen3_tts.mem_saver` | bool | `false` | Release the talker cached-step graph after each request. Voice-prompt, prefill, code-predictor, and speech-decoder caches remain reusable. |
-| `qwen3_tts.perf_mode` | `off`, `flash_attention` | `off` | Opt-in attention optimization; `flash_attention` requires Q8_0 weights in both the talker and speech tokenizer. |
+| `qwen3_tts.lora` | adapter directory or checkpoint file | not set | Load a PEFT Talker/Subtalker adapter at session creation. Keep `adapter_config.json` beside its weights. A trained custom voice may also provide `speaker_embedding` and `tts_config.json` sidecars; select its name with `voice_id`. |
+| `qwen3_tts.lora_scale` | finite float | `1` | Strength multiplier applied after the adapter's alpha/r scaling. Speaker embedding replacements are not scaled. |
+| `qwen3_tts.perf_mode` | `off`, `flash_attention`, `cuda_perf` | `off` | Preset. `off` keeps normal defaults; `flash_attention` selects flash attention. `cuda_perf` also selects packing, optimized cache writes, F16 KV and convolution weights, stateful streaming decoding, and KV alignment 256. Explicit options override the preset. |
+| `qwen3_tts.attention` | `mixed`, `auto`, `eager`, `flash` | `mixed` | `mixed` uses manual prefill and contiguous-K/V flash cached decoding for the talker and code predictor, with eager speech tokenization. `auto` uses the shared backend policy; `eager` disables flash; `flash` uses flash with K/V views. Explicit values override the preset; `cuda_perf` selects `flash`. |
+| `qwen3_tts.activation_type` | `f32`, `bf16` | `f32` | `bf16` applies reference-style BF16 activation rounding to text projection, talker and code predictor. Weight storage is unchanged. Independent of `perf_mode`; may change the designed voice and does not guarantee token parity with PyTorch or Flash Attention 2. Validated on CUDA. |
+| `qwen3_tts.packed_projections` | bool | `false`; `true` with `cuda_perf` | Pack QKV and gate/up projections in the talker and code predictor without changing weight dtype. |
+| `qwen3_tts.kv_cache_write` | `standard`, `optimized` | `standard`; `optimized` with `cuda_perf` | Optimized cache views and I64 indices allow backend fusion where supported; no CUDA-version requirement. |
+| `qwen3_tts.kv_cache_type` | `f32`, `f16` | `f32`; `f16` with `cuda_perf` | Talker and code-predictor KV storage. F16 reduces cache memory and may change numerical results. Explicit values override the preset. |
+| `qwen3_tts.talker_kv_cache_alignment` | int ≥ 1 | `1`; `256` with `cuda_perf` | Round talker KV capacity to this many rows. Alignment 1 disables padding. Explicit values override the preset. Larger alignments may use more memory and change numerical results. |
+| `qwen3_tts.stream_decoder` | `windowed`, `stateful` | `windowed`; `stateful` with `cuda_perf` | GGML streaming decoder. `stateful` carries convolution and attention history and caches graphs for exact chunk lengths. Uses more graph memory and can change audio. |
+| `qwen3_tts.stitch_decode` | bool | `false` | Voice the concatenated speech codes of all text chunks in one decoder pass instead of voicing each chunk separately. Per-chunk voicing voices the voice-clone reference once per chunk and zeroes the stateful vocoder cache at every chunk boundary (measured on RK3588, 300 characters, 22.5 s reference: 7 vocoder runs for 159.9 s against 1 run for 57.5 s); the stitched pass costs device memory proportional to the utterance, since one decode call builds a vocoder graph sized by its frame count. |
 | `qwen3_tts.voice_prompt_cache_slots` | nonnegative integer | `1` | Cached voice-clone prompts; `0` disables prompt caching. |
 | `qwen3_tts.weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | `native` | Talker weight storage fallback. |
 | `qwen3_tts.talker_weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | inherits `weight_type` | Explicit talker weight storage override. |
 | `qwen3_tts.speech_encoder_weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | `native` | Reference speech encoder matmul weight storage. |
 | `qwen3_tts.speech_decoder_weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | `native` | Speech decoder matmul weight storage. |
-| `qwen3_tts.conv_weight_type` | `native`, `f32`, `f16` | `f32` | Speech tokenizer and speaker encoder convolution weight storage. |
+| `qwen3_tts.conv_weight_type` | `native`, `f32`, `f16` | `f32`; `f16` with `cuda_perf` | Speech tokenizer and speaker encoder convolution weight storage. |
 | `qwen3_tts.talker_graph_arena_mb` | positive integer | `32` | Talker graph arena. |
 | `qwen3_tts.speech_encoder_graph_arena_mb` | positive integer | `32` | Reference speech encoder graph arena. |
 | `qwen3_tts.speech_decoder_graph_arena_mb` | positive integer | `32` | Speech decoder graph arena. |
@@ -169,8 +189,7 @@ constant-context sizes are in MiB.
 | `qwen3_tts.talker_constant_context_mb` | positive integer | `4` | Talker constant tensor context. |
 | `qwen3_tts.code_predictor_constant_context_mb` | positive integer | `4` | Code predictor constant tensor context. |
 | `qwen3_tts.speech_decoder_constant_context_mb` | positive integer | `4` | Speech decoder constant tensor context. |
-| `qwen3_tts.rknn_decoder` | `.rknn` path | not set | Path to a pre-compiled stateful speech-tokenizer decoder `.rknn` (Rockchip NPU). When set, the decoder stage runs on the NPU and its ggml weights are not loaded. |
-| `qwen3_tts.rknn_decoder_first` | `.rknn` path | not set | Optional smaller-batch `.rknn` used for the first token group only, to cut time-to-first-audio in streaming. Requires `rknn_decoder`. |
+| `qwen3_tts.exec_plan` | JSON object of component plans, encoded as a string | `{}` | `{"speech_decoder":{"impl":"rknn","artifacts":{"main":"/models/decoder.rknn","first":"/models/decoder-first.rknn","window":"/models/decoder-window.rknn"}}}` selects the NPU decoder and skips GGML decoder weights. `main` is required; `first` optionally uses a smaller engine for the first streaming group; `window` optionally streams with window semantics. No decoder-specific params. See [component execution plans](../build/rockchip-npu.md#component-execution-plans). |
 
 ## Rockchip NPU decoder
 
@@ -189,7 +208,15 @@ outputs `audio_values` and `cache_out`; 1920 samples per token at 24 kHz, with
 the convolution and KV cache carried across steps in the graph I/O. The
 optional first-group model runs the first token group at a smaller compiled
 batch; the cache layout is batch-independent, so its cache feeds the main
-model directly. A `.rknn` is compiled per SoC and is not portable between
+model directly. The optional window model (`artifacts.window`) streams with the
+ggml path's window semantics instead: every event runs a full decode of its
+whole `[left context + new]` window from a zeroed cache and drops the context
+frames' audio, so each event reproduces the CPU streaming function exactly
+(25 frames re-voiced per event, at one NPU step of `25 + frames_per_event`
+tokens). Naming the same file as `main` aliases it: the resident engine covers
+the default 25 + 12 window; a dedicated export compiled at `--codes-length
+25 + stream_frames_per_event` is cheaper per event. Offline decoding keeps
+using `main`. A `.rknn` is compiled per SoC and is not portable between
 chips. Build the file with
 [`tools/rknn/prepare_qwen3_tts_rknn_vocoder.py`](../../tools/rknn/prepare_qwen3_tts_rknn_vocoder.py)
 and see [the Rockchip NPU build guide](../build/rockchip-npu.md) for the toolkit

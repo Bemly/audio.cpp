@@ -79,6 +79,13 @@ public:
     static const core::ModuleSchema & static_schema() noexcept;
 };
 
+class Bf16RoundModule {
+public:
+    const core::ModuleSchema & schema() const noexcept;
+    core::TensorValue build(core::ModuleBuildContext & ctx, const core::TensorValue & input) const;
+    static const core::ModuleSchema & static_schema() noexcept;
+};
+
 class GeluModule {
 public:
     explicit GeluModule(GeluConfig config = {});
@@ -92,11 +99,22 @@ private:
     GeluConfig config_;
 };
 
-class SiluModule {
+class GegluModule {
 public:
     const core::ModuleSchema & schema() const noexcept;
     core::TensorValue build(core::ModuleBuildContext & ctx, const core::TensorValue & input) const;
     static const core::ModuleSchema & static_schema() noexcept;
+};
+
+class SiluModule {
+public:
+    SiluModule() = default;
+    explicit SiluModule(bool preserve_input_type) : preserve_input_type_(preserve_input_type) {}
+    const core::ModuleSchema & schema() const noexcept;
+    core::TensorValue build(core::ModuleBuildContext & ctx, const core::TensorValue & input) const;
+    static const core::ModuleSchema & static_schema() noexcept;
+private:
+    bool preserve_input_type_ = false;
 };
 
 class SeluModule {
@@ -156,7 +174,7 @@ struct Snake1dConfig {
 
 struct Snake1dWeights {
     core::TensorValue alpha;
-    std::optional<core::TensorValue> inverse_alpha;
+    std::optional<core::TensorValue> inverse_alpha{};
 };
 
 class Snake1dModule {

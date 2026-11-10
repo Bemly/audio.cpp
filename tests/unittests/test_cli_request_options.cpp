@@ -39,7 +39,7 @@ uint64_t parse_seed(const std::string & value) {
 void require_seed_rejected(const std::string & value) {
     try {
         (void) parse_seed(value);
-    } catch (const std::runtime_error &) {
+    } catch (const engine::runtime::InvalidRequestError &) {
         return;
     }
     throw std::runtime_error("unsafe seed option was parsed unexpectedly: " + value);
@@ -75,6 +75,13 @@ void test_unsafe_integer_numbers_are_not_silently_rounded() {
         rounded.find('e') != std::string::npos || rounded.find('E') != std::string::npos,
         "2^53+1 does not become a rounded decimal option");
     require_seed_rejected(rounded);
+}
+
+void test_malformed_seeds_are_invalid_requests() {
+    // A JSON null option reaches the parser as "null".
+    for (const char * value : {"null", " -1", "18446744073709551616"}) {
+        require_seed_rejected(value);
+    }
 }
 
 void test_audio_only_language_is_request_option() {
@@ -386,17 +393,116 @@ void test_request_json_artifacts() {
 #endif
 }
 
+void test_component_exec_plans() {
+    using engine::core::BackendType;
+    using engine::runtime::parse_exec_plan;
+    const auto parse = [](const std::unordered_map<std::string, std::string> & options) {
+        return parse_exec_plan(
+            options, "toy.exec_plan",
+            {{"decoder", "ggml",
+              {{"ggml", {BackendType::Cpu}, {}, {}},
+               {"native", {BackendType::Cpu}, {}, {}},
+               {"compiled", {}, {"main"}, {"first"}, {"overlap", "gain", "future"}}}},
+             {"encoder", "ggml", {{"ggml", {BackendType::Cpu}, {}, {}}}}});
+    };
+    const auto defaults = parse({});
+    const auto & default_plan = defaults.at("decoder");
+    engine::test::require_eq(default_plan.impl, std::string("ggml"), "missing plan preserves default");
+    engine::test::require(!default_plan.backend && default_plan.artifacts.empty() && default_plan.params.empty(),
+                          "missing plan has no overrides");
+    engine::test::require_eq(defaults.at("encoder").impl, std::string("ggml"), "all components receive defaults");
+    for (const auto & value : {"{}", "{\"decoder\":{}}", "{\"decoder\":{\"impl\":\"default\"}}"}) {
+        const auto plans = parse({{"toy.exec_plan", value}});
+        engine::test::require(plans.at("decoder").impl == "ggml" && plans.at("encoder").impl == "ggml",
+                              "empty, omitted and explicit default components preserve defaults");
+    }
+    const auto plans = parse({{"toy.exec_plan", R"({"decoder":{"impl":"native","backend":"cpu"}})"}});
+    const auto & native = plans.at("decoder");
+    engine::test::require(native.backend == BackendType::Cpu && native.impl == "native", "native CPU selection");
+    engine::test::require_eq(plans.at("encoder").impl, std::string("ggml"), "selecting decoder leaves encoder unchanged");
+    const auto body = engine::io::json::parse(R"({"toy.exec_plan":{
+        "encoder":{"backend":"cpu"},
+        "decoder":{"impl":"compiled","artifacts":{"main":"main.bin","first":"first.bin"},
+                   "params":{"overlap":4,"gain":true,"future":{"nested":[1,2]}}}
+    }})");
+    const auto combined = parse(minitts::cli::json_options_map(&body));
+    const auto & compiled = combined.at("decoder");
+    engine::test::require(compiled.impl == "compiled" && compiled.artifacts.at("main") == "main.bin" &&
+                          compiled.artifacts.at("first") == "first.bin", "named compiled artifacts");
+    engine::test::require(compiled.params.at("overlap").as_i64() == 4 && compiled.params.at("gain").as_bool() &&
+                          compiled.params.at("future").require("nested").as_array().size() == 2,
+                          "parameters retain JSON types and support model-local structured settings");
+    engine::test::require(combined.at("encoder").backend == BackendType::Cpu,
+                          "multiple component settings are resolved independently");
+    const std::vector<std::pair<std::string, std::string>> rejected = {
+        {"", "toy.exec_plan"},
+        {"[]", "must be a JSON object"},
+        {R"({"unknown":{}})", "unsupported component 'unknown'"},
+        {R"({"impl":"native"})", "unsupported component 'impl'"},
+        {R"({"decoder":null})", "toy.exec_plan.decoder must be a JSON object"},
+        {R"({"decoder":{"impl":false}})", ".impl must be a nonempty string"},
+        {R"({"decoder":{"impl":""}})", ".impl must be a nonempty string"},
+        {R"({"decoder":{"impl":"missing"}})", "unsupported impl"},
+        {R"({"decoder":{"implementation":"native"}})", "unknown field"},
+        {R"({"decoder":{"backend":1}})", ".backend must be a string"},
+        {R"({"decoder":{"backend":"missing"}})", "unknown backend"},
+        {R"({"decoder":{"backend":"cuda"}})", "requested backend is not supported"},
+        {R"({"decoder":{"impl":"compiled"}})", "requires artifacts.main"},
+        {R"({"decoder":{"impl":"compiled","artifacts":{"first":"first.bin"}}})", "requires artifacts.main"},
+        {R"({"decoder":{"impl":"compiled","backend":"cpu","artifacts":{"main":"main.bin"}}})", "requested backend is not supported"},
+        {R"({"decoder":{"artifacts":[]}})", ".artifacts must be an object"},
+        {R"({"decoder":{"artifacts":{"main":0}}})", "must be a nonempty file path"},
+        {R"({"decoder":{"artifacts":{"main":""}}})", "must be a nonempty file path"},
+        {R"({"decoder":{"artifacts":{"main":"main.bin"}}})", "unsupported artifact role"},
+        {R"({"decoder":{"impl":"compiled","artifacts":{"main":"main.bin","other":"other.bin"}}})", "unsupported artifact role"},
+        {R"({"decoder":{"params":[]}})", ".params must be an object"},
+        {R"({"decoder":{"params":{"overlap":4}}})", "unsupported parameter"},
+        {R"({"decoder":{"impl":"compiled","artifacts":{"main":"main.bin"},"params":{"unknown":true}}})", "unsupported parameter"},
+    };
+    for (const auto & [value, expected] : rejected) {
+        bool rejected = false;
+        try {
+            (void) parse({{"toy.exec_plan", value}});
+        } catch (const std::runtime_error & error) {
+            rejected = true;
+            engine::test::require(std::string(error.what()).find(expected) != std::string::npos,
+                                  "exec plan error identifies invalid field: " + value);
+        }
+        engine::test::require(rejected, "invalid exec plan must not be ignored: " + value);
+    }
+}
+
+void test_non_negative_int_flag_values() {
+    using minitts::cli::parse_non_negative_int;
+    const std::string flag = "--resample-kernel-cache-mb";
+    engine::test::require_eq(parse_non_negative_int("0", flag), 0, "0 parses");
+    engine::test::require_eq(parse_non_negative_int("32", flag), 32, "32 parses");
+    engine::test::require_eq(parse_non_negative_int("2147483647", flag), 2147483647, "INT_MAX parses");
+    for (const std::string value : {"-1", "abc", "32abc", "1.5", "", " 8", "+5", "2147483648"}) {
+        bool rejected = false;
+        try {
+            (void) parse_non_negative_int(value, flag);
+        } catch (const std::runtime_error & error) {
+            rejected = std::string(error.what()) == flag + " expects a non-negative integer, got: " + value;
+        }
+        engine::test::require(rejected, flag + " rejects '" + value + "' and names the flag");
+    }
+}
+
 }  // namespace
 
 int main() {
     test_large_safe_integer_numbers_stay_decimal();
     test_float_numbers_keep_json_formatting();
     test_unsafe_integer_numbers_are_not_silently_rounded();
+    test_malformed_seeds_are_invalid_requests();
     test_audio_only_language_is_request_option();
     test_audio_chunk_shortcut_uses_canonical_name();
     test_normalized_request_option_aliases();
     test_out_format_selects_wav_sample_format();
     test_request_json_artifacts();
+    test_component_exec_plans();
+    test_non_negative_int_flag_values();
     std::cout << "cli_request_options_test passed\n";
     return 0;
 }

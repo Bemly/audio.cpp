@@ -1,9 +1,143 @@
 {
+  "haas_asr": [
+    {"name":"return_timestamps","type":"bool","label":"Word timestamps","info":"Include word timestamps in the displayed response."},
+    {"name":"max_tokens","type":"number","label":"Max tokens","info":"Maximum TDT generated tokens; 0 or omitted uses the model-derived limit.","default":0,"minimum":0,"step":1},
+    {"name":"audio_chunk_mode","type":"choice","label":"Audio chunk mode","info":"Offline audio chunking mode. fixed selects overlapping long-form windows regardless of offline_mode; vad uses the configured VAD model (Silero by default) to skip silence; auto follows offline_mode. Offline input is downmixed and resampled as needed.","default":"auto","choices":["auto","fixed","vad","none"]},
+    {"name":"audio_chunk_duration_sec","type":"number","label":"Audio chunk duration sec","info":"VAD maximum chunk duration; omitted inherits the session duration. Fixed/long_form windows use the session setting, not this request override.","minimum":0.001,"step":0.1},
+    {"name":"offline_mode","type":"choice","label":"Offline mode","info":"Offline encoder scheduling. full_context encodes the whole utterance, long_form uses bounded overlapping windows, and auto selects long_form beyond audio_chunk_threshold_sec.","scope":"session","session_option":"haas_asr.offline_mode","default":"full_context","choices":["full_context","long_form","auto"]},
+    {"name":"perf_mode","type":"choice","label":"Perf mode","info":"Encoder attention implementation. Default off uses the validated relative-attention path; flash_attention enables the fused implementation, which was numerically validated but slower on the tested hardware.","scope":"session","session_option":"haas_asr.perf_mode","default":"off","choices":["off","flash_attention"]}
+  ],
+  "phonon2_asr": [
+    {"name":"return_timestamps","type":"bool","label":"Word timestamps","info":"Include word timestamps in the displayed response."},
+    {"name":"hotwords","type":"text","label":"Hotwords","info":"Optional native vocabulary bias: comma-separated terms or a JSON list; up to 25 terms.","lines":2},
+    {"name":"hotwords_score","type":"number","label":"Hotwords score","info":"Phonon-2/Bark native matching-piece logit bonus; duration scores and blank are not biased.","default":2.0,"minimum":0,"maximum":100,"step":0.1},
+    {"name":"max_tokens","type":"number","label":"Max tokens","info":"Maximum TDT generated tokens; 0 or omitted uses the model-derived limit.","default":0,"minimum":0,"step":1},
+    {"name":"audio_chunk_mode","type":"choice","label":"Audio chunk mode","info":"Offline audio chunking mode. fixed selects overlapping long-form windows regardless of offline_mode; vad uses the configured VAD model (Silero by default) to skip silence; auto follows offline_mode. Offline input is downmixed and resampled as needed.","default":"auto","choices":["auto","fixed","vad","none"]},
+    {"name":"audio_chunk_duration_sec","type":"number","label":"Audio chunk duration sec","info":"VAD maximum chunk duration; omitted inherits the session duration. Fixed/long_form windows use the session setting, not this request override.","minimum":0.001,"step":0.1},
+    {"name":"offline_mode","type":"choice","label":"Offline mode","info":"Offline encoder scheduling. full_context encodes the whole utterance, long_form uses bounded overlapping windows, and auto selects long_form beyond audio_chunk_threshold_sec.","scope":"session","session_option":"phonon2_asr.offline_mode","default":"full_context","choices":["full_context","long_form","auto"]},
+    {"name":"perf_mode","type":"choice","label":"Perf mode","info":"Encoder attention implementation. Default off uses the validated relative-attention path; flash_attention enables the fused implementation, which was numerically validated but slower on the tested hardware.","scope":"session","session_option":"phonon2_asr.perf_mode","default":"off","choices":["off","flash_attention"]}
+  ],
+  "underdog_bark3": [
+    {"name":"return_timestamps","type":"bool","label":"Word timestamps","info":"Include word timestamps in the displayed response."},
+    {"name":"hotwords","type":"text","label":"Hotwords","info":"Optional native vocabulary bias: comma-separated terms or a JSON list; up to 25 terms.","lines":2},
+    {"name":"hotwords_score","type":"number","label":"Hotwords score","info":"Phonon-2/Bark native matching-piece logit bonus; duration scores and blank are not biased.","default":2.0,"minimum":0,"maximum":100,"step":0.1},
+    {"name":"max_tokens","type":"number","label":"Max tokens","info":"Maximum TDT generated tokens; 0 or omitted uses the model-derived limit.","default":0,"minimum":0,"step":1},
+    {"name":"audio_chunk_mode","type":"choice","label":"Audio chunk mode","info":"Offline audio chunking mode. fixed selects overlapping long-form windows regardless of offline_mode; vad uses the configured VAD model (Silero by default) to skip silence; auto follows offline_mode. Offline input is downmixed and resampled as needed.","default":"auto","choices":["auto","fixed","vad","none"]},
+    {"name":"audio_chunk_duration_sec","type":"number","label":"Audio chunk duration sec","info":"VAD maximum chunk duration; omitted inherits the session duration. Fixed/long_form windows use the session setting, not this request override.","minimum":0.001,"step":0.1},
+    {"name":"offline_mode","type":"choice","label":"Offline mode","info":"Offline encoder scheduling. full_context encodes the whole utterance, long_form uses bounded overlapping windows, and auto selects long_form beyond audio_chunk_threshold_sec.","scope":"session","session_option":"underdog_bark3.offline_mode","default":"full_context","choices":["full_context","long_form","auto"]},
+    {"name":"perf_mode","type":"choice","label":"Perf mode","info":"Encoder attention implementation. Default off uses the validated relative-attention path; flash_attention enables the fused implementation, which was numerically validated but slower on the tested hardware.","scope":"session","session_option":"underdog_bark3.perf_mode","default":"off","choices":["off","flash_attention"]}
+  ],
+  "nemotron_transcribe": [
+    {"name":"template_name","type":"choice","label":"Task template","info":"Instruction template. Audio Q&A requires instruct or text_input. Timestamps and speakers require the default transcription template.","default":"default","choices":["default","translation","audio_qa","language_id"]},
+    {"name":"instruct","type":"text","label":"Task instruction","info":"Audio instruction or question. Replaces the template instruction; defaults to text_input when present. Chat controls and audio locators are rejected."},
+    {"name":"target_language","type":"text","label":"Target language","info":"Target language for the translation template.","default":"English"},
+    {"name":"system_prompt","type":"text","label":"System prompt","info":"Optional system message; the trained default is empty.","lines":2},
+    {"name":"return_timestamps","type":"bool","label":"Word timestamps","info":"Run the checkpoint CTC head for source-language word timestamps. Failed streams return no fabricated word rows.","default":false},
+    {"name":"diarization","type":"bool","label":"Speaker labels","info":"Request speaker-tagged transcription, CTC words and speaker activity turns. An explicit instruct must request speaker tags itself.","default":false},
+    {"name":"max_tokens","type":"number","label":"Max tokens","info":"Maximum generated response tokens. Defaults to generation_config or native duration budget max(24,ceil(6*audio_seconds)+24). Prompt and output must fit max_context.","minimum":1,"step":1},
+    {"name":"do_sample","type":"bool","label":"Do sample","info":"Sample tokens instead of greedy decoding.","default":false},
+    {"name":"temperature","type":"number","label":"Temperature","info":"Positive sampling temperature when do_sample is true.","default":1,"step":0.1},
+    {"name":"top_k","type":"number","label":"Top k","info":"Sampling candidate count; zero disables top-k filtering.","default":0,"minimum":0,"step":1},
+    {"name":"top_p","type":"number","label":"Top p","info":"Nucleus probability when sampling.","default":1,"minimum":0,"maximum":1,"step":0.1},
+    {"name":"repetition_guard","type":"bool","label":"Repetition guard","info":"Stop runaway token repetition and report repetition_detected termination. May truncate genuine repeated speech; does not repair the transcript.","default":false},
+    {"name":"repetition_penalty","type":"number","label":"Repetition penalty","info":"Positive token repetition penalty.","default":1,"step":0.1},
+    {"name":"disk_experts","type":"bool","label":"Offload expert weights","info":"Keep routed expert weights in the GGUF/host memory and stage selected experts through a bounded backend cache. Dense weights and all expert computation remain on the selected backend.","scope":"session","session_option":"nemotron_transcribe.disk_experts","default":false},
+    {"name":"pin_experts","type":"bool","label":"Keep experts in pinned RAM","info":"With disk_experts, retain complete native expert banks in pinned host RAM for direct uploads. Requires pinned host-buffer support.","scope":"session","session_option":"nemotron_transcribe.pin_experts","default":false},
+    {"name":"expert_cache_size","type":"number","label":"GPU expert slots per layer","info":"Resident expert slots per routed layer with disk_experts. Must cover the model's experts per token and cannot exceed its expert count.","scope":"session","session_option":"nemotron_transcribe.expert_cache_size","default":8,"minimum":1,"step":1},
+    {"name":"disk_expert_read_threads","type":"number","label":"Disk expert read threads","info":"Host workers for staging GGUF expert ranges when disk_experts is true and pin_experts is false. Parallel reads require OpenMP or Apple dispatch.","scope":"session","session_option":"nemotron_transcribe.disk_expert_read_threads","default":4,"minimum":1,"maximum":64,"step":1},
+    {"name":"flash_attention","type":"bool","label":"Flash attention","info":"Use flash attention in the speech and speaker encoders.","scope":"session","session_option":"nemotron_transcribe.flash_attention","default":true}
+  ],
+  "lfm_d1_omni": [
+    {"name":"questions","type":"text","label":"Questions JSON","info":"JSON object mapping question names to typed questions, in input order.","lines":4,"default":"{\n  \"speech\": {\n    \"type\": \"noul\",\n    \"instructions\": \"Does someone speak in this recording?\"\n  },\n  \"sound\": {\n    \"type\": \"choice\",\n    \"instructions\": \"What is the main sound?\",\n    \"criteria\": {\n      \"speech\": \"A person speaking\",\n      \"music\": \"Music playing\",\n      \"noise\": \"Background noise\"\n    }\n  }\n}"},
+    {"name":"set_size","type":"number","label":"Questions per batch","info":"Questions packed together per forward pass. Larger sets may affect accuracy.","default":16,"minimum":1,"step":1},
+    {"name":"score_readout","type":"choice","label":"Score readout","info":"How ordered score probabilities are reduced to a score.","default":"median","choices":["median","mean","mode"]},
+    {"name":"attention","type":"choice","label":"Attention","info":"Attention lowering for the audio encoder and decoder.","scope":"session","session_option":"lfm_d1_omni.attention","default":"auto","choices":["auto","flash","eager"]}
+  ],
+  "pocket_tts_small": [
+    {"name":"temperature","type":"number","label":"Temperature","info":"Positive flow noise temperature; defaults to the model configuration. Captured during session preparation.","step":0.1},
+    {"name":"frames_after_eos","type":"number","label":"Frames after eos","info":"Extra frames after EOS; -1 uses the model-derived value.","default":-1,"minimum":-1,"step":1},
+    {"name":"max_frames","type":"number","label":"Max frames","info":"Maximum generated audio frames; zero estimates the cap from text length. Captured during session preparation.","default":0,"minimum":0,"step":1},
+    {"name":"text_chunk_tokens","type":"number","label":"Text chunk tokens","info":"Tokenizer tokens per text chunk; must be positive, default 50. Set during preparation and overridable per request.","default":50,"minimum":1,"step":1},
+    {"name":"noise_clamp","type":"number","label":"Noise clamp","info":"Noise clamp; a negative value disables clamping. Captured during session preparation.","default":-1,"step":0.1},
+    {"name":"eos_threshold","type":"number","label":"Eos threshold","info":"EOS detection threshold; defaults to the checkpoint recommendation.","step":0.1},
+    {"name":"truncate_clone_audio","type":"bool","label":"Truncate clone audio","info":"Truncate voice clone audio. Captured during session preparation.","default":false},
+    {"name":"attention","type":"choice","label":"Attention","info":"GGML acoustic attention implementation.","scope":"session","session_option":"pocket_tts_small.attention","default":"auto","choices":["auto","eager","flash"]},
+    {"name":"kv_cache_type","type":"choice","label":"Kv cache type","info":"GGML acoustic KV cache storage. Native CPU flow requires f32.","scope":"session","session_option":"pocket_tts_small.kv_cache_type","default":"f32","choices":["f32","f16"]},
+    {"name":"voice_state_cache_slots","type":"number","label":"Voice state cache slots","info":"Cached prepared voice states; zero disables reuse.","scope":"session","session_option":"pocket_tts_small.voice_state_cache_slots","default":4,"minimum":0,"step":1},
+    {"name":"mimi_chunk_frames","type":"number","label":"Decoder frames per block","info":"Latent frames per bounded causal waveform-decoder block.","scope":"session","session_option":"pocket_tts_small.mimi_chunk_frames","default":4,"minimum":1,"step":1},
+    {"name":"use_full_mimi","type":"bool","label":"Full-sequence audio decoding","info":"Use a full-utterance waveform graph instead of bounded causal blocks. This can use more device memory.","scope":"session","session_option":"pocket_tts_small.use_full_mimi","default":false}
+  ],
+  "realtime_reuse": [
+    {"name":"exit_layer","type":"number","label":"Exit layer","info":"Number of causal time-frequency blocks; selects the matching trained decoder.","scope":"session","session_option":"realtime_reuse.exit_layer","default":8,"minimum":3,"maximum":12,"step":1},
+    {"name":"lookahead_frames","type":"number","label":"Lookahead frames","info":"Encoder lookahead in 20 ms STFT frames.","scope":"session","session_option":"realtime_reuse.lookahead_frames","default":0,"minimum":0,"maximum":2,"step":1}
+  ],
+  "magenta_realtime_2": [
+    {"name":"temperature","type":"number","label":"Temperature","info":"Sampling temperature; zero selects greedy decoding.","default":1.3,"minimum":0,"step":0.1},
+    {"name":"top_k","type":"number","label":"Top k","info":"Sampling candidate limit; zero keeps all 1024 valid codes.","default":40,"minimum":0,"maximum":1024,"step":1},
+    {"name":"guidance_scale","type":"number","label":"Guidance scale","info":"MusicCoCa style guidance, discretized to the model's trained conditioning tokens.","default":3,"minimum":-1,"maximum":7,"step":0.1},
+    {"name":"note_guidance_scale","type":"number","label":"Note guidance scale","info":"MIDI note guidance.","default":1,"minimum":-1,"maximum":7,"step":0.1},
+    {"name":"drum_guidance_scale","type":"number","label":"Drum guidance scale","info":"Drum guidance.","default":1,"minimum":-1,"maximum":7,"step":0.1},
+    {"name":"use_mapper","type":"bool","label":"Use mapper","info":"Map text style embeddings into the audio embedding space.","default":true},
+    {"name":"drums","type":"number","label":"Drums","info":"Drum conditioning: -1 leaves drums unspecified, 0 requests no drums, 1 requests drums.","default":-1,"minimum":-1,"maximum":1,"step":1},
+    {"name":"pianoroll_file","type":"text","label":"Piano-roll JSON file (server path)","info":"Optional JSON array of 128 MIDI pitch states per frame at 25 Hz: -1 masked, 0 off, 1 sustain, 2 onset, 3 model chooses."}
+  ],
+  "soulx_flashhead": [
+    {"name":"num_inference_steps","type":"number","label":"Num inference steps","info":"Distilled denoising steps.","default":4,"minimum":1,"step":1},
+    {"name":"height","type":"number","label":"Height","info":"Output height, divisible by the VAE spatial stride.","default":512,"minimum":32,"step":1},
+    {"name":"width","type":"number","label":"Width","info":"Output width, divisible by the VAE spatial stride.","default":512,"minimum":32,"step":1},
+    {"name":"audio_guidance_scale","type":"number","label":"Audio guidance scale","info":"Audio CFG scale for non-distilled pretrained checkpoints; distilled Lite/Pro do not use CFG.","default":3,"minimum":0,"step":0.1},
+    {"name":"color_correction_strength","type":"number","label":"Color correction strength","info":"Blend output color statistics toward the reference portrait.","default":1,"minimum":0,"maximum":1,"step":0.1},
+    {"name":"exec_plan","type":"text","label":"Component execution plan JSON","info":"JSON component execution plan. vae.impl is ggml (default) or cudnn. cudnn requires the Lite variant, CUDA backend, and cuDNN Conv3D build support. No artifacts or params are used.","scope":"session","session_option":"soulx_flashhead.exec_plan","default":"{}"}
+  ],
+  "ming3_tts": [
+    {"name":"template_name","type":"text","label":"Prompt template","placeholder":"Automatic"},
+    {"name":"voice_id","type":"text","label":"IP voice name","placeholder":"US_James (IP template only)"},
+    {"name":"temperature","type":"number","label":"Temperature","default":0,"minimum":0,"step":0.1},
+    {"name":"guidance_scale","type":"number","label":"Guidance scale","default":2,"step":0.1},
+    {"name":"sigma","type":"number","label":"SDE noise scale","default":0.25,"minimum":0,"step":0.05},
+    {"name":"trim_silence","type":"bool","label":"Trim trailing silence","default":true}
+  ],
+  "ming3_audio": [
+    {"name":"voice_id","type":"text","label":"Voice name","placeholder":"US_James"},
+    {"name":"prompt","type":"text","label":"Audio task prompt","placeholder":"Use task default"},
+    {"name":"system_prompt","type":"text","label":"System prompt"},
+    {"name":"enable_thinking","type":"bool","label":"Enable thinking","default":false},
+    {"name":"max_audio_tokens","type":"number","label":"Maximum acoustic patches per chunk","default":1000,"minimum":1,"step":1},
+    {"name":"temperature","type":"number","label":"Temperature","default":0,"minimum":0,"step":0.1},
+    {"name":"guidance_scale","type":"number","label":"Guidance scale","default":2,"step":0.1},
+    {"name":"disk_experts","scope":"session","session_option":"ming3_audio.disk_experts","type":"bool","label":"Offload expert weights","default":false},
+    {"name":"pin_experts","scope":"session","session_option":"ming3_audio.pin_experts","type":"bool","label":"Keep experts in pinned host RAM","default":false}
+  ],
+  "xtts_v2": [
+    {"name":"temperature","type":"slider","label":"Temperature","default":0.75,"minimum":0,"maximum":2,"step":0.05},
+    {"name":"top_k","type":"number","label":"Top-k","default":50,"minimum":0,"step":1},
+    {"name":"top_p","type":"slider","label":"Top-p","default":0.85,"minimum":0,"maximum":1,"step":0.01},
+    {"name":"repetition_penalty","type":"number","label":"Repetition penalty","default":10,"minimum":1,"step":0.5},
+    {"name":"max_mel_tokens","type":"number","label":"Maximum mel tokens","default":605,"minimum":1,"step":1}
+  ],
+  "latentsync": [
+    {"name":"num_inference_steps","type":"number","label":"Denoising steps","default":20,"minimum":1,"maximum":999,"step":1},
+    {"name":"cache_interval","type":"number","label":"DeepCache interval","default":1,"minimum":1,"step":1},
+    {"name":"guidance_scale","type":"number","label":"Guidance scale","default":1.5,"minimum":0,"step":0.1},
+    {"name":"frames_per_chunk","type":"number","label":"Frames per chunk","default":16,"minimum":1,"maximum":24,"step":1},
+    {"name":"fps","type":"number","label":"Frames per second","default":25,"minimum":1,"step":1},
+    {"name":"mem_saver","scope":"session","session_option":"latentsync.mem_saver","type":"bool","label":"Memory saver","default":false}
+  ],
   "ast_audioset": [
     {"name":"top_k","type":"number","label":"Top classes","default":10,"minimum":1,"maximum":527,"step":1}
   ],
   "ced": [
     {"name":"top_k","type":"number","label":"Top classes","default":10,"minimum":1,"maximum":527,"step":1}
+  ],
+  "fish_drama3": [
+    {"name":"text_chunk_size","type":"number","label":"Characters per chunk","default":128,"minimum":1,"step":1,"info":"Smaller chunks reduce waveform-decoder peak memory; larger chunks reduce repeated prefills."},
+    {"name":"temperature","type":"slider","label":"Temperature","default":1,"minimum":0,"maximum":2,"step":0.05},
+    {"name":"top_p","type":"slider","label":"Top-p","default":0.9,"minimum":0.01,"maximum":1,"step":0.01},
+    {"name":"top_k","type":"number","label":"Top-k","default":4097,"minimum":1,"step":1},
+    {"name":"disk_experts","type":"bool","scope":"session","session_option":"fish_drama3.disk_experts","label":"Offload expert weights","default":true,"info":"Keep only selected expert weights on the GPU. Expert computation stays on the selected backend; changing this reloads the model."},
+    {"name":"pin_experts","type":"bool","scope":"session","session_option":"fish_drama3.pin_experts","label":"Preload experts in pinned host RAM","default":true,"info":"Requires expert offload. Faster uploads, but holds the full expert banks in pinned host RAM."},
+    {"name":"expert_cache_size","type":"number","scope":"session","session_option":"fish_drama3.expert_cache_size","label":"GPU expert slots per layer","default":8,"minimum":8,"maximum":256,"step":1},
+    {"name":"context_length","type":"number","scope":"session","session_option":"fish_drama3.context_length","label":"Context capacity","default":4096,"minimum":1,"step":1,"info":"Prompt and generated frames share this capacity, including all voice references and dialogue history."}
   ],
   "firered_vad": [
     {"name":"threshold","type":"number","label":"Speech threshold","minimum":0,"maximum":1,"step":0.05},
@@ -20,6 +154,15 @@
   "micro_wake_word": [
     {"name":"threshold","type":"number","label":"Detection threshold","minimum":0,"maximum":1,"step":0.05},
     {"name":"sliding_window_size","type":"number","label":"Sliding window frames","minimum":1,"step":1}
+  ],
+  "open_wake_word": [
+    {"name":"threshold","type":"number","label":"Detection threshold","default":0.5,"minimum":0,"maximum":1,"step":0.05}
+  ],
+  "plapre": [
+    {"name":"temperature","type":"number","label":"Temperature","default":0.8,"minimum":0,"step":0.05},
+    {"name":"top_p","type":"number","label":"Top-p","default":0.95,"minimum":0.01,"maximum":1,"step":0.01},
+    {"name":"top_k","type":"number","label":"Top-k","default":50,"minimum":-1,"step":1},
+    {"name":"x_vector_only_mode","type":"bool","label":"Reference speaker embedding only","default":false}
   ],
   "mossformer2": [
     {"name":"audio_chunk_duration_sec","type":"number","label":"Chunk duration (s, 0 = whole recording)","default":2,"minimum":0,"step":0.1},
@@ -320,6 +463,30 @@
     {"name": "max_tokens", "type": "number", "label": "max_tokens", "default": 512, "minimum": 1, "step": 1, "precision": 0, "info_en": "Transcript tokens allowed per chunk; a transcript that reaches it is cut off there."}
   ],
 
+  "lfm3-audio-tts": [
+    {"name": "temperature", "type": "slider", "label": "temperature", "default": 1.0, "minimum": 0.0, "maximum": 2.0, "step": 0.05, "info_en": "Audio code temperature; 0 picks the most likely code."},
+    {"name": "top_k", "type": "number", "label": "top_k", "default": 128, "minimum": 0, "step": 1, "precision": 0, "info_en": "Sample audio codes from the k most likely; 0 keeps all."},
+    {"name": "repetition_penalty", "type": "number", "label": "repetition_penalty", "default": 1.1, "minimum": 0.01, "step": 0.05, "info_en": "Audio repetition penalty over the last 4096 frames of each codebook; must be positive, 1 disables it."},
+    {"name": "text_chunk_size", "type": "number", "label": "text_chunk_size", "default": 200, "minimum": 1, "step": 1, "precision": 0, "info_en": "Target characters per text chunk; each chunk is its own spoken turn."}
+  ],
+
+  "lfm3-audio-s2s": [
+    {"name": "temperature", "type": "slider", "label": "temperature", "default": 1.0, "minimum": 0.0, "maximum": 2.0, "step": 0.05, "info_en": "Audio code temperature; 0 picks the most likely code."},
+    {"name": "top_k", "type": "number", "label": "top_k", "default": 128, "minimum": 0, "step": 1, "precision": 0, "info_en": "Sample audio codes from the k most likely; 0 keeps all."},
+    {"name": "repetition_penalty", "type": "number", "label": "repetition_penalty", "default": 1.1, "minimum": 0.01, "step": 0.05, "info_en": "Audio repetition penalty over the last 4096 frames of each codebook; must be positive, 1 disables it."},
+    {"name": "text_temperature", "type": "slider", "label": "text_temperature", "default": 0.0, "minimum": 0.0, "maximum": 2.0, "step": 0.05, "info_en": "Text token temperature; 0 is greedy."},
+    {"name": "text_top_k", "type": "number", "label": "text_top_k", "default": 0, "minimum": 0, "step": 1, "precision": 0, "info_en": "Sample text tokens from the k most likely; 0 keeps all."},
+    {"name": "max_audio_tail_frames", "type": "number", "label": "max_audio_tail_frames", "default": 375, "minimum": 0, "step": 1, "precision": 0, "info_en": "Most audio frames after the reply text ends before the turn is closed with an end-of-audio frame; 0 disables the cap."}
+  ],
+
+  "lfm3_audio": [
+    {"name": "audio_chunk_mode", "type": "choice", "label": "audio_chunk_mode", "default": "auto", "choices": ["auto", "vad", "fixed", "none"], "info_en": "auto keeps audio up to audio_chunk_duration_sec whole and splits longer audio at VAD pauses; none transcribes it in one pass."},
+    {"name": "audio_chunk_duration_sec", "type": "number", "label": "audio_chunk_duration_sec", "minimum": 1, "step": 1, "info_en": "Longest chunk in seconds; empty uses 300 or lfm3_audio.max_pass_duration_sec, whichever is lower."},
+    {"name": "chat", "type": "bool", "label": "chat", "default": false, "info_en": "Answer the spoken input as a text chat reply instead of transcribing it."},
+    {"name": "enable_thinking", "type": "bool", "label": "enable_thinking", "default": false, "info_en": "Needs chat. Let the model think first; only the text after </think> is returned."},
+    {"name": "max_tokens", "type": "number", "label": "max_tokens", "minimum": 1, "step": 1, "precision": 0, "info_en": "Text tokens allowed per chunk; empty uses 512 or 8 per second of audio, whichever is more (chat 512, 2048 with thinking). A reply that reaches it is cut off there."}
+  ],
+
   "confucius4_r2t2": [
     {"name": "chunk_size_ms", "type": "slider", "scope": "session", "session_option": "confucius4_r2t2.chunk_size_ms", "label": "chunk_size_ms（流式分块毫秒）", "label_en": "chunk_size_ms (streaming chunk, ms)", "default": 320, "minimum": 80, "maximum": 2000, "step": 10, "precision": 0, "info": "80-2000ms：越小延迟越低；320ms 在 Apple Silicon 上延迟与速度较均衡。", "info_en": "80-2000 ms. Lower means lower latency; 320 ms balances latency and speed on Apple Silicon."},
     {"name": "unfixed_chunk_num", "type": "number", "scope": "session", "session_option": "confucius4_r2t2.unfixed_chunk_num", "label": "unfixed_chunk_num（前 N 块不用稳定前缀）", "label_en": "unfixed_chunk_num (leading chunks without prefix)", "default": 2, "minimum": 0, "maximum": 10, "step": 1, "precision": 0, "info": "开头若干块不使用已识别文本作为前缀提示。", "info_en": "Leading chunks that decode without a stable-prefix prompt."},
@@ -330,6 +497,11 @@
 
   "pocket_tts": [
     {"name": "frames_after_eos", "type": "number", "label": "frames_after_eos（-1=自动）", "default": -1, "minimum": -1, "step": 1, "precision": 0}
+  ],
+
+  "gradium_phonon": [
+    {"name": "frames_after_eos", "type": "number", "label": "frames_after_eos（-1=自动）", "label_en": "frames_after_eos (-1 = auto)", "default": -1, "minimum": -1, "step": 1, "precision": 0},
+    {"name": "temperature", "type": "slider", "label": "temperature", "default": 0.3, "minimum": 0.05, "maximum": 1.0, "step": 0.05}
   ],
 
   "neutts": [
@@ -420,6 +592,8 @@
   ],
 
   "ace_step": [
+    {"name": "lora", "type": "text", "scope": "session", "session_option": "ace_step.lora", "label": "LoRA adapter", "default": "", "info": "Adapter file or PEFT directory on the server; relative paths use the model root."},
+    {"name": "lora_scale", "type": "number", "scope": "session", "session_option": "ace_step.lora_scale", "label": "LoRA strength", "default": 1, "step": 0.1, "info": "Multiplies the adapter metadata scale; zero disables the adapter."},
     {"name": "route", "type": "choice", "label": "route（操作类型）", "default": "text2music", "choices": ["text2music", "complete", "lego", "extract", "cover", "cover-nofsq", "repaint", "remix"], "info": "cover/remix=换词翻唱，非 text2music 需上传源音频；详见 webui/README.md"},
     {"name": "num_inference_steps", "type": "number", "label": "num_inference_steps", "default": 8, "minimum": 1, "maximum": 20, "step": 1, "precision": 0, "info": "扩散步数（turbo 上限 20）；remix 路由不填时默认 16，其他路由默认 8"},
     {"name": "shift", "type": "slider", "label": "shift（时间步弯曲）", "default": 3.0, "minimum": 1.0, "maximum": 5.0, "step": 0.5, "info": "原版 turbo 默认 3.0；1.0 会明显劣化 remix 换词咬字"},

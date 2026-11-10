@@ -31,7 +31,7 @@
 #endif
 #include <process.h>
 #include <windows.h>
-#else
+#elif !defined(__EMSCRIPTEN__)
 #include <spawn.h>
 #include <sys/wait.h>
 extern char ** environ;
@@ -377,6 +377,8 @@ int run_process(const std::string & program, const std::vector<std::string> & ar
             "failed to launch process: " + format_process_args(program, args) + ": " + std::strerror(errno));
     }
     return static_cast<int>(rc);
+#elif defined(__EMSCRIPTEN__)
+    throw std::runtime_error("external processes are unavailable in the browser: " + format_process_args(program, args));
 #else
     std::vector<char *> argv;
     argv.reserve(args.size() + 2);
@@ -568,6 +570,10 @@ engine::core::BackendConfig parse_step_backend(
     engine::core::BackendConfig fallback) {
     if (const auto backend = workflow_optional_string(step, "backend")) {
         fallback.type = minitts::cli::parse_backend(*backend);
+        fallback.impl.clear();
+    }
+    if (const auto impl = workflow_optional_string(step, "backend_impl")) {
+        fallback.impl = *impl;
     }
     if (const auto device = workflow_optional_number(step, "device")) {
         fallback.device = static_cast<int>(*device);

@@ -4,6 +4,10 @@
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
 
+#ifdef GGML_CUDA_CUDNN_CONV3D
+#include <cudnn.h>
+#endif
+
 #include <cstdint>
 #include <memory>
 
@@ -1378,13 +1382,30 @@ struct ggml_cuda_stream_context {
     }
 };
 
+#ifdef GGML_USE_HIP
+struct ggml_hip_impl;
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    std::unordered_map<const ggml_cgraph *, uint32_t> graph_fusions;
+    uint32_t active_graph_fusions = 0;
+#endif
+
+#ifdef GGML_USE_HIP
+    const ggml_hip_impl * impl = nullptr;
+#endif
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+
+#ifdef GGML_CUDA_CUDNN_CONV3D
+    // One handle per backend/device, shared by sequential convolution launches.
+    cudnnHandle_t conv3d_cudnn_handle = nullptr;
+#endif
 
     int curr_stream_no = 0;
 
@@ -1452,6 +1473,11 @@ struct ggml_backend_cuda_context {
     // ggml_backend_cuda_set_stream_priority(); scoped to this backend
     // instance, unlike a process-wide environment variable.
     int stream_priority = 0;
+
+    // Fold a ROUND_BF16 that directly follows RMS_NORM*MUL, ADD or SwiGLU into
+    // the producing kernel. Off by default; set through
+    // ggml_backend_cuda_set_round_bf16_fusion(), scoped to this backend instance.
+    bool round_bf16_fusion = false;
 
     ~ggml_backend_cuda_context();
 

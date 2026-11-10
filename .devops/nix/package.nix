@@ -20,7 +20,7 @@
   # Overridable feature flags
   cudaSupport ? config.cudaSupport or false,
   vulkanSupport ? false,
-  metalSupport ? stdenv.isDarwin,
+  metalSupport ? stdenv.hostPlatform.isDarwin,
   rocmSupport ? config.rocmSupport or false,
   rocmGpuTargets ? (lib.optionals rocmSupport rocmPackages.clr.gpuTargets),
   strixHaloOptimizations ? (rocmSupport && rocmGpuTargets == [ "gfx1151" ]),
@@ -42,7 +42,12 @@ stdenv.mkDerivation (finalAttrs: {
   ]
   ++ lib.optional cudaSupport cudaPackages.cuda_nvcc
   ++ lib.optional cudaSupport autoAddDriverRunpath
-  ++ lib.optional rocmSupport rocmPackages.clr;
+  ++ lib.optional rocmSupport rocmPackages.clr
+  # ggml's HIP argsort path needs the hipcub and rocprim headers explicitly.
+  ++ lib.optionals rocmSupport [
+    rocmPackages.hipcub
+    rocmPackages.rocprim
+  ];
 
   buildInputs = [
     python-scripts
@@ -82,7 +87,7 @@ stdenv.mkDerivation (finalAttrs: {
     else
       [ "-DAUDIOCPP_MODEL_SET=full" ]
   )
-  ++ lib.optional stdenv.isDarwin "-DENGINE_ENABLE_OPENMP=OFF"
+  ++ lib.optional stdenv.hostPlatform.isDarwin "-DENGINE_ENABLE_OPENMP=OFF"
   ++ lib.optional vulkanSupport "-DENGINE_ENABLE_VULKAN=ON"
   ++ lib.optional cudaSupport "-DENGINE_ENABLE_CUDA=ON"
   ++ lib.optional metalSupport "-DENGINE_ENABLE_METAL=ON"

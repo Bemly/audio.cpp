@@ -1,6 +1,9 @@
 #include "engine/models/kokoro_tts/session.h"
 
 #include "engine/framework/debug/profiler.h"
+#include "engine/framework/io/json.h"
+#include "engine/framework/rknn/engine.h"
+#include "engine/framework/rknn/engine_resources.h"
 #include "engine/framework/text/chunking.h"
 #include "engine/framework/debug/trace.h"
 #include "engine/framework/runtime/options.h"
@@ -12,7 +15,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -29,14 +34,11 @@ constexpr int64_t kDefaultTextChunkSize = 240;
 constexpr const char * kFamily = "kokoro_tts";
 constexpr const char * kModelName = "Kokoro TTS";
 
-// A published GGUF package embeds its own model spec, so an option added to
-// model_specs/kokoro_tts.json is invisible to a package built before it. The NPU
-// generator option is therefore also accepted by name (piper_tts does the same).
-constexpr const char * kPackageIndependentSessionOptions[] = {
-    "kokoro_tts.rknn_generator",
-    "kokoro_tts.rknn_generator_overlap",
-    "kokoro_tts.rknn_generator_gain",
-};
+// Chinese and Japanese phonemize to several symbols per character, so a 240-character chunk exceeds the 510-symbol
+// input limit (Chinese does from about 150 characters) and the request fails. 100 characters leave room for denser text.
+int64_t default_text_chunk_size(const KokoroFrontendSessionState & state) {
+    return state.language_code == "z" || state.language_code == "j" ? 100 : kDefaultTextChunkSize;
+}
 
 }  // namespace
 
@@ -65,36 +67,38 @@ KokoroTTSSession::KokoroTTSSession(
                             "kokoro_tts.predictor_tail_graph_mb"}) {
         validation_options.options.erase(key);
     }
-    // The RKNN sidecar options are model-local and opt-in, and a published GGUF package embeds
-    // an older spec that does not declare them, so they are accepted by name below.
-    for (const auto * key : kPackageIndependentSessionOptions) {
-        validation_options.options.erase(key);
+    // Older embedded contracts omit exec_plan; parse_exec_plan validates its value.
+    if (contract_->session_option_keys.find("kokoro_tts.exec_plan") == contract_->session_option_keys.end()) {
+        validation_options.options.erase("kokoro_tts.exec_plan");
     }
     runtime::validate_spec_backed_session_options(validation_options, *contract_, kFamily, kModelName);
-    if (const auto found = RuntimeSessionBase::options().options.find("kokoro_tts.rknn_generator");        found != RuntimeSessionBase::options().options.end()) {
-        rknn_generator_path_ = found->second;
+    const auto exec_plan = runtime::parse_exec_plan(
+        options.options,
+        "kokoro_tts.exec_plan",
+        {{"generator", "ggml",
+          {{"ggml", {options.backend.type}, {}, {}},
+           {"rknn", {}, {"main"}, {}, {"overlap", "gain"}},
+           {"neon", {core::BackendType::Cpu}, {}, {}}}}});
+    const auto & generator_plan = exec_plan.at("generator");
+    neon_generator_ = generator_plan.impl == "neon";
+    if (generator_plan.impl == "rknn") {
+        rknn_generator_path_ = engine::rknn::resolve_engine_path(
+            generator_plan.artifacts.at("main"), assets_->resources.model_directory());
     }
-    if (rknn_generator_path_.empty()) {
-        for (const char * option : {"kokoro_tts.rknn_generator_overlap",
-                                    "kokoro_tts.rknn_generator_gain"}) {
-            if (RuntimeSessionBase::options().options.count(option) != 0) {
-                throw std::runtime_error(
-                    std::string(kModelName) + " session option 'kokoro_tts.rknn_generator' " +
-                    "must name an RKNN engine before '" + option + "' can tune its window walk");
-            }
+    if (const auto overlap = generator_plan.params.find("overlap"); overlap != generator_plan.params.end()) {
+        const auto & value = overlap->second;
+        if (!value.is_number() || !std::isfinite(value.as_number()) || value.as_number() < 0 ||
+            value.as_number() >= static_cast<double>(std::numeric_limits<int64_t>::max()) ||
+            std::floor(value.as_number()) != value.as_number()) {
+            throw std::runtime_error("kokoro_tts.exec_plan.generator.params.overlap must be a nonnegative integer");
         }
+        rknn_generator_overlap_ = value.as_i64();
     }
-    if (const auto overlap = runtime::parse_i64_option(
-            RuntimeSessionBase::options().options,
-            {"kokoro_tts.rknn_generator_overlap"});
-        overlap.has_value()) {
-        rknn_generator_overlap_ = *overlap;
-    }
-    if (const auto gain = runtime::find_option(
-            RuntimeSessionBase::options().options,
-            {"kokoro_tts.rknn_generator_gain"});
-        gain.has_value()) {
-        rknn_generator_gain_ = runtime::parse_bool_option(*gain, "kokoro_tts.rknn_generator_gain");
+    if (const auto gain = generator_plan.params.find("gain"); gain != generator_plan.params.end()) {
+        if (!gain->second.is_bool()) {
+            throw std::runtime_error("kokoro_tts.exec_plan.generator.params.gain must be a boolean");
+        }
+        rknn_generator_gain_ = gain->second.as_bool();
     }
     if (task_.task != runtime::VoiceTaskKind::Tts) {
         throw std::runtime_error("Kokoro TTS only supports tts tasks");
@@ -286,7 +290,7 @@ void KokoroTTSSession::prepare_decoder_graph_capacity(int64_t capacity) {
                 decoder_contract,
                 rknn_generator_path_,
                 rknn_generator_overlap_,
-                rknn_generator_gain_);
+                rknn_generator_gain_, neon_generator_);
         });
     }
     prepared_decoder_capacity_ = capacity;
@@ -586,8 +590,8 @@ void KokoroTTSSession::prepare(const runtime::SessionPreparationRequest & reques
     int64_t request_size = 0;
     const auto & prepare_phonemes = require_phoneme_chunks(request.option_arrays);
     if (request.text.has_value()) {
-        const int64_t text_chunk_size =
-            engine::text::parse_text_chunk_size_override(request.options).value_or(kDefaultTextChunkSize);
+        const int64_t text_chunk_size = engine::text::parse_text_chunk_size_override(request.options).value_or(
+            default_text_chunk_size(resolve_kokoro_frontend_session_state(request.text, voice, *assets_)));
         // The graph is sized for the LARGEST chunk either way. With supplied phonemes the
         // caller's own chunking decides that, so the text is not split -- splitting it would
         // size the graph against a boundary run() is never going to use.
@@ -647,8 +651,8 @@ runtime::TaskResult KokoroTTSSession::synthesize(const runtime::TaskRequest & re
     if (prepared_decoder_) prepared_decoder_->set_seed(rng_seed_);
     engine::debug::trace_log_scalar("kokoro.generation.seed", rng_seed_);
 
-    const int64_t text_chunk_size =
-        engine::text::parse_text_chunk_size_override(request.options).value_or(kDefaultTextChunkSize);
+    const int64_t text_chunk_size = engine::text::parse_text_chunk_size_override(request.options).value_or(
+        default_text_chunk_size(resolve_kokoro_frontend_session_state(request.text_input, voice, *assets_)));
     // ⚠ WHEN PHONEMES ARE SUPPLIED THE CALLER OWNS THE CHUNKING. Chunking splits the TEXT, and
     // nothing here knows where the matching cut points in someone else's phoneme stream are --
     // only their G2P does. So the option is a LIST: one entry per chunk, rendered in order and
@@ -794,6 +798,27 @@ runtime::TaskResult KokoroTTSSession::synthesize(const runtime::TaskRequest & re
 std::shared_ptr<runtime::IVoiceModelLoader> make_kokoro_tts_loader() {
     runtime::SpecBackedVoiceModelConfig<KokoroAssets> config;
     config.family = kFamily;
+    config.model_resources = [](const std::filesystem::path & path,
+                                const std::unordered_map<std::string, std::string> & options) {
+        const auto option = options.find("kokoro_tts.exec_plan");
+        if (option == options.end()) {
+            return runtime::ModelResourcePlan{};
+        }
+        std::vector<std::string> artifacts;
+        try {
+            const auto plan = io::json::parse(option->second);
+            const auto * generator = plan.find("generator");
+            const auto * impl = generator ? generator->find("impl") : nullptr;
+            if (!impl || impl->as_string() != "rknn") {
+                return runtime::ModelResourcePlan{};
+            }
+            artifacts.push_back(io::json::require_string(generator->require("artifacts"), "main"));
+        } catch (const std::runtime_error &) {
+            // Session loading reports invalid execution plans.
+            return runtime::ModelResourcePlan{};
+        }
+        return rknn::engine_resources(artifacts, path);
+    };
     config.load_assets = [](const std::filesystem::path & model_path) {
         return load_kokoro_assets(model_path);
     };
