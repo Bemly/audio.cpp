@@ -3120,6 +3120,33 @@ bool ggml_metal_op_flash_attn_ext_amd_quant_supported(const ggml_tensor * op) {
 // vec path split count (0 = auto)
 static int ggml_metal_op_flash_attn_ext_amd_split_count(const ggml_tensor * op);
 
+// register-tiled prefill (ToshLLM pf_amd); GGML_METAL_FA_PF_DISABLE keeps the tile kernel
+static bool ggml_metal_op_flash_attn_ext_amd_pf(
+        ggml_metal_op_t ctx, const ggml_metal_kargs_flash_attn_ext_amd & args, int dk, bool has_mask,
+        ggml_metal_buffer_id bid_q, ggml_metal_buffer_id bid_k, ggml_metal_buffer_id bid_v,
+        ggml_metal_buffer_id bid_m, ggml_metal_buffer_id bid_dst) {
+    static const bool pf_disabled = getenv("GGML_METAL_FA_PF_DISABLE") != nullptr;
+    if (pf_disabled || args.ne01 < 32 || (dk != 64 && dk != 128 && dk != 256)) {
+        return false;
+    }
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_pf(ctx->lib, dk, has_mask);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, (void *) &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_q,   1);
+    ggml_metal_encoder_set_buffer  (enc, bid_k,   2);
+    ggml_metal_encoder_set_buffer  (enc, bid_v,   3);
+    ggml_metal_encoder_set_buffer  (enc, bid_m,   4);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst, 5);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 0, 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne01 + pipeline.nr0 - 1)/pipeline.nr0, args.ne02, args.ne03, 32, 8, 1);
+
+    return true;
+}
+
 static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, float scale) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3328,8 +3355,8 @@ static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, 
         ggml_metal_kargs_flash_attn_ext_amd_reduce args_r = {
             /*.ne02  =*/ ne02,
             /*.ne03  =*/ ne03,
-            /*.nb02  =*/ nb02,
-            /*.nb03  =*/ nb03,
+            /*.nb02  =*/ nbd1,
+            /*.nb03  =*/ nbd3,
             /*.split =*/ split,
         };
 
@@ -3372,6 +3399,10 @@ static int ggml_metal_op_flash_attn_ext_amd_quant(ggml_metal_op_t ctx, int idx, 
             /*.nbh_d   =*/ nbd1,
             /*.nbb_d   =*/ nbd3,
         };
+
+    if (ggml_metal_op_flash_attn_ext_amd_pf(ctx, args, dk, has_mask, bid_q, bid_k, bid_v, bid_m, bid_dst)) {
+        return 1;
+    }
 
     auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(lib, dk, has_mask);
 
@@ -3529,8 +3560,8 @@ static int ggml_metal_op_flash_attn_ext_amd(ggml_metal_op_t ctx, int idx, float 
         ggml_metal_kargs_flash_attn_ext_amd_reduce args_r = {
             /*.ne02  =*/ ne02,
             /*.ne03  =*/ ne03,
-            /*.nb02  =*/ nb02,
-            /*.nb03  =*/ nb03,
+            /*.nb02  =*/ nb1,
+            /*.nb03  =*/ nb3,
             /*.split =*/ split,
         };
 
@@ -3574,6 +3605,10 @@ static int ggml_metal_op_flash_attn_ext_amd(ggml_metal_op_t ctx, int idx, float 
             /*.nbh_d   =*/ nb1,
             /*.nbb_d   =*/ nb3,
         };
+
+    if (ggml_metal_op_flash_attn_ext_amd_pf(ctx, args, dk, has_mask, bid_q, bid_k, bid_v, bid_m, bid_dst)) {
+        return 1;
+    }
 
     auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_amd_tile(lib, dk, has_mask);
 
