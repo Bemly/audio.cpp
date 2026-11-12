@@ -634,6 +634,8 @@ add_library(engine_core OBJECT
     src/framework/modules/transformers/decoder.cpp
     src/framework/modules/transformers/causal_decoder.cpp
     src/framework/modules/transformers/causal_decoder_runtime.cpp
+    src/framework/modules/transformers/dit.cpp
+    src/framework/modules/transformers/dit_runtime.cpp
     src/framework/modules/speech_encoders/lfm3_audio_encoder_runtime.cpp
     src/framework/modules/speech_encoders/rope_transformer_encoder_runtime.cpp
     src/framework/modules/transformers/lfm_decoder_runtime.cpp
@@ -969,6 +971,7 @@ audiocpp_add_model(omnivoice
         src/models/omnivoice/audio_tokenizer.cpp
         src/models/omnivoice/prompt_builder.cpp
         src/models/omnivoice/generator.cpp
+        src/models/omnivoice/rknn_generator.cpp
         src/models/omnivoice/postprocess.cpp
         src/models/omnivoice/session.cpp
         src/models/omnivoice/loader.cpp
@@ -1138,7 +1141,7 @@ audiocpp_add_model(maya1
 
 audiocpp_add_model(parakeet_tdt
     SOURCES
-        src/community_models/parakeet_tdt/implementation.cpp
+        src/community_models/parakeet_tdt/routing.cpp
         src/community_models/parakeet_tdt/predictor.cpp
         src/community_models/parakeet_tdt/assets.cpp
         src/community_models/parakeet_tdt/bark3.cpp
@@ -2449,6 +2452,18 @@ audiocpp_add_model(niagara_asr
         engine/models/niagara_asr/weights.h
     LOADERS
         engine::models::niagara_asr::make_niagara_asr_loader
+)
+
+audiocpp_add_model(edda_asr
+    SOURCES
+        src/community_models/edda_asr/assets.cpp
+        src/community_models/edda_asr/weights.cpp
+        src/community_models/edda_asr/runtime.cpp
+        src/community_models/edda_asr/session.cpp
+    INCLUDES
+        engine/community_models/edda_asr/model.h
+    LOADERS
+        engine::community_models::edda_asr::make_edda_asr_loader
 )
 
 audiocpp_add_model(whistle_asr
@@ -3802,11 +3817,17 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         endif()
     endif()
 
+    add_engine_unittest(model_routing_test tests/unittests/test_model_routing.cpp)
+    add_test(NAME model_routing_test COMMAND model_routing_test
+        --log ${CMAKE_CURRENT_BINARY_DIR}/model_routing_test.log)
     add_engine_unittest(ctc_host_decoder_test tests/unittests/test_ctc_host_decoder.cpp)
     add_test(NAME ctc_host_decoder_test COMMAND ctc_host_decoder_test)
     add_engine_unittest(device_denoiser_runtime_test tests/unittests/test_device_denoiser_runtime.cpp)
     add_test(NAME device_denoiser_runtime_test COMMAND device_denoiser_runtime_test
         --log ${CMAKE_CURRENT_BINARY_DIR}/device_denoiser_runtime_test.log)
+    add_engine_unittest(dit_runtime_test tests/unittests/test_dit_runtime.cpp)
+    add_test(NAME dit_runtime_test COMMAND dit_runtime_test
+        --log ${CMAKE_CURRENT_BINARY_DIR}/dit_runtime_test.log)
     add_engine_unittest(prepared_graph_test tests/unittests/test_prepared_graph.cpp)
     target_include_directories(prepared_graph_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external/ggml/src)
     add_test(NAME prepared_graph_test COMMAND prepared_graph_test
@@ -5215,6 +5236,7 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
         if (dots_tts IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(dots_tts_vocoder_parity tests/dots_tts/dots_tts_vocoder_parity.cpp)
+        add_engine_unittest(dots_tts_flow_parity tests/dots_tts/dots_tts_flow_parity.cpp)
         endif()
 
         # Needs the GGUF and a PyTorch reference dump, so it is driven by hand

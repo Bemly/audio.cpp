@@ -154,6 +154,7 @@ Arena and weight-context sizes are in MiB.
 | `omnivoice.generator_decode_graph_arena_mb` | positive integer | `256` | Generator decode graph arena. |
 | `omnivoice.audio_tokenizer_weight_context_mb` | positive integer | `128` | Audio tokenizer weight tensor context. |
 | `omnivoice.generator_weight_context_mb` | positive integer | `256` | Generator weight tensor context. |
+| `omnivoice.exec_plan` | JSON object | `{}` | Component execution plans. The only component is `generator`; see the RKNN section. |
 
 `omnivoice.perf_mode=flash_attention` is only available on the normal graph path and cannot be combined with `omnivoice.mem_saver=true`.
 
@@ -172,6 +173,57 @@ so only `packed_projections=false` is needed there.
 
 `perf_mode=flash_attention` passes the 8 K/V heads to the kernel as they are
 (grouped-query attention) instead of repeating them to 16 heads.
+
+## Rockchip NPU (RKNN) generator
+
+The generator is the expensive half of this family: the diffusion-LM step graph runs once per
+inference step (`num_inference_steps`, default 32) over the whole sequence, and on an RK3588 it
+is ~99% of synthesis. `omnivoice.exec_plan` voices that one stage through `librknnrt` and leaves
+the text frontend, the audio tokenizer decode and the postprocessing on the host.
+
+RKNN has no runtime graph builder, so each engine is compiled offline for one fixed total-token
+length (the conditional row: style + text + reference + target frames). Build them on an x86_64
+host from the same checkpoint the GGUF was converted from:
+
+```bash
+python3 tools/rknn/prepare_omnivoice_rknn_generator.py \
+    --model-dir /path/to/OmniVoice \
+    --seq-len 256 --seq-len 384 --seq-len 512 --seq-len 768 --seq-len 1024 \
+    --output-dir models/OmniVoice-RKNN
+```
+
+Then point the session at the ladder (order does not matter; the smallest engine that fits is
+used, and a request longer than the largest engine runs the CPU graph). The ladder travels as
+the `generator` component's `main` artifact, comma-separated - see
+[component execution plans](../build/rockchip-npu.md#component-execution-plans):
+
+```bash
+audiocpp_cli --task tts --family omnivoice --model models/OmniVoice-GGUF/omnivoice-q8_0.gguf \
+    --backend cpu --session-option 'omnivoice.exec_plan={"generator":{"impl":"rknn","artifacts":{"main":"models/OmniVoice-RKNN/omnivoice_generator_seq256_fp16.rknn,models/OmniVoice-RKNN/omnivoice_generator_seq1024_fp16.rknn"}}}' \
+    --text "..." --out out.wav
+```
+
+Build with `-DENGINE_ENABLE_RKNN=ON` (plus `ENGINE_RKNN_LIBRARY` / `ENGINE_RKNN_INCLUDE_DIR`
+pointing at the board's `librknnrt`); a plan selecting `impl: rknn` throws at load in a build
+without it rather than falling back silently. Each engine carries the fp16 weight set and asks
+the driver for its whole residency at init, so one rung is resident at a time
+(`AUDIOCPP_RKNN_APERTURE_MIB`). Requests pad up to the bucket; the padding is exact (measured
+398-401 dB padded-vs-exact on the fp32 graph), and the step costs about `S^2` in attention, so
+the bucket ladder is a time trade.
+
+A ladder built with the producer's `--front-k 28` (`omnivoice_generator_front28_seq*.rknn`) is
+the front-shard contract: the engine runs the embeddings and all 28 backbone layers on the NPU
+and returns the raw hidden state, and the CFG tail - final RMS norm, the 8 audio heads, the
+guidance combine - runs on the host in fp32. This is the mode that makes
+`--guidance-scale > 0` usable on the NPU: the full ladder's in-graph fp16 heads put the
+unconditional logits at 26.9 dB SNR (past the decoding knife-edge, so guidance renders noise),
+while the same fp16 backbone leaves the hidden state at 67 dB and the fp32 tail returns the
+guided logits to ~84 dB. It costs about 0.4 s/step of CPU tail time on top of the ~8.4 s/step
+NPU pass, is validated at guidance 2.0 (board gate whisper-clean, same reference and seed), and
+runs at batch 1 only (a batched shard request falls back to the CPU graph). Length accounting
+includes the reference audio: a 14 s reference alone costs about 393 prompt tokens, so the
+short rungs (seq256/384) only engage with a short reference clip; anything above a rung's
+capacity runs the CPU graph.
 
 ## Native Batching
 
@@ -216,6 +268,8 @@ The T4 is already saturated by one request, so `run_batch()` is not faster
 than sequential `run()` there.
 
 The two `weight_type` options quantize SafeTensors weights at load time, which is not the same as loading a prebuilt Q8 GGUF package. On CUDA, `omnivoice.generator_weight_type=f16` measured 1.26x faster than `native`, while runtime `omnivoice.audio_tokenizer_weight_type=q8_0` produced unusable audio without being faster. See the [OmniVoice weight-type benchmark](../reports/omnivoice_weight_type_benchmark.md).
+
+For throughput on an RTX 4090 with several instances and batch sizes, in f16 and bf16, compared with the Python OmniVoice package (with and without FlashInfer), see the [OmniVoice concurrency benchmark](../reports/omnivoice_concurrency_benchmark.md).
 
 ## VoiceTut-TTS (Egyptian Arabic)
 
