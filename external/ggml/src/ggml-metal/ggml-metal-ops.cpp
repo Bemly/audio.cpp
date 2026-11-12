@@ -2463,9 +2463,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     } else if (
         !ggml_is_transposed(op->src[0]) &&
         !ggml_is_transposed(op->src[1]) &&
-        // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
-        // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
-        props_dev->has_simdgroup_mm && props_dev->supports_gpu_family_apple7 && ne00 >= 64 && ne11 > ne11_mm_min) {
+        // simdgroup-matrix kernel on A14+/M1+; AMD takes the register-tiled manual path of the
+        // same kernel, except the full-f32 variant whose float tiles that path does not lay out
+        ((props_dev->has_simdgroup_mm && props_dev->supports_gpu_family_apple7) ||
+         (props_dev->use_mm_manual && ggml_get_op_params_i32(op, 1) != GGML_MUL_MAT_LOWERING_METAL_F32_INPUTS)) &&
+        ne00 >= 64 && ne11 > ne11_mm_min) {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
         // some Metal matrix data types require aligned pointers
@@ -2494,7 +2496,25 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.ne1  =*/ ne1,
             /*.r2   =*/ r2,
             /*.r3   =*/ r3,
+            /*.band =*/ 0,
         };
+
+        const int nr0 = pipeline.nr0;
+        const int nr1 = pipeline.nr1;
+        const int nsg = pipeline.nsg;
+
+        // bands only pay with a last-level cache that holds them; TOSH_MM_BAND_MB sets another
+        // size, 0 the plain order
+        if (!props_dev->has_simdgroup_mm && !props_dev->has_unified_memory &&
+            (strstr(props_dev->desc, "RX 6") || strstr(props_dev->desc, "W6"))) {
+            static const int64_t band_bytes = (int64_t) (getenv("TOSH_MM_BAND_MB") ? atoi(getenv("TOSH_MM_BAND_MB")) : 16) << 20;
+            const int64_t tile_bytes = (int64_t) nr1*nb11;
+            const int64_t ntx = (ne11 + nr1 - 1)/nr1;
+            if (band_bytes > 0 && tile_bytes > 0) {
+                const int64_t band = std::max<int64_t>(1, band_bytes/tile_bytes);
+                args.band = band < ntx ? (int32_t) band : 0;
+            }
+        }
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -2505,10 +2525,6 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const size_t smem = pipeline.smem;
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-
-        const int nr0 = pipeline.nr0;
-        const int nr1 = pipeline.nr1;
-        const int nsg = pipeline.nsg;
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
     } else {
