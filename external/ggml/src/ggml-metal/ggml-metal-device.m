@@ -170,6 +170,24 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
         extern const char ggml_metallib_end[];
 
         src = [[NSString alloc] initWithBytes:ggml_metallib_start length:(ggml_metallib_end-ggml_metallib_start) encoding:NSUTF8StringEncoding];
+
+        // load the precompiled default.metallib next to the binary rather than spending tens of
+        // seconds compiling the embedded source. It is built without the tensor API, so M5-class
+        // GPUs fall through to the source compile below and keep their tensor kernels.
+        if (!ggml_metal_device_get_props(dev)->has_tensor) {
+            NSString * bin_dir  = [[[NSProcessInfo processInfo] arguments][0] stringByDeletingLastPathComponent];
+            NSString * path_lib = [NSString pathWithComponents:@[bin_dir, @"default.metallib"]];
+            if ([[NSFileManager defaultManager] isReadableFileAtPath:path_lib]) {
+                NSError * lib_error = nil;
+                id<MTLLibrary> precompiled = [device newLibraryWithURL:[NSURL fileURLWithPath:path_lib] error:&lib_error];
+                if (precompiled && lib_error == nil) {
+                    GGML_LOG_INFO("%s: loaded precompiled '%s'\n", __func__, [path_lib UTF8String]);
+                    library = precompiled;
+                } else {
+                    GGML_LOG_WARN("%s: precompiled metallib unusable, compiling from source\n", __func__);
+                }
+            }
+        }
 #else
 
 #ifdef SWIFT_PACKAGE
