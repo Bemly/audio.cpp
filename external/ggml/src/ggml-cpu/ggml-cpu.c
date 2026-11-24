@@ -2124,6 +2124,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ssm_conv_causal_silu(params, tensor);
             } break;
+        case GGML_OP_CONV_2D_DW_SPARSE:
+            ggml_compute_forward_conv_2d_dw_sparse(params, tensor);
+            break;
+        case GGML_OP_AFFINE:
+            ggml_compute_forward_affine(params, tensor);
+            break;
+        case GGML_OP_GRU_CELL:
+            ggml_compute_forward_gru_cell(params, tensor);
+            break;
+        case GGML_OP_GRU_SCAN:
+            ggml_compute_forward_gru_scan(params, tensor);
+            break;
         case GGML_OP_SSM_SCAN_MAMBA1:
             {
                 ggml_compute_forward_ssm_scan_mamba1(params, tensor);
@@ -2408,6 +2420,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
 
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_ERF:
+                case GGML_UNARY_OP_GELU_ERF_APPROX:
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_XIELU:
@@ -2531,6 +2544,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_SSM_CONV_CAUSAL_SILU:
+        case GGML_OP_AFFINE:
+        case GGML_OP_CONV_2D_DW_SPARSE:
+        case GGML_OP_GRU_CELL:
+        case GGML_OP_GRU_SCAN:
         case GGML_OP_SSM_SCAN_MAMBA1:
             {
                 n_tasks = n_threads;

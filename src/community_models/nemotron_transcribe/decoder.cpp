@@ -2,13 +2,10 @@
 #include "engine/community_models/nemotron_transcribe/repetition_guard.h"
 
 #include "engine/framework/core/backend_weight_store.h"
-#include "engine/framework/core/prepared_graph.h"
-#include "engine/framework/core/disk_expert_weight_store.h"
+#include "engine/framework/moe_engine/moe_prepared_graph.h"
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/runtime/kv_cache.h"
-#include "engine/framework/modules/moe_module.h"
 #include "engine/framework/modules/feed_forward_modules.h"
-#include "engine/framework/modules/staged_moe_runtime.h"
 #include "engine/framework/sampling/hf_sampler.h"
 
 #include <ggml-alloc.h>
@@ -139,11 +136,8 @@ struct LayerWeights {
     ggml_tensor * k = nullptr;
     ggml_tensor * v = nullptr;
     ggml_tensor * attention_out = nullptr;
-    ggml_tensor * router = nullptr;
-    ggml_tensor * router_bias = nullptr;
-    ggml_tensor * experts_up = nullptr;
-    ggml_tensor * experts_down = nullptr;
     modules::FeedForwardWeights shared;
+    moe::LayerId expert;
 };
 
 struct Weights {
@@ -151,8 +145,7 @@ struct Weights {
     ggml_tensor * final_norm = nullptr;
     ggml_tensor * output = nullptr;
     std::vector<LayerWeights> layers;
-    core::DiskExpertWeightStore * disk_store = nullptr;
-    std::vector<size_t> disk_groups;
+    moe::MoeEngine * experts = nullptr;
 };
 
 // Caches have their own allocation so all bounded prefill/decode graphs share
@@ -309,24 +302,18 @@ ggml_tensor * build_attention(ggml_context * g, ggml_tensor * input, const Layer
 class DecoderGraph {
 public:
     DecoderGraph(const DecoderConfig & c, const Weights & w, DecoderState & state,
-        core::ExecutionContext & execution, int64_t steps, bool prompt)
+        core::ExecutionContext & execution, int64_t steps, bool prompt, bool needs_logits = true)
         : execution_(execution), state_(state), steps_(steps), prompt_(prompt), hidden_size_(c.hidden_size), weights_(w),
+          workspace_(w.experts->staged() ? std::make_shared<core::GraphWorkspace>(execution.backend()) : nullptr),
           prepared_(execution, {"nemotron_transcribe.decoder", kGraphArenaBytes, kGraphNodes,
-              w.disk_store ? 64 * ggml_tensor_overhead() : 0}) {
-        routing_config_.experts = c.experts;
-        routing_config_.selected = c.experts_per_token;
-        routing_config_.scoring = modules::MoeScoring::Sigmoid;
-        routing_config_.normalization = modules::MoeNormalization::Clamp;
-        routing_config_.denominator_epsilon = 6.103515625e-5F;
-        routing_config_.scale = c.routed_scaling_factor;
-        routing_config_.precision = GGML_PREC_F32;
+              w.experts->staged() ? 64 * ggml_tensor_overhead() : 0}, workspace_) {
         shared_config_.hidden_size = c.hidden_size;
         shared_config_.intermediate_size = c.shared_expert_width;
         shared_config_.use_bias = false;
         shared_config_.activation = modules::FeedForwardActivation::ReluSquared;
         auto * g = prepared_.build_context().ggml;
         graph_ = prepared_.graph();
-        auto * inputs = w.disk_store ? prepared_.persistent_build_context().ggml : g;
+        auto * inputs = w.experts->staged() ? prepared_.persistent_build_context().ggml : g;
         ids_ = ggml_new_tensor_1d(inputs, GGML_TYPE_I32, steps);
         ggml_set_input(ids_);
         if (c.block_pattern.find('M') != std::string::npos) {
@@ -355,11 +342,11 @@ public:
             audio_scratch_.resize(static_cast<size_t>(c.hidden_size * steps));
             text_mask_scratch_.resize(static_cast<size_t>(steps));
         }
-        if (w.disk_store) {
+        if (w.experts->staged()) {
             build_offload(c, w, cur);
             return;
         }
-        if (prompt) {
+        if (prompt && w.experts->config().cpu_layers.empty()) {
             body_id_ = prepared_.add_entry_point("body", 0);
             prefill_body_ = prepared_.graph(body_id_);
         }
@@ -373,14 +360,24 @@ public:
             switch (c.block_pattern[i]) {
                 case 'M': cur = build_mamba(g, prefill_body_ ? prefill_body_ : graph_,
                     cur, layer, c, state, i, sequence_id_, steps); break;
-                case 'A': cur = build_attention(g, cur, layer, c, state, i, slots_, mask_, steps, prefill_body_); break;
-                case 'E': cur = build_moe(ctx, cur, layer); break;
+                case 'A': cur = build_attention(g, cur, layer, c, state, i, slots_, mask_, steps,
+                    prefill_body_ ? prefill_body_ : (!needs_logits ? graph_ : nullptr)); break;
+                case 'E': {
+                    auto shared = modules::FeedForwardModule(shared_config_).build(ctx, core::wrap_tensor(cur, core::TensorShape::from_dims({steps_, c.hidden_size})), layer.shared);
+                    cur = ggml_add(g, w.experts->build(prepared_, layer.expert, cur), shared.tensor);
+                    break;
+                }
             }
             cur = ggml_add(g, cur, residual);
         }
         // Intermediate chunks need only recurrent/KV updates. Copy their graph
         // into the full graph so both executions share the same tensor allocation.
         if (prefill_body_) ggml_graph_cpy(prefill_body_, graph_);
+        if (!needs_logits) {
+
+            prepared_.allocate();
+            return;
+        }
         // All tokens update state, but only the last row needs the large head.
         cur = ggml_view_2d(g, cur, c.hidden_size, 1, cur->nb[1], (steps - 1) * cur->nb[1]);
         cur = rms_norm(g, cur, w.final_norm, c.rms_norm_eps);
@@ -419,31 +416,9 @@ public:
 
 
 private:
-    ggml_tensor * build_moe(core::ModuleBuildContext & ctx, ggml_tensor * input,
-        const LayerWeights & layer) const {
-        const auto routing = modules::MoeModule::build_routing(ctx, input, layer.router, layer.router_bias, routing_config_);
-        auto * routed = moe_.build(ctx, input, routing, {layer.experts_up, nullptr, layer.experts_down});
-        auto shared = modules::FeedForwardModule(shared_config_).build(ctx,
-            core::wrap_tensor(input, core::TensorShape::from_dims({input->ne[1], input->ne[0]})), layer.shared);
-        return ggml_add(ctx.ggml, routed, shared.tensor);
-    }
-
     void build_offload(const DecoderConfig & c, const Weights & weights,
         ggml_tensor * embeddings) {
-        const auto h = c.hidden_size, k = c.experts_per_token;
-        const auto first = c.block_pattern.find('E');
-        slots_count_ = weights.layers.at(first).experts_up->ne[2];
-        int64_t expert_rows = std::min<int64_t>(steps_, 32);
-        while ((expert_rows & (expert_rows - 1)) != 0) ++expert_rows;
-        modules::StagedMoeConfig staged_config;
-        staged_config.hidden_size = h;
-        staged_config.tokens = steps_;
-        staged_config.selected = k;
-        staged_config.experts = c.experts;
-        staged_config.cache_slots = slots_count_;
-        for (int64_t count = 1; count <= expert_rows; count *= 2) staged_config.rows_per_expert.push_back(count);
-        workspace_ = std::make_shared<core::GraphWorkspace>(execution_.backend());
-        staged_moe_ = std::make_unique<modules::StagedMoeRuntime>(execution_, std::move(staged_config), workspace_);
+        const auto h = c.hidden_size;
         auto * persistent = prepared_.persistent_build_context().ggml;
         x_ = ggml_new_tensor_2d(persistent, GGML_TYPE_F32, h, steps_);
         shared_ = ggml_new_tensor_2d(persistent, GGML_TYPE_F32, h, steps_);
@@ -456,54 +431,40 @@ private:
         ctx.module_instance_name = "nemotron_transcribe.offload";
         ctx.elide_identity_reshapes = true;
         ggml_build_forward_expand(graph_, ggml_cpy(g, embeddings, x_));
+        std::vector<moe::MoePreparedGraph::Step> sequence{size_t{0}};
         for (size_t i = 0; i < c.block_pattern.size(); ++i) {
             const auto & layer = weights.layers[i];
             const auto id = prepared_.add_graph("layer_" + std::to_string(i), 128);
             auto * graph = prepared_.graph(id);
             auto * normalized = rms_norm(g, x_, layer.norm, c.rms_norm_eps);
             if (c.block_pattern[i] == 'E') {
-                const auto routing = modules::MoeModule::build_routing(ctx, normalized, layer.router, layer.router_bias, routing_config_);
                 auto shared = modules::FeedForwardModule(shared_config_).build(ctx,
                     core::wrap_tensor(normalized, core::TensorShape::from_dims({steps_, h})), layer.shared);
                 ggml_build_forward_expand(graph, ggml_cpy(g, shared.tensor, shared_));
-                staged_moe_->build_inputs(ctx, graph, normalized, routing);
+                const auto call = weights.experts->add_call(layer.expert, {steps_, h, h}, workspace_);
+                weights.experts->build_inputs(call, prepared_, id, normalized);
+                const auto finish = prepared_.add_graph("finish_" + std::to_string(i), 64);
+                auto * output = ggml_add(g, weights.experts->build_result(call, prepared_), shared_);
+                ggml_build_forward_expand(prepared_.graph(finish), ggml_cpy(g, ggml_add(g, output, x_), x_));
+                sequence.emplace_back(id); sequence.emplace_back(call); sequence.emplace_back(finish);
             } else {
                 auto * output = c.block_pattern[i] == 'M'
                     ? build_mamba(g, graph, normalized, layer, c, state_, i, sequence_id_, steps_)
                     : build_attention(g, normalized, layer, c, state_, i, slots_, mask_, steps_);
                 ggml_build_forward_expand(graph, ggml_cpy(g, ggml_add(g, output, x_), x_));
             }
-            layer_graphs_.push_back(id);
-            if (c.block_pattern[i] == 'E') {
-                staged_layers_.push_back(staged_moe_->add_layer(moe_,
-                    {layer.experts_up, nullptr, layer.experts_down}, *weights.disk_store, weights.disk_groups[i]));
-            } else staged_layers_.push_back(-1);
+            if (c.block_pattern[i] != 'E') sequence.emplace_back(id);
         }
-
-        finish_ = prepared_.add_graph("finish", 64);
-        auto * routed = modules::MoeModule::combine(ctx, staged_moe_->output(), staged_moe_->routing_weights());
-        ggml_build_forward_expand(prepared_.graph(finish_), ggml_cpy(g, ggml_add(g, ggml_add(g, routed, shared_), x_), x_));
         final_ = prepared_.add_graph("final", 64);
         auto * last = ggml_view_2d(g, x_, h, 1, x_->nb[1], (steps_ - 1) * x_->nb[1]);
         logits_ = ggml_mul_mat(g, weights.output, rms_norm(g, last, weights.final_norm, c.rms_norm_eps));
         ggml_set_output(logits_);
         ggml_build_forward_expand(prepared_.graph(final_), logits_);
-        workspace_->add(prepared_);
-        workspace_->prepare();
-        staged_moe_->prepare();
+        sequence.emplace_back(final_);
+        offload_sequence_ = prepared_.add_sequence(std::move(sequence));
+        prepared_.allocate();
         debug::timing_log_scalar("nemotron_transcribe.decoder.offload_workspace_mb",
             workspace_->bytes() / (1024.0 * 1024.0));
-    }
-
-    void run_offload() {
-        prepared_.compute();
-        for (size_t layer = 0; layer < layer_graphs_.size(); ++layer) {
-            prepared_.compute(layer_graphs_[layer]);
-            if (staged_layers_[layer] < 0) continue;
-            staged_moe_->run(static_cast<size_t>(staged_layers_[layer]));
-            prepared_.compute(finish_);
-        }
-        prepared_.compute(final_);
     }
 
     void run(const int32_t * ids, bool output_logits = true) {
@@ -525,18 +486,17 @@ private:
             ggml_backend_tensor_set(slots_, slots_scratch_.data(), 0, slots_scratch_.size() * sizeof(int64_t));
             ggml_backend_tensor_set(mask_, mask_scratch_.data(), 0, mask_scratch_.size() * sizeof(ggml_fp16_t));
         }
-        if (!layer_graphs_.empty()) {
-            run_offload();
+        if (weights_.experts->staged()) {
+            prepared_.compute(offload_sequence_);
         } else {
-            auto * graph = output_logits ? graph_ : prefill_body_;
-            if (ggml_graph_n_nodes(graph) > 0) prepared_.compute(output_logits ? 0 : body_id_);
+            const bool body_only = !output_logits && prefill_body_ != nullptr;
+            auto * graph = body_only ? prefill_body_ : graph_;
+            if (ggml_graph_n_nodes(graph) > 0) prepared_.compute(body_only ? body_id_ : 0);
         }
         state_.advance(steps_);
     }
 
-    modules::MoeRoutingConfig routing_config_;
     modules::FeedForwardConfig shared_config_;
-    const modules::MoeModule moe_{{modules::MoeActivation::ReluSquared}};
     core::ExecutionContext & execution_;
     DecoderState & state_;
     int64_t steps_;
@@ -551,20 +511,17 @@ private:
     ggml_tensor * text_mask_ = nullptr;
     ggml_tensor * logits_ = nullptr;
     const Weights & weights_;
-    std::vector<core::PreparedGraph::GraphId> layer_graphs_;
     std::shared_ptr<core::GraphWorkspace> workspace_;
-    std::unique_ptr<modules::StagedMoeRuntime> staged_moe_;
-    std::vector<int64_t> staged_layers_;
-    core::PreparedGraph::GraphId finish_ = 0, final_ = 0;
+    size_t final_ = 0;
+    moe::MoePreparedGraph::SequenceId offload_sequence_{0};
     ggml_tensor * x_ = nullptr, * shared_ = nullptr;
-    int64_t slots_count_ = 0;
     std::vector<ggml_fp16_t> mask_scratch_;
     std::vector<int64_t> slots_scratch_;
     std::vector<float> audio_scratch_;
     std::vector<float> text_mask_scratch_;
     ggml_cgraph * prefill_body_ = nullptr;
     core::PreparedGraph::GraphId body_id_ = 0;
-    core::PreparedGraph prepared_;
+    moe::MoePreparedGraph prepared_;
 };
 
 }  // namespace
@@ -587,17 +544,11 @@ struct NemotronHDecoderRuntime::Impl {
         if (!source_) throw std::runtime_error("Nemotron-H weights are missing");
         const auto & c = config_;
         const auto & s = *source_;
-        if (options.disk_experts) {
-            if (storage != assets::TensorStorageType::Native)
-                throw std::runtime_error("Nemotron-H disk_experts requires native weight storage");
-            if (c.block_pattern.find('E') == std::string::npos ||
-                options.expert_cache_size < c.experts_per_token || options.expert_cache_size > c.experts)
-                throw std::runtime_error("Nemotron-H expert cache must cover top-k and not exceed the expert count");
-            disk_store_ = std::make_unique<core::DiskExpertWeightStore>(source_->source_path(), options.pin_experts,
-                static_cast<size_t>(options.disk_expert_read_threads));
-            weights_.disk_store = disk_store_.get();
-        }
-        weights_.disk_groups.resize(c.block_pattern.size());
+        if (options.moe.residency == moe::Residency::Staged && c.block_pattern.find('E') == std::string::npos)
+            throw std::runtime_error("Nemotron-H expert cache must cover top-k and not exceed the expert count");
+        resources_ = std::make_unique<moe::MoeEngine>(execution_, store_, s, options.moe,
+            "nemotron_transcribe.decoder.host_experts", kWeightArenaBytes);
+        weights_.experts = resources_.get();
         const int64_t inner = c.mamba_heads * c.mamba_head_dim;
         const int64_t conv_dim = inner + 2 * c.mamba_groups * c.mamba_state_size;
         weights_.embedding = store_.load_tensor(s, "token_embd.weight", storage, {c.vocab_size, c.hidden_size}).tensor;
@@ -632,36 +583,34 @@ struct NemotronHDecoderRuntime::Impl {
                 layer.attention_out = store_.load_tensor(s, prefix + "attn_output.weight", storage,
                     {c.hidden_size, c.attention_heads * c.attention_head_dim}).tensor;
             } else {
-                layer.router = store_.load_f32_tensor(s, prefix + "ffn_gate_inp.weight", {c.experts, c.hidden_size}).tensor;
-                layer.router_bias = store_.load_f32_tensor(s, prefix + "exp_probs_b.bias", {c.experts}).tensor;
-                if (disk_store_) {
-                    if (s.require_metadata(prefix + "ffn_up_exps.weight").shape !=
-                            std::vector<int64_t>{c.experts, c.expert_width, expert_row_width(c.hidden_size, c.expert_row_alignment)} ||
-                        s.require_metadata(prefix + "ffn_down_exps.weight").shape !=
-                            std::vector<int64_t>{c.experts, c.hidden_size, expert_row_width(c.expert_width, c.expert_row_alignment)})
-                        throw std::runtime_error("Nemotron-H offloaded expert bank shape mismatch");
-                    const auto group = disk_store_->add_group(
-                        {prefix + "ffn_up_exps.weight", prefix + "ffn_down_exps.weight"},
-                        execution.backend(), options.expert_cache_size);
-                    weights_.disk_groups[i] = group;
-                    layer.experts_up = disk_store_->tensor(group, 0).tensor;
-                    layer.experts_down = disk_store_->tensor(group, 1).tensor;
-                } else {
-                    layer.experts_up = store_.load_tensor(s, prefix + "ffn_up_exps.weight", storage,
-                        {c.experts, c.expert_width, expert_row_width(c.hidden_size, c.expert_row_alignment)}).tensor;
-                    layer.experts_down = store_.load_tensor(s, prefix + "ffn_down_exps.weight", storage,
-                        {c.experts, c.hidden_size, expert_row_width(c.expert_width, c.expert_row_alignment)}).tensor;
-                }
-                layer.shared.fc1_weight = store_.load_tensor(s, prefix + "ffn_up_shexp.weight", storage,
+                moe::LayerBindings bindings;
+                bindings.router = store_.load_f32_tensor(s, prefix + "ffn_gate_inp.weight", {c.experts, c.hidden_size});
+                bindings.selection_bias = store_.load_f32_tensor(s, prefix + "exp_probs_b.bias", {c.experts});
+                bindings.experts = {
+                    {prefix + "ffn_up_exps.weight", prefix + "ffn_up_exps.weight",
+                        {c.experts, c.expert_width, expert_row_width(c.hidden_size, c.expert_row_alignment)}, storage},
+                    {prefix + "ffn_down_exps.weight", prefix + "ffn_down_exps.weight",
+                        {c.experts, c.hidden_size, expert_row_width(c.expert_width, c.expert_row_alignment)}, storage}};
+                bindings.experts.back().role = moe::ProjectionRole::Down;
+                moe::LayerMath math;
+                math.routing.experts = c.experts; math.routing.selected = c.experts_per_token;
+                math.routing.scoring = moe::Scoring::Sigmoid; math.routing.normalization = moe::Normalization::Clamp;
+                math.routing.denominator_epsilon = 6.103515625e-5F;
+                math.routing.scale = c.routed_scaling_factor; math.routing.precision = GGML_PREC_F32;
+                math.experts.activation = moe::ExpertActivation::ReluSquared;
+                layer.expert = resources_->register_layer(std::move(bindings), math);
+                auto & shared = layer.shared;
+                shared.fc1_weight = store_.load_tensor(s, prefix + "ffn_up_shexp.weight", storage,
                     {c.shared_expert_width, c.hidden_size});
-                layer.shared.fc2_weight = store_.load_tensor(s, prefix + "ffn_down_shexp.weight", storage,
+                shared.fc2_weight = store_.load_tensor(s, prefix + "ffn_down_shexp.weight", storage,
                     {c.hidden_size, c.shared_expert_width});
             }
             weights_.layers.push_back(layer);
         }
         store_.upload();
-        if (disk_store_) {
-            const auto stats = disk_store_->statistics();
+        resources_->finalize_weights();
+        if (resources_->staged()) {
+            const auto stats = resources_->statistics();
             debug::timing_log_scalar("nemotron_transcribe.decoder.expert_cache_mb", stats.buffer_bytes / (1024.0 * 1024.0));
             debug::timing_log_scalar("nemotron_transcribe.decoder.host_experts_mb", stats.host_buffer_bytes / (1024.0 * 1024.0));
         }
@@ -705,7 +654,7 @@ struct NemotronHDecoderRuntime::Impl {
         state_->reset();
         // Match the other offloaded MoE runtimes: a new request starts from
         // canonical slot placement, independent of the previous routing history.
-        if (disk_store_) disk_store_->invalidate_cache();
+        resources_->begin_generation();
         out.cache_capacity = state_->capacity();
         std::vector<int32_t> prompt = before;
         prompt.insert(prompt.end(), static_cast<size_t>(frames), 0);
@@ -718,7 +667,7 @@ struct NemotronHDecoderRuntime::Impl {
                 return out;
             }
             const auto count = std::min(c.prefill_batch_size, steps - offset);
-            auto & graph = prompt_graph(count);
+            auto & graph = prompt_graph(count, offset + count == steps);
             graph.run_prompt(prompt, audio, static_cast<int64_t>(before.size()), frames, offset, offset + count == steps);
             offset += count;
             out.processed_prompt_tokens = offset;
@@ -780,6 +729,7 @@ private:
         // one remainder shape and a single-token graph remain resident.
         tail_.reset();
         prefill_.reset();
+        cpu_body_prefill_.reset();
         decode_.reset();
         state_.reset();
         const int64_t capacity = std::min(config_.max_context, ((required + 127) / 128) * 128);
@@ -789,7 +739,12 @@ private:
         decode_ = std::move(decode);
     }
 
-    DecoderGraph & prompt_graph(int64_t count) {
+    DecoderGraph & prompt_graph(int64_t count, bool needs_logits) {
+        if (!resources_->config().cpu_layers.empty() && !resources_->staged() && !needs_logits) {
+            if (!cpu_body_prefill_ || cpu_body_prefill_->steps() != count)
+                cpu_body_prefill_ = std::make_unique<DecoderGraph>(config_, weights_, *state_, execution_, count, true, false);
+            return *cpu_body_prefill_;
+        }
         auto & slot = count == config_.prefill_batch_size ? prefill_ : tail_;
         if (!slot || slot->steps() != count) {
             slot = std::make_unique<DecoderGraph>(config_, weights_, *state_, execution_, count, true);
@@ -801,12 +756,13 @@ private:
     core::ExecutionContext & execution_;
     DecoderConfig config_;
     core::BackendWeightStore store_;
-    std::unique_ptr<core::DiskExpertWeightStore> disk_store_;
+    std::unique_ptr<moe::MoeEngine> resources_;
     Weights weights_;
     std::unique_ptr<DecoderState> state_;
     std::unique_ptr<DecoderGraph> decode_;
     std::unique_ptr<DecoderGraph> prefill_;
     std::unique_ptr<DecoderGraph> tail_;
+    std::unique_ptr<DecoderGraph> cpu_body_prefill_;
 };
 
 NemotronHDecoderRuntime::NemotronHDecoderRuntime(std::shared_ptr<const assets::TensorSource> source,

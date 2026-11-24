@@ -101,6 +101,13 @@
         "default": false
       },
       {
+        "name": "trim_chunk_overlap",
+        "type": "bool",
+        "description": "Opt-in trimming of punctuated text to retained aligned words at overlapping chunk boundaries. Only applies with return_timestamps=true and preserve_punctuation=true. Default false preserves complete ASR chunk text.",
+        "required": false,
+        "default": false
+      },
+      {
         "name": "preserve_punctuation",
         "type": "bool",
         "description": "Opt-in text output mode for timestamped chunked ASR: preserve ASR punctuation in text_output instead of rebuilding text from aligned words.",
@@ -355,6 +362,27 @@
       "download": {
         "kind": "huggingface_snapshot",
         "repo": "Qwen/Qwen3-ASR-0.6B"
+      }
+    },
+    {
+      "id": "oruk_fourier_2b_safetensors",
+      "display_name": "Oruk Fourier 2B (English, local noncommercial use)",
+      "description": "English Qwen3-ASR fine-tune by Oruk. CC BY-NC 4.0. Hosted or API serving requires separate permission from Oruk.",
+      "format": "safetensors",
+      "precision": "native",
+      "target_directory": "Oruk-Fourier-2B",
+      "files": [
+        "config.json",
+        "generation_config.json",
+        "model.safetensors",
+        "processor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json"
+      ],
+      "download": {
+        "kind": "huggingface_snapshot",
+        "repo": "oruk/oruk-fourier-2b",
+        "revision": "8c2a8871f1304aa2f634da4fb95e24438c4945b9"
       }
     },
     {

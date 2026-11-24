@@ -51,6 +51,8 @@ struct TensorValue {
     bool valid() const noexcept;
 };
 
+class PreparedGraph;
+
 struct ModuleBuildContext {
     ggml_context * ggml = nullptr;
     const char * module_instance_name = nullptr;

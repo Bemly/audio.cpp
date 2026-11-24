@@ -1,3 +1,4 @@
+#include "engine/framework/runtime/moe_options.h"
 #include "engine/community_models/fish_drama3/generator.h"
 
 #include "engine/framework/debug/profiler.h"
@@ -93,7 +94,8 @@ std::vector<float> last_hidden(const std::vector<float> & values, int64_t width)
 Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     core::ExecutionContext & execution, const runtime::SessionOptions & options, bool streaming)
     : assets_(std::move(assets)), tokenizer_(assets_->resources),
-      cache_steps_(runtime::parse_positive_i64_option(options.options, {"fish_drama3.context_length"}, 2048)) {
+      cache_steps_(runtime::parse_positive_i64_option(options.options, {"fish_drama3.context_length"}, 2048)),
+      reference_cache_(parse_reference_cache_slots(options.options)) {
     if (cache_steps_ > 262144) throw std::runtime_error("Drama 3 context_length exceeds the checkpoint's maximum position count");
     if (const auto value = runtime::find_option(options.options, {"fish_drama3.profile_first_audio"})) {
         profile_first_audio_ = runtime::parse_bool_option(*value, "fish_drama3.profile_first_audio");
@@ -130,26 +132,20 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     debug::trace_log_scalar("fish_drama3.fused_moe", backbone_config.fused_moe);
     debug::trace_log_scalar("fish_drama3.kv_cache_type", std::string_view(backbone_config.kv_cache_type == GGML_TYPE_F16 ? "f16" : "f32"));
     debug::trace_log_scalar("fish_drama3.kv_cache_alignment", backbone_config.kv_cache_alignment);
-    backbone_config.cpu_expert_layers = runtime::parse_i64_option(options.options, {"fish_drama3.cpu_expert_layers"}).value_or(4);
-    if (const auto value = runtime::find_option(options.options, {"fish_drama3.disk_experts"}))
-        backbone_config.disk_experts = runtime::parse_bool_option(*value, "fish_drama3.disk_experts");
-    if (const auto value = runtime::find_option(options.options, {"fish_drama3.pin_experts"}))
-        backbone_config.pin_experts = runtime::parse_bool_option(*value, "fish_drama3.pin_experts");
-    if (backbone_config.pin_experts && !backbone_config.disk_experts)
+    auto moe_defaults = backbone_config.moe;
+    moe_defaults.cpu_layers = {0, 1, 2, 3};
+    backbone_config.moe = runtime::resolve_moe_options(options.options, "fish_drama3",
+        std::move(moe_defaults), static_cast<size_t>(backbone_config.layers));
+    if (backbone_config.moe.pin_host_weights &&
+        backbone_config.moe.residency != moe::Residency::Staged)
         throw std::runtime_error("fish_drama3.pin_experts requires fish_drama3.disk_experts=true");
-    backbone_config.expert_cache_size = runtime::parse_positive_i64_option(
-        options.options, {"fish_drama3.expert_cache_size"}, 32);
-    backbone_config.disk_expert_read_threads = runtime::parse_positive_i64_option(
-        options.options, {"fish_drama3.disk_expert_read_threads"}, 1);
-    if (backbone_config.disk_expert_read_threads > 64)
-        throw std::runtime_error("Drama 3 disk_expert_read_threads must be between 1 and 64");
     const auto backbone_prefill_cache_mb = runtime::parse_i64_option(options.options, {"fish_drama3.backbone_prefill_cache_mb"}).value_or(256);
     if (backbone_prefill_cache_mb < 0 || backbone_prefill_cache_mb > 4096) throw std::runtime_error("Drama 3 backbone_prefill_cache_mb must be between 0 and 4096");
     backbone_config.prefill_cache_bytes = static_cast<size_t>(backbone_prefill_cache_mb) * 1024u * 1024u;
     backbone_config.profile_prefill_cache = profile_first_audio_;
     backbone_ = std::make_unique<Drama3BackboneDecoderRuntime>(assets_->model_weights, backbone_config, execution,
         64 * 1024 * 1024, 8 * 1024 * 1024, assets::TensorStorageType::Native);
-    disk_experts_ = backbone_config.disk_experts;
+    disk_experts_ = backbone_config.moe.residency == moe::Residency::Staged;
     decoder_ = backbone_->create_decode_session(cache_steps_);
     const auto tower_prefill_cache_mb = runtime::parse_i64_option(options.options, {"fish_drama3.tower_prefill_cache_mb"}).value_or(256);
     if (tower_prefill_cache_mb < 0 || tower_prefill_cache_mb > 4096) throw std::runtime_error("Drama 3 tower_prefill_cache_mb must be between 0 and 4096");
@@ -185,23 +181,19 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
 Drama3Generator::~Drama3Generator() = default;
 
 codecs::FishDacCodes Drama3Generator::encode_reference(const runtime::AudioBuffer & audio) {
-    if (cached_reference_audio_ && cached_reference_audio_->sample_rate == audio.sample_rate &&
-        cached_reference_audio_->channels == audio.channels && cached_reference_audio_->samples == audio.samples) {
-        return cached_reference_codes_;
-    }
-    auto result = codec_->encode_codes(audio);
-    codec_->release_encode_graph();
-    validate_drama3_codes(result, assets_->tower.codebook_size);
-    // Keep one short reference in host memory. Exact waveform equality avoids
+    // Keep several short references in host memory. Exact waveform equality avoids
     // stale path-based hits when an uploaded file is replaced or re-decoded.
-    constexpr size_t max_cached_samples = 44100 * 30;
-    if (audio.samples.size() <= max_cached_samples) {
-        cached_reference_audio_ = audio;
-        cached_reference_codes_ = result;
-    } else {
-        cached_reference_audio_.reset();
-        cached_reference_codes_ = {};
-    }
+    Drama3ReferenceCache::Outcome outcome = Drama3ReferenceCache::Outcome::Miss;
+    auto result = reference_cache_.lookup_or_encode(audio, [this](const runtime::AudioBuffer & clip) {
+        auto codes = codec_->encode_codes(clip);
+        codec_->release_encode_graph();
+        validate_drama3_codes(codes, assets_->tower.codebook_size);
+        return codes;
+    }, &outcome);
+    const char * label = outcome == Drama3ReferenceCache::Outcome::Hit ? "hit"
+                       : outcome == Drama3ReferenceCache::Outcome::Skip ? "skip" : "miss";
+    debug::trace_log_scalar("drama3.reference_cache", std::string(label) + " " + std::to_string(reference_cache_.size()) +
+                            "/" + std::to_string(reference_cache_.capacity()));
     return result;
 }
 

@@ -120,16 +120,141 @@ std::string strip_ascii_whitespace(std::string text) {
     return text;
 }
 
+// The characters Python's str.split() separates on (str.isspace()), so the collapse below also
+// folds the no-break spaces French text puts before ":" and inside guillemets.
+bool is_python_whitespace(uint32_t value) {
+    return (value >= 0x09 && value <= 0x0D) || (value >= 0x1C && value <= 0x20) || value == 0x85 ||
+        value == 0xA0 || value == 0x1680 || (value >= 0x2000 && value <= 0x200A) || value == 0x2028 ||
+        value == 0x2029 || value == 0x202F || value == 0x205F || value == 0x3000;
+}
+
+// The reference's replace_characters step (pocket_tts prepare_text_prompt):
+//     text = " ".join(text.translate(str.maketrans(replace_characters)).split())
+//     text = re.sub(r"([.!?…])\s*[,;:]", r"\1", text)
+// Each character is replaced once, in a single pass. Deleted quotes leave '"Hi?", she said' as
+// 'Hi?, she said', which reads as a sentence end followed by a stray comma; the second step keeps
+// only the sentence mark.
+std::string translate_replace_characters(
+    const std::string & text,
+    const std::vector<std::pair<std::string, std::string>> & replace_characters) {
+    std::string translated;
+    translated.reserve(text.size());
+    for (size_t pos = 0; pos < text.size();) {
+        const size_t length = decode_utf8_at(text, pos).length;
+        const std::string character = text.substr(pos, length);
+        const auto replacement = std::find_if(
+            replace_characters.begin(), replace_characters.end(), [&](const auto & entry) {
+                return entry.first == character;
+            });
+        translated += replacement == replace_characters.end() ? character : replacement->second;
+        pos += length;
+    }
+
+    std::string collapsed;
+    collapsed.reserve(translated.size());
+    bool pending_space = false;
+    for (size_t pos = 0; pos < translated.size();) {
+        const CodePoint code_point = decode_utf8_at(translated, pos);
+        if (is_python_whitespace(code_point.value)) {
+            pending_space = !collapsed.empty();
+        } else {
+            if (pending_space) {
+                collapsed.push_back(' ');
+                pending_space = false;
+            }
+            collapsed.append(translated, pos, code_point.length);
+        }
+        pos += code_point.length;
+    }
+
+    std::string out;
+    out.reserve(collapsed.size());
+    for (size_t pos = 0; pos < collapsed.size();) {
+        const CodePoint code_point = decode_utf8_at(collapsed, pos);
+        out.append(collapsed, pos, code_point.length);
+        pos += code_point.length;
+        const uint32_t mark = code_point.value;
+        if (mark == '.' || mark == '!' || mark == '?' || mark == 0x2026) {
+            size_t next = pos;
+            while (next < collapsed.size() && collapsed[next] == ' ') {
+                ++next;
+            }
+            if (next < collapsed.size() &&
+                (collapsed[next] == ',' || collapsed[next] == ';' || collapsed[next] == ':')) {
+                pos = next + 1;
+            }
+        }
+    }
+    return out;
+}
+
+// Gradium Phonon: a final letter or digit gets a period, any other ending is kept.
+void end_after_letter_or_digit(std::string & text) {
+    size_t last_start = text.size() - 1;
+    while (last_start > 0 && (static_cast<unsigned char>(text[last_start]) & 0xC0) == 0x80) {
+        --last_start;
+    }
+    const CodePoint last = decode_utf8_at(text, last_start);
+    if (last_start + last.length == text.size() && is_letter_or_digit(last.value)) {
+        text.push_back('.');
+    }
+}
+
+// The reference's _ensure_terminal_punctuation, as PocketTTS Small does it: past any closing
+// quotes or brackets, a sentence mark is kept, a trailing ",;:-" or dash becomes a period, and
+// anything else gets a period after the closers.
+void end_like_pocket_tts(std::string & text) {
+    size_t core_end = text.size();
+    uint32_t terminal = 0;
+    while (core_end > 0) {
+        size_t start = core_end - 1;
+        while (start > 0 && (static_cast<unsigned char>(text[start]) & 0xC0) == 0x80) {
+            --start;
+        }
+        terminal = decode_utf8_at(text, start).value;
+        if (terminal != '"' && terminal != '\'' && terminal != ')' && terminal != ']' && terminal != 0x201D &&
+            terminal != 0x2019 && terminal != 0x00BB && terminal != ' ') {
+            break;
+        }
+        core_end = start;
+    }
+    if (core_end > 0 && terminal != '.' && terminal != '!' && terminal != '?' && terminal != 0x2026) {
+        size_t weak_end = core_end;
+        while (weak_end > 0) {
+            size_t start = weak_end - 1;
+            while (start > 0 && (static_cast<unsigned char>(text[start]) & 0xC0) == 0x80) {
+                --start;
+            }
+            const uint32_t value = decode_utf8_at(text, start).value;
+            if (value != ',' && value != ';' && value != ':' && value != '-' && value != 0x2013 && value != 0x2014 &&
+                value != ' ') {
+                break;
+            }
+            weak_end = start;
+        }
+        if (weak_end < core_end) {
+            text = text.substr(0, weak_end) + "." + strip_ascii_whitespace(text.substr(core_end));
+        } else {
+            text.push_back('.');
+        }
+    }
+}
+
 std::string prepare_pocket_tts_text(
     std::string text,
     bool pad_with_spaces_for_short_inputs,
     bool remove_semicolons,
-    bool capitalize_first_letter = true) {
+    bool capitalize_first_letter = true,
+    const std::vector<std::pair<std::string, std::string>> & replace_characters = {},
+    PromptPunctuation punctuation = PromptPunctuation::PocketTTS) {
     while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
         text.erase(text.begin());
     }
     while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
         text.pop_back();
+    }
+    if (!replace_characters.empty()) {
+        text = translate_replace_characters(text, replace_characters);
     }
     if (text.empty()) {
         throw std::runtime_error("PocketTTS text prompt cannot be empty");
@@ -151,18 +276,23 @@ std::string prepare_pocket_tts_text(
         std::replace(text.begin(), text.end(), ';', ',');
     }
     if (capitalize_first_letter) {
-        const CodePoint first = decode_utf8_at(text, 0);
+        // pocket-tts skips any opening quotes or brackets first ('"hello," she said').
+        size_t start = 0;
+        CodePoint first = decode_utf8_at(text, start);
+        while (punctuation == PromptPunctuation::PocketTTS && start + first.length < text.size() &&
+               (first.value == '"' || first.value == '\'' || first.value == 0x201C || first.value == 0x2018 ||
+                first.value == '(' || first.value == '[' || first.value == 0x00AB)) {
+            start += first.length;
+            first = decode_utf8_at(text, start);
+        }
         if (const uint32_t upper = latin_uppercase(first.value); upper != 0) {
-            text.replace(0, first.length, encode_utf8(upper));
+            text.replace(start, first.length, encode_utf8(upper));
         }
     }
-    size_t last_start = text.size() - 1;
-    while (last_start > 0 && (static_cast<unsigned char>(text[last_start]) & 0xC0) == 0x80) {
-        --last_start;
-    }
-    const CodePoint last = decode_utf8_at(text, last_start);
-    if (last_start + last.length == text.size() && is_letter_or_digit(last.value)) {
-        text.push_back('.');
+    if (punctuation == PromptPunctuation::PocketTTS) {
+        end_like_pocket_tts(text);
+    } else {
+        end_after_letter_or_digit(text);
     }
     if (pad_with_spaces_for_short_inputs) {
         int words = 0;
@@ -251,12 +381,59 @@ bool is_decimal_period_boundary(
         std::isdigit(static_cast<unsigned char>(suffix.front())) != 0;
 }
 
+bool is_closer(uint32_t value) {
+    return value == '"' || value == '\'' || value == 0x201D || value == 0x2019 || value == ')' || value == ']' ||
+        value == 0x00BB;
+}
+
+// The reference's _skip_closers: where the segment that starts at `segment_start` really starts,
+// after the closing quotes and brackets that directly follow the punctuation ("“Stop.”",
+// "(quietly.)"), so that they stay with their sentence. A curly quote is several byte tokens
+// that decode to U+FFFD on their own, so the start only moves past complete closers. A closer
+// after a space opens the next sentence and is left alone.
+size_t skip_closers(
+    const std::vector<tokenizers::SentencePiecePiece> & pieces,
+    const std::vector<int32_t> & tokens,
+    size_t segment_start) {
+    const std::string punctuation = decode_range(pieces, tokens, segment_start - 1, segment_start);
+    size_t start = segment_start;
+    const size_t stop = std::min(tokens.size(), segment_start + 8);
+    for (size_t end = segment_start + 1; end <= stop; ++end) {
+        const std::string window = decode_range(pieces, tokens, segment_start - 1, end);
+        if (window.size() <= punctuation.size() || window.compare(0, punctuation.size(), punctuation) != 0) {
+            break;
+        }
+        bool closers_only = true;
+        bool partial = false;
+        for (size_t pos = punctuation.size(); pos < window.size();) {
+            const CodePoint code_point = decode_utf8_at(window, pos);
+            if (code_point.value == 0xFFFD) {
+                partial = true;
+            } else if (!is_closer(code_point.value)) {
+                closers_only = false;
+                break;
+            }
+            pos += code_point.length;
+        }
+        if (!closers_only) {
+            break;
+        }
+        if (!partial) {
+            start = end;
+        }
+    }
+    return start;
+}
+
 // A segment starts at the first token that is not a boundary token after a run of boundary
-// tokens. Returns [0, starts..., size], so consecutive pairs are the segments.
+// tokens, or past the closers right after them when `closers_stay` is set. Returns
+// [0, starts..., size], so consecutive pairs are the segments.
 std::vector<size_t> find_boundary_indices(
     const std::vector<int32_t> & tokens,
     const std::unordered_set<int32_t> & boundary_ids,
-    const std::vector<tokenizers::SentencePiecePiece> * pieces_for_decimal_check) {
+    const std::vector<tokenizers::SentencePiecePiece> & pieces,
+    bool check_decimal_period,
+    bool closers_stay) {
     std::vector<size_t> indices{0};
     bool previous_was_boundary = false;
     for (size_t index = 0; index < tokens.size(); ++index) {
@@ -265,9 +442,11 @@ std::vector<size_t> find_boundary_indices(
             continue;
         }
         if (previous_was_boundary &&
-            !(pieces_for_decimal_check != nullptr &&
-              is_decimal_period_boundary(*pieces_for_decimal_check, tokens, index))) {
-            indices.push_back(index);
+            !(check_decimal_period && is_decimal_period_boundary(pieces, tokens, index))) {
+            const size_t start = closers_stay ? skip_closers(pieces, tokens, index) : index;
+            if (start < tokens.size()) {
+                indices.push_back(start);
+            }
         }
         previous_was_boundary = false;
     }
@@ -294,6 +473,10 @@ std::vector<TextSegment> segments_from_boundaries(
     return segments;
 }
 
+PromptPunctuation prompt_punctuation(const models::pocket_tts::PocketTTSAssets & manifest) {
+    return manifest.impl != nullptr ? manifest.impl->prompt_punctuation : PromptPunctuation::PocketTTS;
+}
+
 }  // namespace
 
 TextConditioner::TextConditioner(TextConditionerConfig config) : config_(config) {}
@@ -308,7 +491,9 @@ TextConditioningResult TextConditioner::prepare(
             text,
             manifest.model_config.pad_with_spaces_for_short_inputs,
             manifest.model_config.remove_semicolons,
-            manifest.model_config.capitalize_first_letter);
+            manifest.model_config.capitalize_first_letter,
+            manifest.model_config.replace_characters,
+            prompt_punctuation(manifest));
         if (manifest.tokenizer_pieces.empty()) {
             throw std::runtime_error("PocketTTS tokenizer pieces are not loaded");
         }
@@ -318,6 +503,13 @@ TextConditioningResult TextConditioner::prepare(
     });
     engine::debug::timing_log_scalar("pocket_tts.text.prepare_ms", prepare_ms);
     return result;
+}
+
+std::string TextConditioner::apply_replace_characters(
+    const models::pocket_tts::PocketTTSAssets & manifest,
+    const std::string & text) const {
+    const auto & replace_characters = manifest.model_config.replace_characters;
+    return replace_characters.empty() ? text : translate_replace_characters(text, replace_characters);
 }
 
 std::vector<std::string> TextConditioner::split_into_sentence_chunks(
@@ -337,12 +529,15 @@ std::vector<std::string> TextConditioner::split_into_sentence_chunks(
         text,
         manifest.model_config.pad_with_spaces_for_short_inputs,
         manifest.model_config.remove_semicolons,
-        manifest.model_config.capitalize_first_letter));
+        manifest.model_config.capitalize_first_letter,
+        manifest.model_config.replace_characters,
+        prompt_punctuation(manifest)));
+    const bool closers_stay = prompt_punctuation(manifest) == PromptPunctuation::PocketTTS;
     const std::vector<int32_t> tokens = tokenizers::tokenize_sentencepiece(pieces, prepared);
     const std::vector<TextSegment> sentences = segments_from_boundaries(
         pieces,
         tokens,
-        find_boundary_indices(tokens, boundary_token_ids(pieces, ".!...?"), &pieces));
+        find_boundary_indices(tokens, boundary_token_ids(pieces, ".!...?"), pieces, true, closers_stay));
 
     // A sentence longer than the budget is split again on commas, semicolons and colons,
     // which keeps the model from skipping words at the end of an overlong chunk.
@@ -358,7 +553,7 @@ std::vector<std::string> TextConditioner::split_into_sentence_chunks(
         std::vector<TextSegment> parts = segments_from_boundaries(
             pieces,
             sub_tokens,
-            find_boundary_indices(sub_tokens, fallback_ids, nullptr));
+            find_boundary_indices(sub_tokens, fallback_ids, pieces, false, closers_stay));
         if (parts.size() > 1) {
             refined.insert(refined.end(), parts.begin(), parts.end());
         } else {

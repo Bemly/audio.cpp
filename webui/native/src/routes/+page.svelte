@@ -18,6 +18,7 @@
     models,
     pathStatus,
     runTask,
+    taskStreamEvents,
     setModelsRoot,
     speech,
     stopModelInstall,
@@ -31,8 +32,10 @@
     type ModelPackageSize,
     type DirectoryBrowserResponse
   } from '$lib/api';
-  import { catalog, parameterCatalog, requirePackageLoadTarget, taskLabels, withPackageLoadTarget } from '$lib/catalog';
+  import { catalog, parameterCatalog, requirePackageLoadTarget, taskLabels, streamingFamilies, withPackageLoadTarget } from '$lib/catalog';
   import { createTranslator, resolveUiLanguage, uiLanguages } from '$lib/i18n';
+  import { StreamPlayback } from '$lib/media/stream_playback';
+  import { base64Bytes } from '$lib/media/pcm_wav';
   import MediaPreview from '$lib/MediaPreview.svelte';
   import LoraControls from '$lib/LoraControls.svelte';
   import VoicePicker from '$lib/VoicePicker.svelte';
@@ -82,6 +85,22 @@
   let loadingModel = false;
   let loraUploading = false;
   let running = false;
+  let streamOutput = false;
+  let autoplay = false;
+  let liveText = '';
+  let playbackWarning = '';
+  let playbackActive = false;
+  let streamedAudioPlayed = false;
+  let pendingLiveAudio: ArrayBuffer[] = [];
+  let liveAudioReady = false;
+  let livePlaybackStart: Promise<void> | null = null;
+  let playbackGeneration = 0;
+  const streamLoadedModels = new Set<string>();
+  const playback = new StreamPlayback();
+  playback.onchange = () => { playbackActive = playback.playing; };
+  $: canStreamOutput = !usesPanelRequest && streamingFamilies.has(selected?.family) &&
+    (!isConfiguredEntry(selected) || loadedModels.some(model => model.id === selectedId && model.mode === 'streaming'));
+  $: useStreamOutput = streamOutput && canStreamOutput;
   let rewritingCaption = false;
   let status = 'Ready';
   let warningStatus = '';
@@ -305,7 +324,7 @@
   }
 
   function setDuration(value: number) {
-    const minimum = selected?.family === 'ace_step' ? -1 : 1;
+    const minimum = selected?.family === 'moss_soundeffect' ? 0.1 : selected?.family === 'ace_step' ? -1 : 1;
     duration = Math.max(minimum, Number.isFinite(value) ? value : minimum);
     if (selected?.family === 'minimax_h3') {
       advancedValues = { ...advancedValues, num_frames: miniMaxFramesForDuration(duration) };
@@ -366,10 +385,11 @@
     fish_drama3: 'Fish Audio Drama 3',
     kugelaudio: 'KugelAudio', crisperwhisper: 'CrisperWhisper', index_echo: 'Index-Echo S2TT',
     audio_flamingo: 'Audio Flamingo', owsm: 'OWSM', owsm_ctc: 'OWSM-CTC',
-    reuse: 'RE-USE', realtime_reuse: 'Real-time RE-USE',
+    reuse: 'RE-USE', realtime_reuse: 'Real-time RE-USE', voice_isolator: 'Inworld Voice Isolator',
     haas_asr: 'Haas Japanese ASR', lfm_d1_omni: 'd1-Omni audio decisions',
     nemotron_transcribe: 'Nemotron 3.5 Transcribe', phonon2_asr: 'Phonon-2 ASR',
-    pocket_tts_small: 'PocketTTS Small', underdog_bark3: 'Underdog Bark 3',
+    voxmel_tts: 'VoxMel', tiny_voca: 'tiny-voca', soulx_singer: 'SoulX-Singer', rosvot: 'ROSVOT',
+    m5_tts: 'M5-TTS', pocket_tts_small: 'PocketTTS Small', underdog_bark3: 'Underdog Bark 3',
     magenta_realtime_2: 'Magenta RealTime 2', soulx_flashhead: 'SoulX-FlashHead', sidon: 'Sidon', smart_turn: 'Smart Turn',
     gigaam_asr: 'GigaAM ASR',
     ced: 'CED',
@@ -405,6 +425,8 @@
     canary_asr: 0, cohere_asr: 256, moss_transcribe_diarize: 5120
   };
   const asrLanguages: Record<string, string[]> = {
+    tiny_voca: ['en'],
+    m5_tts: ['zh', 'yue', 'zh-Sichuan', 'en', 'de', 'fr', 'ja', 'ko'],
     canary_asr: ['en', 'de', 'es', 'fr'],
     cohere_asr: ['en', 'fr', 'de', 'es', 'it', 'pt', 'nl', 'pl', 'el', 'ar', 'ja', 'zh', 'vi', 'ko'],
     // Confucius4-R2T2 takes canonical language names (the engine normalizes
@@ -551,14 +573,14 @@
     selected?.id === 'firered-audio-acoustic-edit';
   $: allowsAutoDuration = selected?.family === 'ace_step';
   $: supportsTextOnlyTts = (
-    selected?.family === 'breeze_tts' ||
+    selected?.family === 'm5_tts' || selected?.family === 'voxmel_tts' || selected?.family === 'breeze_tts' ||
     selected?.family === 'chatterbox_turbo' || selected?.family === 'maya1' || selected?.family === 'kugelaudio' || selected?.family === 'voxtral_tts' ||
     (selected?.family === 'lfm2_audio' && !selected?.builtin_voices?.length)
   ) && selected?.task === 'tts';
   $: needsSource = ['asr', 'vc', 'svc', 's2s', 'sep', 'vad', 'diar', 'align', 'midi', 'turn', 'wake', 'cls'].includes(selected?.task) ||
     isFireRedAudioEdit || selected?.family === 'liveavatar' || selected?.family === 'latentsync' || selected?.family === 'soulx_flashhead' ||
-    (selected?.family === 'auk' && selected?.task === 'gen');
-  $: acceptsSource = needsSource || (selected?.task === 'gen' && !replacesGenericControls.genSource);
+    (['auk', 'mulacover'].includes(selected?.family) && selected?.task === 'gen');
+  $: acceptsSource = needsSource || (selected?.task === 'gen' && selected.family !== 'moss_soundeffect' && !replacesGenericControls.genSource);
   $: acceptsVideo = selected?.request_options?.includes('video') === true;
   $: needsVoice = (['clon', 'vc', 'svc'].includes(selected?.task) && selected?.family !== 'rvc') ||
     (selected?.task === 's2s' && selected?.family === 'personaplex') ||
@@ -573,7 +595,7 @@
   $: lyricsRequired = requiresRequestOption(selected, 'lyrics');
   $: referenceTextRequired = (requiresRequestOption(selected, 'reference_text') &&
     !(allowsQuickStartVoice && quickStartVoice)) ||
-    (Boolean(voiceFile) && isQwenBase);
+    (Boolean(voiceFile) && isQwenBase) || (['m5_tts', 'voxmel_tts'].includes(selected?.family) && selected?.task === 'clon');
   // A model with built-in voices also lists the server's voices (presets), but
   // not the embedded demo wavs, which such a model cannot clone.
   $: quickStartVoices = usesBuiltInVoiceSelector
@@ -596,7 +618,7 @@
   // from another model is not sent.
   $: usesFixedChatPrompt = ['lfm2_audio', 'lfm3_audio'].includes(selected?.family) && selected?.task === 's2s';
   $: showsText = ['tts', 'clon', 'gen', 's2s', 'align', 'vdes'].includes(selected?.task) &&
-    !['apollo', 'universr', 'builtin_audio_utils', 'reuse', 'realtime_reuse', 'sidon'].includes(selected?.family) &&
+    !['apollo', 'universr', 'builtin_audio_utils', 'reuse', 'realtime_reuse', 'voice_isolator', 'sidon'].includes(selected?.family) &&
     !usesFixedChatPrompt && !replacesGenericControls.text;
   $: supportsLiveAsr = selected?.task === 'asr' &&
     ['voxtral_realtime', 'nemotron_asr', 'higgs_audio_stt', 'sense_asr', 'vibevoice_asr_streaming', 'confucius4_r2t2'].includes(selected?.family);
@@ -1238,7 +1260,7 @@
       duration = 15;
       advancedValues = { ...advancedValues, num_frames: miniMaxFramesForDuration(duration), dit_acceleration: 'none' };
     } else if (selected?.task === 'gen') {
-      duration = selected.family === 'magenta_realtime_2' ? 10 : 30;
+      duration = ['magenta_realtime_2', 'moss_soundeffect'].includes(selected.family) ? 10 : 30;
     }
     if (selected?.family === 'yue2') {
       if (isConfiguredEntry(selected)) {
@@ -1254,7 +1276,7 @@
       text = '';
       lyrics = '';
       ensureYue2DefaultLyrics();
-    } else if (['liveavatar', 'moss_ttsd', 'sam_audio'].includes(selected?.family)) {
+    } else if (['liveavatar', 'moss_ttsd', 'sam_audio', 'moss_soundeffect', 'mulacover', 'mossformer2'].includes(selected?.family)) {
       text = selected.default_text || '';
     } else if (selected?.family === 'ming3_audio' && selected.task === 's2s') {
       text = '';
@@ -1474,7 +1496,7 @@
 
   async function stagedPath(file: File | null): Promise<string | undefined> {
     if (!file) return undefined;
-    const targetSampleRate = selected.task === 'sep' || selected.family === 'apollo'
+    const targetSampleRate = selected.family === 'rosvot' ? 24000 : selected.task === 'sep' || selected.family === 'apollo'
       ? 44100
       : ['asr', 'vad', 'diar', 'align', 'midi', 'wake', 'cls'].includes(selected.task) ? 16000 : undefined;
     const wav = await browserDecodeToWav(file, targetSampleRate);
@@ -2034,6 +2056,62 @@
     log(status);
   }
 
+  function playLiveAudio() {
+    const generation = playbackGeneration;
+    const pending = pendingLiveAudio;
+    pendingLiveAudio = [];
+    livePlaybackStart = (async () => {
+      try {
+        await playback.begin();
+        for (const audio of pending) {
+          if (generation !== playbackGeneration) return;
+          await playback.push(audio);
+          if (generation !== playbackGeneration) return;
+          streamedAudioPlayed = true;
+        }
+      } catch (error) {
+        if (generation !== playbackGeneration) return;
+        playback.stop();
+        playbackWarning = error instanceof Error ? error.message : String(error);
+      }
+    })();
+  }
+
+  async function streamedResult(body: Record<string, unknown>, signal: AbortSignal,
+    play: boolean): Promise<Record<string, unknown>> {
+    let result: Record<string, unknown> = {};
+    for await (const message of taskStreamEvents(body, signal)) {
+      if (message.type === 'task.stream.done') {
+        result = message.result;
+        continue;
+      }
+      const event = message.event;
+      const snapshot = event.partial_text_snapshot as { text?: string } | undefined;
+      const delta = event.partial_text as { text?: string } | undefined;
+      if (typeof snapshot?.text === 'string') liveText = snapshot.text;
+      else if (typeof delta?.text === 'string') liveText += delta.text;
+      const named = event.named_audio_outputs as Array<{ audio?: string }> | undefined;
+      const audio = typeof event.audio === 'string' ? event.audio : named?.[0]?.audio;
+      if (!playbackWarning && typeof audio === 'string') {
+        if (!play && !livePlaybackStart) {
+          pendingLiveAudio.push(base64Bytes(audio).buffer);
+          liveAudioReady = true;
+          continue;
+        }
+        try {
+          await livePlaybackStart;
+          await playback.push(base64Bytes(audio).buffer);
+          streamedAudioPlayed = true;
+        }
+        catch (error) {
+          playback.stop();
+          playbackWarning = error instanceof Error ? error.message : String(error);
+        }
+      }
+    }
+    return result;
+  }
+
   async function run() {
     if (running || loadingModel || rewritingCaption || modelPanelUploading || restoringHistory) return;
     if (!selectedId) {
@@ -2048,6 +2126,21 @@
       errorStatus = '';
       return;
     }
+    const streaming = useStreamOutput;
+    const autoPlayOutput = !usesPanelRequest && selected.task !== 'asr' && autoplay;
+    ++playbackGeneration;
+    pendingLiveAudio = [];
+    liveAudioReady = false;
+    livePlaybackStart = null;
+    streamedAudioPlayed = false;
+    liveText = '';
+    playbackWarning = '';
+    playback.stop();
+    // Resume synchronously from the Generate gesture, before uploads/loading.
+    if (autoPlayOutput) {
+      try { void playback.begin().catch(error => { playbackWarning = String(error); }); }
+      catch (error) { playbackWarning = String(error); }
+    }
     running = true;
     aborter = new AbortController();
     const started = performance.now();
@@ -2056,6 +2149,7 @@
       generationElapsedSeconds = (performance.now() - started) / 1000;
     }, 250);
     let nextAudio: AudioOutput[] = [];
+    let nextPlaybackAudio: Blob | string | undefined;
     let nextArtifacts: typeof outputArtifacts = [];
     let nextText = '';
     let nextJson = '';
@@ -2088,7 +2182,13 @@
           throw new StatusWarning('LiveAvatar requires a reference image.');
         }
       }
-      await ensureLoaded();
+      if (streaming) {
+        await ensurePanelLoaded(selectedId, 'streaming');
+        if (!isConfiguredEntry(selected)) streamLoadedModels.add(selectedId);
+      } else if (streamLoadedModels.has(selectedId)) {
+        await ensurePanelLoaded(selectedId, selected.mode);
+        streamLoadedModels.delete(selectedId);
+      } else await ensureLoaded();
       const resident = loadedModels.find((model) => model.id === selected.id);
       const submittedSettings = {
         schema_version: 1,
@@ -2133,12 +2233,22 @@
         ? await stagedPath(voiceFile) : undefined;
 
       if (['tts', 'clon', 'vdes'].includes(selected.task)) {
+        let streamingVoiceRef = voiceRef;
+        const voiceName = quickStartVoice || selected.default_voice;
+        // Generic task streaming accepts voice_id/reference audio, rather than
+        // the speech route's named voice-library lookup. Resolve library audio
+        // through the existing preview/upload APIs once for this request.
+        if (streaming && !streamingVoiceRef && voiceName && !selected.builtin_voices?.includes(voiceName)) {
+          const response = await fetch(voicePreviewUrl(demoVoiceSources[voiceName] || voiceName), { signal: aborter.signal });
+          if (!response.ok) throw new Error('This voice cannot be streamed through the task API. Select a built-in voice or supply reference audio.');
+          streamingVoiceRef = await uploadWav(await response.blob(), aborter.signal);
+        }
         if (!text.trim()) throw new StatusWarning('Enter text to generate.');
         const effectiveChunkBudget = Math.max(40, chunkBudget);
         if (selected.family === 'voxcpm2') options.text_chunk_size = effectiveChunkBudget;
-        // Ming anchors subsequent chunks to the first voice inside one request.
-        if (selected.family === 'ming3_tts' && longText) options.text_chunk_size = effectiveChunkBudget;
-        const chunks = longText && selected.task !== 'vdes' && !['moss_ttsd', 'ming3_tts'].includes(selected.family)
+        // Keep model-owned voice conditioning across chunks inside one request.
+        if (['ming3_tts', 'zonos2', 'zonos3', 'm5_tts', 'voxmel_tts', 'tiny_voca'].includes(selected.family) && longText) options.text_chunk_size = effectiveChunkBudget;
+        const chunks = longText && selected.task !== 'vdes' && !['moss_ttsd', 'ming3_tts', 'zonos2', 'zonos3', 'm5_tts', 'voxmel_tts', 'tiny_voca'].includes(selected.family)
           ? splitTtsChunks(text, effectiveChunkBudget)
           : [text];
         const audioChunks: Blob[] = [];
@@ -2165,17 +2275,37 @@
             if (selected.family === 'ming3_tts') body.instruct = instructions;
             else body.instructions = instructions;
           }
-          submittedRequests.push({ endpoint: '/v1/audio/speech', body: JSON.parse(JSON.stringify(body)) });
-          const result = await speech(body, aborter.signal);
-          audioChunks.push(result.blob);
-          timings.push({
-            chunk: index + 1,
-            characters: chunks[index].length,
-            wall_ms: result.wallMs,
-            rtf: result.rtf
-          });
+          if (streaming) {
+            const { model, input, voice, instructions, reference_text, ...request } = body;
+            request.text = input;
+            request.options = { ...options,
+              ...(typeof instructions === 'string' ? { instruction: instructions } : {}),
+              ...(typeof reference_text === 'string' ? { reference_text } : {}) };
+            if (streamingVoiceRef) request.voice_ref = streamingVoiceRef;
+            else if (voice) request.voice_id = voice;
+            const streamBody = { model, request };
+            submittedRequests.push({ endpoint: '/v1/tasks/stream', body: JSON.parse(JSON.stringify(streamBody)) });
+            const result = await streamedResult(streamBody, aborter.signal, autoPlayOutput);
+            const named = result.named_audio_outputs as Array<{ audio?: string }> | undefined;
+            const finalAudio = typeof result.audio === 'string' ? result.audio
+              : named?.length === 1 ? named[0].audio : undefined;
+            if (typeof finalAudio !== 'string') throw new Error('The streaming response contains no final audio.');
+            audioChunks.push(new Blob([base64Bytes(finalAudio)], { type: 'audio/wav' }));
+            timings.push({ chunk: index + 1, characters: chunks[index].length, timing: result.timing });
+          } else {
+            submittedRequests.push({ endpoint: '/v1/audio/speech', body: JSON.parse(JSON.stringify(body)) });
+            const result = await speech(body, aborter.signal);
+            audioChunks.push(result.blob);
+            timings.push({
+              chunk: index + 1,
+              characters: chunks[index].length,
+              wall_ms: result.wallMs,
+              rtf: result.rtf
+            });
+          }
         }
         const merged = await concatenateAudioBlobs(audioChunks);
+        nextPlaybackAudio = merged;
         nextAudio = [{ id: chunks.length > 1 ? 'merged' : 'output', url: URL.createObjectURL(merged) }];
         nextJson = JSON.stringify({
           seed: resolvedSeed,
@@ -2197,25 +2327,28 @@
         };
         const detail = ['owsm', 'crisperwhisper', 'haas_asr', 'phonon2_asr', 'underdog_bark3', 'nemotron_transcribe'].includes(selected.family) &&
           (options.return_timestamps === true || options.diarization === true);
+        const streamBody = { model: selected.id, request: { text: context, audio, language, options } };
         submittedRequests.push({
-          endpoint: detail ? '/v1/audio/transcriptions/details' : '/v1/audio/transcriptions',
-          body: JSON.parse(JSON.stringify(body))
+          endpoint: streaming ? '/v1/tasks/stream' : detail ? '/v1/audio/transcriptions/details' : '/v1/audio/transcriptions',
+          body: JSON.parse(JSON.stringify(streaming ? streamBody : body))
         });
-        const result = await transcription(body, aborter.signal, detail);
+        const result = streaming
+          ? await streamedResult(streamBody, aborter.signal, autoPlayOutput)
+          : await transcription(body, aborter.signal, detail);
         nextText = String(result.text || '');
         nextJson = JSON.stringify(result, null, 2);
       } else {
         if (needsSource && !audio) throw new StatusWarning('Choose a source audio file.');
         const request: Record<string, unknown> = { options };
-        if (['gen', 's2s', 'align'].includes(selected.task) && text.trim() && !usesYue2Request && !usesFixedChatPrompt && !['apollo', 'universr', 'reuse', 'realtime_reuse', 'sidon'].includes(selected.family)) request.text = text;
-        if (['gen', 's2s', 'align'].includes(selected.task) && language.trim() && !usesYue2Request && !['apollo', 'universr', 'reuse', 'realtime_reuse', 'sidon'].includes(selected.family)) request.language = language;
+        if (['gen', 's2s', 'align'].includes(selected.task) && text.trim() && !usesYue2Request && !usesFixedChatPrompt && !['apollo', 'universr', 'reuse', 'realtime_reuse', 'voice_isolator', 'sidon', 'mossformer2'].includes(selected.family)) request.text = text;
+        if (['gen', 's2s', 'align'].includes(selected.task) && language.trim() && !usesYue2Request && !['apollo', 'universr', 'reuse', 'realtime_reuse', 'voice_isolator', 'sidon'].includes(selected.family)) request.language = language;
         if (selected.task === 'gen') {
           if (usesYue2Request) {
             request.lyrics = lyrics.trim();
           } else {
             const resolvedText = requestText();
             if (resolvedText) request.text = resolvedText;
-            if (lyrics.trim()) request.lyrics = lyrics;
+            if (lyrics.trim() && selected.family !== 'moss_soundeffect') request.lyrics = lyrics;
             if (!isFireRedAudioEdit && selected.family !== 'auk') {
               options.duration_sec = duration;
             }
@@ -2223,7 +2356,7 @@
           request.seed = resolvedSeed;
           if (supportsMaxTokens(selected)) request.max_tokens = maxTokens;
         } else if (selected.task === 's2s') {
-          if (!['apollo', 'reuse', 'realtime_reuse', 'sidon'].includes(selected.family)) request.seed = resolvedSeed;
+          if (!['apollo', 'reuse', 'realtime_reuse', 'voice_isolator', 'sidon', 'mossformer2'].includes(selected.family)) request.seed = resolvedSeed;
           if (supportsMaxTokens(selected)) request.max_tokens = maxTokens;
         }
         if (audio) request.audio = audio;
@@ -2232,13 +2365,14 @@
           request.reference_text = referenceText;
         }
         const body = { model: selected.id, request };
-        submittedRequests.push({ endpoint: '/v1/tasks/run', body: JSON.parse(JSON.stringify(body)) });
-        const result = await runTask(body, aborter.signal);
+        submittedRequests.push({ endpoint: streaming ? '/v1/tasks/stream' : '/v1/tasks/run', body: JSON.parse(JSON.stringify(body)) });
+        const result = streaming ? await streamedResult(body, aborter.signal, autoPlayOutput) : await runTask(body, aborter.signal);
         nextText = typeof result.text === 'string' ? result.text : '';
         nextJson = JSON.stringify(result, (key, value) =>
           (key === 'audio' || key === 'payload') && typeof value === 'string'
             ? `<base64 data: ${value.length} chars>` : value, 2);
         if (typeof result.audio === 'string') {
+          nextPlaybackAudio = result.audio;
           nextAudio = [{ id: 'output', url: base64AudioUrl(result.audio) }];
         }
         if (Array.isArray(result.named_audio_outputs)) {
@@ -2247,6 +2381,9 @@
             .filter((entry): entry is { id: string; audio: string } =>
               typeof entry?.id === 'string' && typeof entry?.audio === 'string')
             .map((entry) => ({ id: entry.id, url: base64AudioUrl(entry.audio) }));
+          const primary = result.named_audio_outputs.find((entry) =>
+            typeof entry?.id === 'string' && typeof entry?.audio === 'string');
+          nextPlaybackAudio = primary?.audio;
         }
         if (Array.isArray(result.artifacts)) {
           if (selected.family === 'liveavatar') {
@@ -2299,12 +2436,22 @@
       }
       historyError = '';
       outputCommitted = true;
+      if (autoPlayOutput && !streamedAudioPlayed && !playbackWarning && nextPlaybackAudio) {
+        try {
+          await playback.push(typeof nextPlaybackAudio === 'string'
+            ? base64Bytes(nextPlaybackAudio).buffer : await nextPlaybackAudio.arrayBuffer());
+        } catch (error) {
+          if ((error as Error)?.name === 'AbortError') throw error;
+          playbackWarning = error instanceof Error ? error.message : String(error);
+        }
+      }
       const elapsed = ((performance.now() - started) / 1000).toFixed(2);
       warningStatus = '';
       errorStatus = '';
       status = tr('status.completeIn', { seconds: elapsed });
       log(status);
     } catch (error) {
+      playback.stop();
       if ((error as Error)?.name === 'AbortError') {
         status = 'Cancelled.';
         warningStatus = '';
@@ -2322,6 +2469,8 @@
         for (const output of nextAudio) URL.revokeObjectURL(output.url);
         for (const artifact of nextArtifacts) URL.revokeObjectURL(artifact.url);
       }
+      pendingLiveAudio = [];
+      liveAudioReady = false;
       running = false;
       aborter = null;
       // A configured entry loads with its first request; show it as resident.
@@ -2330,6 +2479,8 @@
   }
 
   function cancel() {
+    ++playbackGeneration;
+    playback.stop();
     aborter?.abort();
   }
 
@@ -2650,6 +2801,7 @@
   });
 
   onDestroy(() => {
+    playback.close();
     if (generationTimer !== null) window.clearInterval(generationTimer);
     clearOutput();
     for (const entry of generationHistory) releaseGeneration(entry);
@@ -2889,7 +3041,7 @@
               setSourceFile={(file: File | null) => sourceFile = file}
               startSourceRecording={() => startRecording('source')}
               stopSourceRecording={stopRecording} />
-        {:else if selected.task === 'gen'}
+        {:else if selected.task === 'gen' && selected.family !== 'moss_soundeffect'}
           <label for="lyrics">{tr('request.lyrics')} <span>{lyricsRequired ? tr('voice.required') : tr('request.optional')}</span></label>
           <textarea id="lyrics" rows="3" bind:value={lyrics} required={lyricsRequired}
             aria-required={lyricsRequired} placeholder="[Verse]…"></textarea>
@@ -2907,7 +3059,7 @@
         {/if}
 
         <div class="field-grid">
-          {#if ['tts', 'clon', 'asr', 'gen', 's2s', 'align', 'vdes'].includes(selected.task) && !replacesGenericControls.language && !['apollo', 'universr', 'moss_transcribe_diarize', 'builtin_audio_utils', 'sam_audio', 'samsone', 'gigaam_asr', 'maya1', 'owsm', 'owsm_ctc', 'index_echo', 'audio_flamingo', 'kugelaudio', 'reuse', 'realtime_reuse', 'haas_asr', 'phonon2_asr', 'underdog_bark3', 'sidon', 'hviske_asr_v6', 'voxtral_tts'].includes(selected.family)}
+          {#if ['tts', 'clon', 'asr', 'gen', 's2s', 'align', 'vdes'].includes(selected.task) && !replacesGenericControls.language && !['apollo', 'universr', 'moss_transcribe_diarize', 'builtin_audio_utils', 'sam_audio', 'samsone', 'gigaam_asr', 'maya1', 'owsm', 'owsm_ctc', 'index_echo', 'audio_flamingo', 'kugelaudio', 'reuse', 'realtime_reuse', 'voice_isolator', 'haas_asr', 'phonon2_asr', 'underdog_bark3', 'sidon', 'hviske_asr_v6', 'voxtral_tts', 'zonos2', 'zonos3'].includes(selected.family)}
             <div>
               <label for="language">{tr('request.language')} {#if !asrLanguages[selected.family]}<span>{tr('request.autoLanguage')}</span>{/if}</label>
               {#if ['moss_ttsd', 'moss_voicegen'].includes(selected.family)}
@@ -2921,7 +3073,7 @@
               {/if}
             </div>
           {/if}
-          {#if ['tts', 'clon', 'gen', 's2s', 'vdes'].includes(selected.task) && !replacesGenericControls.seed && !['apollo', 'builtin_audio_utils', 'reuse', 'realtime_reuse', 'sidon'].includes(selected.family)}
+          {#if ['tts', 'clon', 'gen', 's2s', 'vdes'].includes(selected.task) && !replacesGenericControls.seed && !['apollo', 'builtin_audio_utils', 'reuse', 'realtime_reuse', 'voice_isolator', 'sidon', 'mossformer2'].includes(selected.family)}
             <div>
               <label for="seed">{tr('request.seed')} <span>{tr('request.randomSeed')}</span></label>
               <input id="seed" type="number" min="-1" max="4294967295" step="1" bind:value={seed} />
@@ -2942,7 +3094,7 @@
           {#if selected.task === 'gen' && !replacesGenericControls.duration}
             <div>
               <label for="duration">{tr('request.duration')}{#if allowsAutoDuration} <span>{tr('request.autoDuration')}</span>{/if}</label>
-              <input id="duration" type="number" min={allowsAutoDuration ? -1 : 1} step="0.1" value={duration}
+              <input id="duration" type="number" min={selected.family === 'moss_soundeffect' ? 0.1 : allowsAutoDuration ? -1 : 1} max={selected.family === 'moss_soundeffect' ? 30 : undefined} step="0.1" value={duration}
                 on:input={(event) => setDuration(event.currentTarget.valueAsNumber)} />
               {#if selected.family === 'minimax_h3'}
                 <small>{tr('request.minimaxFrames', { frames: Number(advancedValues.num_frames || 0) })}</small>
@@ -3159,6 +3311,20 @@
           </details>
         {/if}
 
+        {#if !usesPanelRequest}
+          <div class="studio-request-actions studio-playback-controls">
+            {#if canStreamOutput}
+              <label class="toggle"><input type="checkbox" bind:checked={streamOutput} disabled={running} /><span></span>{tr('run.streamingMode')}</label>
+            {/if}
+            {#if selected.task !== 'asr'}
+              <label class="toggle"><input type="checkbox" bind:checked={autoplay} disabled={running} /><span></span>{tr('run.autoPlay')}</label>
+            {/if}
+            {#if running && liveAudioReady && !livePlaybackStart}<button on:click={playLiveAudio}>{tr('run.playLive')}</button>{/if}
+            {#if playbackActive}<button on:click={() => playback.stop()}>{tr('run.stopPlayback')}</button>{/if}
+          </div>
+          {#if running && liveText}<pre aria-live="polite" aria-label={tr('result.streamingText')}>{liveText}</pre>{/if}
+          {#if playbackWarning}<p role="status">{playbackWarning}</p>{/if}
+        {/if}
         <div class="runbar">
           <button class="run" disabled={!selectedId || running || loadingModel || rewritingCaption || restoringHistory || modelPanelUploading ||
             (!isLoaded && (installed === false || !packageLoadReady))} on:click={run}

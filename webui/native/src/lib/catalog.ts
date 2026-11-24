@@ -34,6 +34,7 @@ interface PackageEntry {
 interface PackageSpec {
   family: string;
   capabilities?: Record<string, string[]>;
+  modes?: string[];
   packages?: Array<Omit<PackageEntry, 'family'>>;
   options?: {
     request?: Array<{ name: string; required?: boolean }>;
@@ -57,10 +58,14 @@ const packages: PackageEntry[] = Object.values(specModules).flatMap((spec) =>
   (spec.packages || []).map((entry) => ({ ...entry, family: spec.family }))
 );
 
+export const streamingFamilies = new Set(Object.values(specModules)
+  .filter(spec => spec.modes?.includes("streaming")).map(spec => spec.family));
+
 const specsByFamily = new Map(Object.values(specModules).map((spec) => [spec.family, spec]));
 export const modelCapabilities = Object.fromEntries(Object.values(specModules).map(spec =>
   [spec.family, [...new Set(Object.values(spec.capabilities || {}).flat())]])) as Record<string, string[]>;
 const exposeAllGgufPackageFamilies = new Set([
+  'zonos2', 'zonos3',
   'haas_asr', 'lfm_d1_omni', 'nemotron_transcribe', 'phonon2_asr',
   'pocket_tts_small', 'realtime_reuse', 'underdog_bark3', 'lfm3_audio',
   'ming3_tts',
@@ -83,7 +88,6 @@ const exposeAllGgufPackageFamilies = new Set([
   'meanvc2',
   'midashenglm_gen',
   'sanotts',
-  'mossformer2',
   'plapre',
   'voxtral_tts'
 ]);
@@ -175,6 +179,7 @@ function exposedPackageRank(entry: PackageEntry, selectedId?: string): number {
 }
 
 function packageLabel(entry: PackageEntry): string {
+  if (entry.family === 'zonos3') return entry.display_name || entry.id;
   if (entry.family === 'pocket_tts_small') {
     return (entry.display_name || entry.id).replace('PocketTTS Small English ', '').replace(' GGUF', '');
   }
@@ -253,6 +258,7 @@ function packageModelPath(entry: PackageEntry): string {
 
 function installChoices(entry: CatalogEntry): InstallPackageChoice[] {
   if (['maya1', 'gigaam_asr', 'samsone', 'sam_audio', 'tone_color_vc', 'moss_ttsd', 'moss_voicegen',
+    'mossformer2', 'mulacover', 'moss_soundeffect', 'm5_tts',
     'kugelaudio', 'crisperwhisper', 'index_echo', 'audio_flamingo', 'owsm', 'owsm_ctc', 'reuse', 'sidon', 'smart_turn'].includes(entry.family)) {
     const stem = (entry.download_id || '').replace(/_(?:q8_0|q4_k|bf16|f16|f32|orig)(?:_codec_f16(?:_decode)?)?$/, '');
     return packages.filter((candidate) => candidate.family === entry.family && candidate.format === 'gguf' &&

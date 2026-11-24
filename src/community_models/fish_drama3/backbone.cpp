@@ -1,16 +1,14 @@
 #include "engine/community_models/fish_drama3/backbone.h"
 
 #include "engine/framework/core/backend.h"
-#include "engine/framework/core/prepared_graph.h"
+#include "engine/framework/moe_engine/moe_prepared_graph.h"
 #include "engine/framework/core/backend_weight_store.h"
-#include "engine/framework/core/disk_expert_weight_store.h"
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/modules/activation_modules.h"
 #include "engine/framework/modules/feed_forward_modules.h"
+#include "engine/framework/modules/gated_delta_net_module.h"
 #include "engine/framework/modules/attention/grouped_query_attention.h"
 #include "engine/framework/modules/linear_module.h"
-#include "engine/framework/modules/moe_module.h"
-#include "engine/framework/modules/staged_moe_runtime.h"
 #include "engine/framework/modules/lookup_modules.h"
 #include "engine/framework/modules/norm_modules.h"
 #include "engine/framework/modules/optimizations/fast_kv_modules.h"
@@ -69,17 +67,7 @@ struct FullAttentionWeights {
     modules::NormWeights k_norm;
 };
 
-struct LinearAttentionWeights {
-    modules::LinearWeights in_proj_qkv;
-    modules::LinearWeights in_proj_z;
-    modules::LinearWeights in_proj_b;
-    modules::LinearWeights in_proj_a;
-    core::TensorValue conv_weight;
-    core::TensorValue dt_bias;
-    core::TensorValue a_log;
-    modules::NormWeights norm;
-    modules::LinearWeights out_proj;
-};
+using LinearAttentionWeights = modules::GatedDeltaNetWeights;
 
 struct Drama3BackboneLayerWeights {
     bool full_attention = false;
@@ -87,23 +75,29 @@ struct Drama3BackboneLayerWeights {
     modules::NormWeights post_norm;
     std::optional<FullAttentionWeights> full;
     std::optional<LinearAttentionWeights> linear;
-    modules::LinearWeights mlp_gate;
-    modules::LinearWeights mlp_up;
-    modules::LinearWeights mlp_down;
-    core::TensorValue router;
-    core::TensorValue expert_gate;
-    core::TensorValue expert_up;
-    core::TensorValue expert_down;
-    core::TensorValue shared_gate;
-    core::DiskExpertWeightStore * disk_store = nullptr;
-    size_t disk_group = 0;
+    modules::GatedFeedForwardWeights shared;
+    modules::LinearWeights shared_gate;
+    moe::LayerId expert;
 };
 
 struct Drama3BackboneWeights {
-    std::shared_ptr<core::ExecutionContext> cpu_execution;
+    explicit Drama3BackboneWeights(const Drama3BackboneDecoderConfig & c)
+        : delta_net({c.hidden_size, c.linear_key_head_dim, c.linear_num_key_heads,
+            c.linear_value_head_dim, c.linear_num_value_heads, c.linear_conv_kernel_dim,
+            c.rms_norm_eps, c.round_bf16_activations}) {
+        modules::GatedFeedForwardConfig shared;
+        shared.hidden_size = c.hidden_size;
+        shared.intermediate_size = c.intermediate_size;
+        shared.activation = modules::GatedFeedForwardActivation::Silu;
+        shared.round_projections = shared.round_activation = c.round_bf16_activations;
+        shared.round_product = shared.round_output = c.round_bf16_activations;
+        shared_config = shared;
+    }
+
+    modules::GatedDeltaNetModule delta_net;
+    modules::GatedFeedForwardConfig shared_config;
     std::shared_ptr<core::BackendWeightStore> store;
-    std::shared_ptr<core::BackendWeightStore> cpu_store;
-    std::unique_ptr<core::DiskExpertWeightStore> disk_store;
+    std::unique_ptr<moe::MoeEngine> experts;
     core::TensorValue token_embedding;
     std::vector<Drama3BackboneLayerWeights> layers;
     modules::NormWeights final_norm;
@@ -189,33 +183,16 @@ std::shared_ptr<Drama3BackboneWeights> load_qwen35_weights(
     core::ExecutionContext & execution,
     size_t weight_context_bytes,
     assets::TensorStorageType storage_type) {
-    auto weights = std::make_shared<Drama3BackboneWeights>();
+    auto weights = std::make_shared<Drama3BackboneWeights>(config);
     weights->store = std::make_shared<core::BackendWeightStore>(
         execution.backend(),
         execution.backend_type(),
         "drama3_backbone.weights",
         weight_context_bytes);
     const auto & c = config;
-    if (c.cpu_expert_layers < 0 || c.cpu_expert_layers > c.layers) {
-        throw std::runtime_error("Drama 3 cpu_expert_layers must be between zero and the layer count");
-    }
-    if ((c.cpu_expert_layers > 0 || c.disk_experts) && execution.backend_type() != core::BackendType::Cpu) {
-        core::BackendConfig host;
-        host.threads = execution.config().threads;
-        weights->cpu_execution = std::make_shared<core::ExecutionContext>(host);
-        if (!c.disk_experts) weights->cpu_store = std::make_shared<core::BackendWeightStore>(
-            weights->cpu_execution->backend(), core::BackendType::Cpu,
-            "drama3_backbone.host_experts", weight_context_bytes);
-    }
+    weights->experts = std::make_unique<moe::MoeEngine>(execution, *weights->store, source,
+        c.moe, "drama3_backbone.host_experts", weight_context_bytes);
     const std::string & root = c.weight_prefix;
-    if (c.disk_experts) {
-        if (storage_type != assets::TensorStorageType::Native)
-            throw std::runtime_error("Drama 3 disk experts require native GGUF weight types");
-        if (c.expert_cache_size < c.experts_per_token || c.expert_cache_size > c.experts)
-            throw std::runtime_error("Drama 3 expert_cache_size must cover top-k and not exceed the expert count");
-        weights->disk_store = std::make_unique<core::DiskExpertWeightStore>(source.source_path(), c.pin_experts,
-            static_cast<size_t>(c.disk_expert_read_threads));
-    }
     weights->token_embedding = weights->store->load_tensor(
         source,
         root + ".embed_tokens.weight",
@@ -238,28 +215,30 @@ std::shared_ptr<Drama3BackboneWeights> load_qwen35_weights(
         } else {
             out.linear = load_linear_attention(*weights->store, source, prefix + ".linear_attn", c, storage_type);
         }
-        out.mlp_gate = binding::linear_from_source(*weights->store, source, prefix + ".mlp.shared_expert.gate_proj", storage_type, c.intermediate_size, c.hidden_size, false);
-        out.mlp_up = binding::linear_from_source(*weights->store, source, prefix + ".mlp.shared_expert.up_proj", storage_type, c.intermediate_size, c.hidden_size, false);
-        out.mlp_down = binding::linear_from_source(*weights->store, source, prefix + ".mlp.shared_expert.down_proj", storage_type, c.hidden_size, c.intermediate_size, false);
+        auto & shared = out.shared;
+        shared.gate_proj = binding::linear_from_source(*weights->store, source, prefix + ".mlp.shared_expert.gate_proj", storage_type, c.intermediate_size, c.hidden_size, false);
+        shared.up_proj = binding::linear_from_source(*weights->store, source, prefix + ".mlp.shared_expert.up_proj", storage_type, c.intermediate_size, c.hidden_size, false);
+        shared.down_proj = binding::linear_from_source(*weights->store, source, prefix + ".mlp.shared_expert.down_proj", storage_type, c.hidden_size, c.intermediate_size, false);
         const int64_t layer_experts = c.experts_per_layer.empty() ? c.experts : c.experts_per_layer[static_cast<size_t>(layer)];
-        out.router = weights->store->load_tensor(source, prefix + ".mlp.gate.weight", storage_type, {layer_experts, c.hidden_size});
-        out.shared_gate = weights->store->load_tensor(source, prefix + ".mlp.shared_expert_gate.weight", storage_type, {1, c.hidden_size});
-        if (weights->disk_store) {
-            out.disk_store = weights->disk_store.get();
-            const auto backend = weights->cpu_execution && layer < c.cpu_expert_layers
-                ? weights->cpu_execution->backend() : execution.backend();
-            const auto bank = "model_weights/" + prefix + ".mlp.experts.";
-            out.disk_group = out.disk_store->add_group({bank + "gate_proj.weight", bank + "up_proj.weight",
-                bank + "down_proj.weight"}, backend, c.expert_cache_size);
-            out.expert_gate = out.disk_store->tensor(out.disk_group, 0);
-            out.expert_up = out.disk_store->tensor(out.disk_group, 1);
-            out.expert_down = out.disk_store->tensor(out.disk_group, 2);
-        } else {
-            auto & expert_store = weights->cpu_store && layer < c.cpu_expert_layers ? *weights->cpu_store : *weights->store;
-            out.expert_gate = expert_store.load_tensor(source, prefix + ".mlp.experts.gate_proj.weight", storage_type, {layer_experts, c.intermediate_size, c.hidden_size});
-            out.expert_up = expert_store.load_tensor(source, prefix + ".mlp.experts.up_proj.weight", storage_type, {layer_experts, c.intermediate_size, c.hidden_size});
-            out.expert_down = expert_store.load_tensor(source, prefix + ".mlp.experts.down_proj.weight", storage_type, {layer_experts, c.hidden_size, c.intermediate_size});
-        }
+        moe::LayerBindings expert_bindings;
+        expert_bindings.router = weights->store->load_tensor(source, prefix + ".mlp.gate.weight", storage_type, {layer_experts, c.hidden_size});
+        out.shared_gate.weight = weights->store->load_tensor(source, prefix + ".mlp.shared_expert_gate.weight", storage_type, {1, c.hidden_size});
+        const auto bank = prefix + ".mlp.experts.";
+        expert_bindings.experts = {
+            {bank + "gate_proj.weight", "model_weights/" + bank + "gate_proj.weight",
+                {layer_experts, c.intermediate_size, c.hidden_size}, storage_type},
+            {bank + "up_proj.weight", "model_weights/" + bank + "up_proj.weight",
+                {layer_experts, c.intermediate_size, c.hidden_size}, storage_type},
+            {bank + "down_proj.weight", "model_weights/" + bank + "down_proj.weight",
+                {layer_experts, c.hidden_size, c.intermediate_size}, storage_type}};
+        // Bindings use explicit projection roles rather than cache-bank order.
+        expert_bindings.experts[0].role = moe::ProjectionRole::Gate;
+        expert_bindings.experts[1].role = moe::ProjectionRole::Up;
+        expert_bindings.experts[2].role = moe::ProjectionRole::Down;
+        moe::LayerMath math;
+        math.routing.experts = layer_experts; math.routing.selected = c.experts_per_token;
+        math.routing.contiguous_ids = weights->experts->staged();
+        out.expert = weights->experts->register_layer(std::move(expert_bindings), math);
         weights->layers.push_back(std::move(out));
     }
     auto final_scale = source.require_f32(root + ".norm.weight", {c.hidden_size});
@@ -278,7 +257,7 @@ std::shared_ptr<Drama3BackboneWeights> load_qwen35_weights(
             false);
     }
     weights->store->upload();
-    if (weights->cpu_store) weights->cpu_store->upload();
+    weights->experts->finalize_weights();
     return weights;
 }
 
@@ -329,64 +308,27 @@ core::TensorValue round_activation(
     return core::wrap_tensor(ggml_round_bf16(ctx.ggml, input.tensor), input.shape, GGML_TYPE_F32);
 }
 
-struct Drama3MoeInputs {
-    ggml_tensor * shared;
-    ggml_tensor * ids;
-    ggml_tensor * scales;
-};
-
-Drama3MoeInputs build_moe_inputs(
-    core::ModuleBuildContext & ctx,
-    const core::TensorValue & x,
-    const Drama3BackboneLayerWeights & weights,
-    const Drama3BackboneDecoderConfig & config,
-    bool fused = false) {
-    auto gate = modules::LinearModule({config.hidden_size, config.intermediate_size, false}).build(ctx, x, weights.mlp_gate);
-    gate = round_activation(ctx, gate, config);
-    auto up = modules::LinearModule({config.hidden_size, config.intermediate_size, false}).build(ctx, x, weights.mlp_up);
-    up = round_activation(ctx, up, config);
-    core::TensorValue gated;
-    if (fused) {
-        gated = core::wrap_tensor(ggml_swiglu_split(ctx.ggml, gate.tensor, up.tensor), gate.shape, gate.type);
-    } else {
-        gate = modules::SiluModule{}.build(ctx, gate);
-        gate = round_activation(ctx, gate, config);
-        gated = modules::MulModule{}.build(ctx, gate, up);
-    }
-    gated = round_activation(ctx, gated, config);
-    auto shared = round_activation(ctx,
-        modules::LinearModule({config.intermediate_size, config.hidden_size, false}).build(ctx, gated, weights.mlp_down), config);
-    auto * shared_scale = ggml_sigmoid(ctx.ggml, ggml_mul_mat(ctx.ggml, weights.shared_gate.tensor, x.tensor));
-    auto * shared_output = ggml_mul(ctx.ggml, shared.tensor, shared_scale);
-    const int64_t steps = ggml_nelements(x.tensor) / config.hidden_size;
-    auto * hidden = ggml_reshape_2d(ctx.ggml, x.tensor, config.hidden_size, steps);
-    modules::MoeRoutingConfig routing_config;
-    routing_config.experts = weights.router.tensor->ne[1]; // per-layer adaptive pruning
-    routing_config.selected = config.experts_per_token;
-    // Preserve offload's original unfused routing arithmetic.
-    routing_config.contiguous_ids = weights.disk_store != nullptr;
-    auto routing = modules::MoeModule::build_routing(ctx, hidden, weights.router.tensor, nullptr, routing_config);
-    return {ggml_reshape_2d(ctx.ggml, shared_output, config.hidden_size, steps), routing.ids, routing.weights};
+core::TensorValue shared_expert(core::ModuleBuildContext & ctx, const core::TensorValue & input,
+    const Drama3BackboneLayerWeights & layer, modules::GatedFeedForwardConfig config) {
+    auto shared = modules::GatedFeedForwardModule(config).build(ctx, input, layer.shared);
+    auto gate = modules::LinearModule({input.tensor->ne[0], 1, false}).build(ctx, input, layer.shared_gate);
+    gate = modules::SigmoidModule{}.build(ctx, gate);
+    return modules::MulModule{true}.build(ctx, shared, gate);
 }
 
-core::TensorValue mlp(
-    core::ModuleBuildContext & ctx,
-    const core::TensorValue & x,
-    const Drama3BackboneLayerWeights & weights,
-    const Drama3BackboneDecoderConfig & config,
-    ggml_cgraph * routing_graph = nullptr) {
-    const auto inputs = build_moe_inputs(ctx, x, weights, config, routing_graph != nullptr);
-    if (routing_graph && !weights.disk_store) ggml_build_forward_expand(routing_graph, inputs.scales);
+core::TensorValue mlp(core::ModuleBuildContext & ctx, const core::TensorValue & x,
+    const Drama3BackboneLayerWeights & layer, const Drama3BackboneDecoderConfig & config,
+    moe::MoePreparedGraph & graph, const Drama3BackboneWeights & weights, bool fused = false) {
+    auto shared_config = weights.shared_config;
+    shared_config.fused_swiglu = fused;
+    auto shared = shared_expert(ctx, x, layer, shared_config);
     const int64_t steps = ggml_nelements(x.tensor) / config.hidden_size;
     auto * hidden = ggml_reshape_2d(ctx.ggml, x.tensor, config.hidden_size, steps);
-    auto * bank_ids = weights.disk_store ? weights.disk_store->route(ctx, inputs.ids, weights.disk_group) : nullptr;
-    modules::MoeExpertConfig expert_config;
-    expert_config.fused_swiglu = routing_graph != nullptr;
-    const modules::MoeModule moe(expert_config);
-    auto * expert_output = moe.build(ctx, hidden, {inputs.ids, inputs.scales},
-        {weights.expert_up.tensor, weights.expert_gate.tensor, weights.expert_down.tensor}, bank_ids);
-    auto * output = ggml_add(ctx.ggml, expert_output, inputs.shared);
-    return round_activation(ctx, core::wrap_tensor(ggml_reshape_3d(ctx.ggml, output, config.hidden_size, steps, 1), x.shape), config);
+    auto * routed = weights.experts->build(graph, layer.expert, hidden, nullptr,
+        fused ? moe::ExpertLowering::FusedSwiGlu : moe::ExpertLowering::Default);
+    auto * output = ggml_add(ctx.ggml, routed, ggml_reshape_2d(ctx.ggml, shared.tensor, config.hidden_size, steps));
+    if (config.round_bf16_activations) output = ggml_round_bf16(ctx.ggml, output);
+    return core::wrap_tensor(ggml_reshape_3d(ctx.ggml, output, config.hidden_size, steps, 1), x.shape);
 }
 
 core::TensorValue apply_partial_rope(
@@ -593,247 +535,7 @@ core::TensorValue full_attention_cached(
         modules::LinearModule({config.heads * config.head_dim, config.hidden_size, false}).build(ctx, context, weights.o_proj), config);
 }
 
-core::TensorValue repeat_head_values(
-    core::ModuleBuildContext & ctx,
-    const core::TensorValue & values,
-    int64_t steps,
-    int64_t heads) {
-    auto shaped = core::reshape_tensor(ctx, values, core::TensorShape::from_dims({1, 1, heads}));
-    return modules::RepeatModule({core::TensorShape::from_dims({1, steps, heads})}).build(ctx, shaped);
-}
 
-core::TensorValue repeat_linear_attention_heads(
-    core::ModuleBuildContext & ctx,
-    const core::TensorValue & input,
-    int64_t repeats) {
-    if (repeats == 1) {
-        return input;
-    }
-    if (input.shape.rank != 4) {
-        throw std::runtime_error("Drama 3 backbone linear attention head repeat expects rank-4 input");
-    }
-    // Introduce a singleton axis before the head axis, repeat that axis, then
-    // collapse it into heads. This is repeat_interleave, not head tiling.
-    // It preserves the exact values while avoiding one concat per output head.
-    const int64_t batch = input.shape.dims[0];
-    const int64_t steps = input.shape.dims[1];
-    const int64_t heads = input.shape.dims[2];
-    const int64_t dim = input.shape.dims[3];
-    auto * shaped = ggml_reshape_4d(ctx.ggml, ggml_cont(ctx.ggml, input.tensor), dim, 1, heads, steps * batch);
-    auto * repeated = ggml_repeat_4d(ctx.ggml, shaped, dim, repeats, heads, steps * batch);
-    return core::wrap_tensor(ggml_reshape_4d(ctx.ggml, repeated, dim, heads * repeats, steps, batch),
-        core::TensorShape::from_dims({batch, steps, heads * repeats, dim}), input.type);
-}
-
-struct LinearAttentionCachedOutput {
-    core::TensorValue output;
-    core::TensorValue next_conv_tail;
-    core::TensorValue next_recurrent_state;
-};
-
-LinearAttentionCachedOutput linear_attention_prefill(
-    core::ModuleBuildContext & ctx,
-    const core::TensorValue & input,
-    const core::TensorValue & state,
-    const LinearAttentionWeights & weights,
-    const Drama3BackboneDecoderConfig & config) {
-    const int64_t steps = input.shape.dims[1];
-    const int64_t key_dim = config.linear_key_head_dim * config.linear_num_key_heads;
-    const int64_t value_dim = config.linear_value_head_dim * config.linear_num_value_heads;
-    const int64_t conv_dim = key_dim * 2 + value_dim;
-    auto qkv = modules::LinearModule({config.hidden_size, conv_dim, false}).build(ctx, input, weights.in_proj_qkv);
-    qkv = round_activation(ctx, qkv, config);
-    qkv = modules::TransposeModule({{0, 2, 1}, 3}).build(ctx, qkv);
-    qkv = core::ensure_backend_addressable_layout(ctx, qkv);
-    auto * padded_raw = ggml_pad_ext(
-        ctx.ggml,
-        qkv.tensor,
-        static_cast<int>(config.linear_conv_kernel_dim - 1),
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0);
-    auto padded = core::wrap_tensor(
-        padded_raw,
-        core::TensorShape::from_dims({1, conv_dim, steps + config.linear_conv_kernel_dim - 1}),
-        GGML_TYPE_F32);
-    auto conv_weight = core::reshape_tensor(ctx, weights.conv_weight, core::TensorShape::from_dims({conv_dim, config.linear_conv_kernel_dim}));
-    auto conv = core::wrap_tensor(
-        ggml_ssm_conv(ctx.ggml, padded.tensor, conv_weight.tensor),
-        core::TensorShape::from_dims({1, steps, conv_dim}),
-        GGML_TYPE_F32);
-    conv = round_activation(ctx, conv, config);
-    conv = modules::SiluModule{}.build(ctx, conv);
-    conv = round_activation(ctx, conv, config);
-    auto query = modules::SliceModule({2, 0, key_dim}).build(ctx, conv);
-    auto key = modules::SliceModule({2, key_dim, key_dim}).build(ctx, conv);
-    auto value = modules::SliceModule({2, 2 * key_dim, value_dim}).build(ctx, conv);
-    query = reshape_heads(ctx, query, config.linear_num_key_heads, config.linear_key_head_dim);
-    key = reshape_heads(ctx, key, config.linear_num_key_heads, config.linear_key_head_dim);
-    value = reshape_heads(ctx, value, config.linear_num_value_heads, config.linear_value_head_dim);
-    query = core::wrap_tensor(ggml_l2_norm(ctx.ggml, query.tensor, 1.0e-6F), query.shape, GGML_TYPE_F32);
-    key = core::wrap_tensor(ggml_l2_norm(ctx.ggml, key.tensor, 1.0e-6F), key.shape, GGML_TYPE_F32);
-    query = round_activation(ctx, query, config);
-    key = round_activation(ctx, key, config);
-    if (config.linear_num_value_heads % config.linear_num_key_heads != 0) {
-        throw std::runtime_error("Drama 3 backbone linear attention key heads must divide value heads");
-    }
-    const int64_t key_repeats = config.linear_num_value_heads / config.linear_num_key_heads;
-    query = repeat_linear_attention_heads(ctx, query, key_repeats);
-    key = repeat_linear_attention_heads(ctx, key, key_repeats);
-    auto beta = modules::LinearModule({config.hidden_size, config.linear_num_value_heads, false}).build(ctx, input, weights.in_proj_b);
-    beta = round_activation(ctx, beta, config);
-    beta = modules::SigmoidModule{}.build(ctx, beta);
-    beta = round_activation(ctx, beta, config);
-    auto a = modules::LinearModule({config.hidden_size, config.linear_num_value_heads, false}).build(ctx, input, weights.in_proj_a);
-    a = round_activation(ctx, a, config);
-    auto dt_bias = repeat_head_values(ctx, weights.dt_bias, steps, config.linear_num_value_heads);
-    a = modules::AddModule{}.build(ctx, a, dt_bias);
-    a = core::wrap_tensor(ggml_softplus(ctx.ggml, a.tensor), a.shape, GGML_TYPE_F32);
-    auto a_log = repeat_head_values(ctx, weights.a_log, steps, config.linear_num_value_heads);
-    a_log = core::wrap_tensor(ggml_exp(ctx.ggml, a_log.tensor), a_log.shape, GGML_TYPE_F32);
-    auto g = modules::MulModule{}.build(ctx, a, a_log);
-    g = core::wrap_tensor(ggml_scale(ctx.ggml, g.tensor, -1.0F), g.shape, GGML_TYPE_F32);
-    beta = core::reshape_tensor(ctx, beta, core::TensorShape::from_dims({1, steps, config.linear_num_value_heads, 1}));
-    g = core::reshape_tensor(ctx, g, core::TensorShape::from_dims({1, steps, config.linear_num_value_heads, 1}));
-    auto delta = core::wrap_tensor(
-        ggml_gated_delta_net(ctx.ggml, query.tensor, key.tensor, value.tensor, g.tensor, beta.tensor, state.tensor),
-        core::TensorShape::from_dims({steps + config.linear_value_head_dim, value_dim}),
-        GGML_TYPE_F32);
-    auto current_delta = modules::SliceModule({0, 0, steps}).build(ctx, delta);
-    auto next_state = modules::SliceModule({0, steps, config.linear_value_head_dim}).build(ctx, delta);
-    current_delta = round_activation(ctx, current_delta, config);
-    next_state = round_activation(ctx, next_state, config);
-    next_state = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, next_state), state.shape);
-    auto z = modules::LinearModule({config.hidden_size, value_dim, false}).build(ctx, input, weights.in_proj_z);
-    z = round_activation(ctx, z, config);
-    z = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, z), core::TensorShape::from_dims({steps, value_dim}));
-    current_delta = modules::RMSNormModule({config.linear_value_head_dim, config.rms_norm_eps, true, false}).build(
-        ctx,
-        core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, current_delta), core::TensorShape::from_dims({steps * config.linear_num_value_heads, config.linear_value_head_dim})),
-        weights.norm);
-    current_delta = round_activation(ctx, current_delta, config);
-    auto z_flat = core::reshape_tensor(ctx, z, core::TensorShape::from_dims({steps * config.linear_num_value_heads, config.linear_value_head_dim}));
-    z_flat = modules::SiluModule{}.build(ctx, z_flat);
-    z_flat = round_activation(ctx, z_flat, config);
-    current_delta = modules::MulModule{}.build(ctx, current_delta, z_flat);
-    current_delta = round_activation(ctx, current_delta, config);
-    current_delta = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, current_delta), core::TensorShape::from_dims({1, steps, value_dim}));
-    auto output = modules::LinearModule({value_dim, config.hidden_size, false}).build(ctx, current_delta, weights.out_proj);
-    output = round_activation(ctx, output, config);
-    auto next_tail = modules::SliceModule({2, steps, config.linear_conv_kernel_dim - 1}).build(ctx, padded);
-    next_tail = core::ensure_backend_addressable_layout(ctx, next_tail);
-    return {std::move(output), std::move(next_tail), std::move(next_state)};
-}
-
-core::TensorValue linear_attention(
-    core::ModuleBuildContext & ctx,
-    const core::TensorValue & input,
-    const core::TensorValue & state,
-    const LinearAttentionWeights & weights,
-    const Drama3BackboneDecoderConfig & config) {
-    return linear_attention_prefill(ctx, input, state, weights, config).output;
-}
-
-LinearAttentionCachedOutput linear_attention_cached(
-    core::ModuleBuildContext & ctx,
-    const core::TensorValue & input,
-    const core::TensorValue & conv_tail,
-    const core::TensorValue & recurrent_state,
-    const LinearAttentionWeights & weights,
-    const Drama3BackboneDecoderConfig & config) {
-    const int64_t steps = input.shape.dims[1];
-    if (steps != 1) {
-        throw std::runtime_error("Drama 3 backbone cached linear attention requires one decode step");
-    }
-    const int64_t key_dim = config.linear_key_head_dim * config.linear_num_key_heads;
-    const int64_t value_dim = config.linear_value_head_dim * config.linear_num_value_heads;
-    const int64_t conv_dim = key_dim * 2 + value_dim;
-    auto qkv = modules::LinearModule({config.hidden_size, conv_dim, false}).build(ctx, input, weights.in_proj_qkv);
-    qkv = round_activation(ctx, qkv, config);
-    qkv = modules::TransposeModule({{0, 2, 1}, 3}).build(ctx, qkv);
-    qkv = core::ensure_backend_addressable_layout(ctx, qkv);
-    auto conv_input = modules::ConcatModule({2}).build(ctx, conv_tail, qkv);
-    auto conv_weight = core::reshape_tensor(ctx, weights.conv_weight, core::TensorShape::from_dims({conv_dim, config.linear_conv_kernel_dim}));
-    auto conv = core::wrap_tensor(
-        ggml_ssm_conv(ctx.ggml, conv_input.tensor, conv_weight.tensor),
-        core::TensorShape::from_dims({1, 1, conv_dim}),
-        GGML_TYPE_F32);
-    conv = round_activation(ctx, conv, config);
-    conv = modules::SiluModule{}.build(ctx, conv);
-    conv = round_activation(ctx, conv, config);
-    auto query = modules::SliceModule({2, 0, key_dim}).build(ctx, conv);
-    auto key = modules::SliceModule({2, key_dim, key_dim}).build(ctx, conv);
-    auto value = modules::SliceModule({2, 2 * key_dim, value_dim}).build(ctx, conv);
-    query = reshape_heads(ctx, query, config.linear_num_key_heads, config.linear_key_head_dim);
-    key = reshape_heads(ctx, key, config.linear_num_key_heads, config.linear_key_head_dim);
-    value = reshape_heads(ctx, value, config.linear_num_value_heads, config.linear_value_head_dim);
-    query = core::wrap_tensor(ggml_l2_norm(ctx.ggml, query.tensor, 1.0e-6F), query.shape, GGML_TYPE_F32);
-    key = core::wrap_tensor(ggml_l2_norm(ctx.ggml, key.tensor, 1.0e-6F), key.shape, GGML_TYPE_F32);
-    query = round_activation(ctx, query, config);
-    key = round_activation(ctx, key, config);
-    if (config.linear_num_value_heads % config.linear_num_key_heads != 0) {
-        throw std::runtime_error("Drama 3 backbone linear attention key heads must divide value heads");
-    }
-    const int64_t key_repeats = config.linear_num_value_heads / config.linear_num_key_heads;
-    query = repeat_linear_attention_heads(ctx, query, key_repeats);
-    key = repeat_linear_attention_heads(ctx, key, key_repeats);
-    auto beta = modules::LinearModule({config.hidden_size, config.linear_num_value_heads, false}).build(ctx, input, weights.in_proj_b);
-    beta = round_activation(ctx, beta, config);
-    beta = modules::SigmoidModule{}.build(ctx, beta);
-    beta = round_activation(ctx, beta, config);
-    auto a = modules::LinearModule({config.hidden_size, config.linear_num_value_heads, false}).build(ctx, input, weights.in_proj_a);
-    a = round_activation(ctx, a, config);
-    auto dt_bias = repeat_head_values(ctx, weights.dt_bias, 1, config.linear_num_value_heads);
-    a = modules::AddModule{}.build(ctx, a, dt_bias);
-    a = core::wrap_tensor(ggml_softplus(ctx.ggml, a.tensor), a.shape, GGML_TYPE_F32);
-    auto a_log = repeat_head_values(ctx, weights.a_log, 1, config.linear_num_value_heads);
-    a_log = core::wrap_tensor(ggml_exp(ctx.ggml, a_log.tensor), a_log.shape, GGML_TYPE_F32);
-    auto g = modules::MulModule{}.build(ctx, a, a_log);
-    g = core::wrap_tensor(ggml_scale(ctx.ggml, g.tensor, -1.0F), g.shape, GGML_TYPE_F32);
-    beta = core::reshape_tensor(ctx, beta, core::TensorShape::from_dims({1, 1, config.linear_num_value_heads, 1}));
-    g = core::reshape_tensor(ctx, g, core::TensorShape::from_dims({1, 1, config.linear_num_value_heads, 1}));
-    auto delta = core::wrap_tensor(
-        ggml_gated_delta_net(ctx.ggml, query.tensor, key.tensor, value.tensor, g.tensor, beta.tensor, recurrent_state.tensor),
-        core::TensorShape::from_dims({1 + config.linear_value_head_dim, value_dim}),
-        GGML_TYPE_F32);
-    auto current_delta = modules::SliceModule({0, 0, 1}).build(ctx, delta);
-    auto next_state = modules::SliceModule({0, 1, config.linear_value_head_dim}).build(ctx, delta);
-    current_delta = round_activation(ctx, current_delta, config);
-    next_state = round_activation(ctx, next_state, config);
-    next_state = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, next_state), recurrent_state.shape);
-    auto z = modules::LinearModule({config.hidden_size, value_dim, false}).build(ctx, input, weights.in_proj_z);
-    z = round_activation(ctx, z, config);
-    z = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, z), core::TensorShape::from_dims({1, value_dim}));
-    current_delta = modules::RMSNormModule({config.linear_value_head_dim, config.rms_norm_eps, true, false}).build(
-        ctx,
-        core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, current_delta), core::TensorShape::from_dims({config.linear_num_value_heads, config.linear_value_head_dim})),
-        weights.norm);
-    current_delta = round_activation(ctx, current_delta, config);
-    auto z_flat = core::reshape_tensor(ctx, z, core::TensorShape::from_dims({config.linear_num_value_heads, config.linear_value_head_dim}));
-    z_flat = modules::SiluModule{}.build(ctx, z_flat);
-    z_flat = round_activation(ctx, z_flat, config);
-    current_delta = modules::MulModule{}.build(ctx, current_delta, z_flat);
-    current_delta = round_activation(ctx, current_delta, config);
-    current_delta = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, current_delta), core::TensorShape::from_dims({1, 1, value_dim}));
-    auto output = modules::LinearModule({value_dim, config.hidden_size, false}).build(ctx, current_delta, weights.out_proj);
-    output = round_activation(ctx, output, config);
-    auto next_tail = modules::SliceModule({2, 1, config.linear_conv_kernel_dim - 1}).build(ctx, conv_input);
-    next_tail = core::ensure_backend_addressable_layout(ctx, next_tail);
-    return {std::move(output), std::move(next_tail), std::move(next_state)};
-}
-
-void configure_expert_scheduler(core::PreparedGraph & graph, const Drama3BackboneWeights & weights) {
-    if (!weights.cpu_execution && !weights.disk_store) return;
-    std::vector<ggml_backend_t> backends{graph.execution().backend()};
-    if (weights.cpu_execution) backends.push_back(weights.cpu_execution->backend());
-    auto * scheduler = graph.create_scheduler(std::move(backends));
-    if (weights.disk_store) ggml_backend_sched_set_eval_callback(
-        scheduler, core::DiskExpertWeightStore::evaluate, weights.disk_store.get());
-}
 
 class BackboneForwardGraph {
 public:
@@ -883,7 +585,7 @@ private:
             return;
         }
         prepared_.reset();
-        auto candidate = std::make_unique<core::PreparedGraph>(execution_, core::PreparedGraphConfig{
+        auto candidate = std::make_unique<moe::MoePreparedGraph>(execution_, core::PreparedGraphConfig{
             "drama3_backbone.forward", graph_arena_bytes_, 65536, 16ull * 1024ull * 1024ull});
         auto & ctx = candidate->build_context();
         auto & input_ctx = candidate->persistent_build_context();
@@ -916,14 +618,14 @@ private:
                     }));
                 state_inputs_.push_back(state.tensor);
                 ggml_set_input(state.tensor);
-                h = linear_attention(ctx, h, state, *layer.linear, config_);
+                h = weights_->delta_net.build(ctx, h, state, *layer.linear).output;
             }
             x = modules::AddModule{}.build(ctx, residual, h);
             x = round_activation(ctx, x, config_);
             residual = x;
             h = modules::RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false}).build(ctx, x, layer.post_norm);
             h = round_activation(ctx, h, config_);
-            h = mlp(ctx, h, layer, config_);
+            h = mlp(ctx, h, layer, config_, *candidate, *weights_);
             x = modules::AddModule{}.build(ctx, residual, h);
             x = round_activation(ctx, x, config_);
         }
@@ -933,7 +635,7 @@ private:
         ggml_set_output(output_);
         ggml_build_forward_expand(candidate->graph(), output_);
         candidate->allocate_persistent();
-        configure_expert_scheduler(*candidate, *weights_);
+
         candidate->allocate();
         const auto pos = position_ids(steps);
         ggml_backend_tensor_set(positions_, pos.data(), 0, pos.size() * sizeof(int32_t));
@@ -953,7 +655,7 @@ private:
     std::shared_ptr<const Drama3BackboneWeights> weights_;
     Drama3BackboneDecoderConfig config_;
     size_t graph_arena_bytes_;
-    std::unique_ptr<core::PreparedGraph> prepared_;
+    std::unique_ptr<moe::MoePreparedGraph> prepared_;
     int64_t steps_ = 0;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * positions_ = nullptr;
@@ -998,7 +700,7 @@ private:
             return;
         }
         prepared_.reset();
-        auto candidate = std::make_unique<core::PreparedGraph>(execution_, core::PreparedGraphConfig{
+        auto candidate = std::make_unique<moe::MoePreparedGraph>(execution_, core::PreparedGraphConfig{
             "drama3_backbone.token_embedding", graph_arena_bytes_, 4096, 8ull * 1024ull * 1024ull});
         auto & ctx = candidate->build_context();
         auto & input_ctx = candidate->persistent_build_context();
@@ -1019,7 +721,7 @@ private:
     std::shared_ptr<const Drama3BackboneWeights> weights_;
     Drama3BackboneDecoderConfig config_;
     size_t graph_arena_bytes_;
-    std::unique_ptr<core::PreparedGraph> prepared_;
+    std::unique_ptr<moe::MoePreparedGraph> prepared_;
     int64_t steps_ = 0;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * output_ = nullptr;
@@ -1058,7 +760,7 @@ private:
         if (prepared_ != nullptr) {
             return;
         }
-        auto candidate = std::make_unique<core::PreparedGraph>(execution_, core::PreparedGraphConfig{
+        auto candidate = std::make_unique<moe::MoePreparedGraph>(execution_, core::PreparedGraphConfig{
             "drama3_backbone.lm_head", graph_arena_bytes_, 4096, 8ull * 1024ull * 1024ull});
         auto & ctx = candidate->build_context();
         auto & input_ctx = candidate->persistent_build_context();
@@ -1102,7 +804,7 @@ private:
     std::shared_ptr<const Drama3BackboneWeights> weights_;
     Drama3BackboneDecoderConfig config_;
     size_t graph_arena_bytes_;
-    std::unique_ptr<core::PreparedGraph> prepared_;
+    std::unique_ptr<moe::MoePreparedGraph> prepared_;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * output_ = nullptr;
 };
@@ -1121,26 +823,17 @@ public:
         const size_t small_bytes = ggml_graph_overhead_custom(small_nodes, false) + 64 * ggml_tensor_overhead();
         const size_t layer_bytes =
             ggml_graph_overhead_custom(nodes, false) + 512 * ggml_tensor_overhead() + small_bytes;
-        prepared_ = std::make_unique<core::PreparedGraph>(execution, core::PreparedGraphConfig{
+        workspace_ = std::make_shared<core::GraphWorkspace>(execution.backend());
+        prepared_ = std::make_unique<moe::MoePreparedGraph>(execution, core::PreparedGraphConfig{
             "drama3_backbone.offload_prefill", weights.layers.size() * layer_bytes + 2 * small_bytes,
-            nodes, 4 * 1024 * 1024});
+            nodes, 4 * 1024 * 1024}, workspace_);
         auto * persistent = prepared_->persistent_build_context().ggml;
         const auto h = config.hidden_size;
-        const auto k = config.experts_per_token;
         x_ = ggml_new_tensor_3d(persistent, GGML_TYPE_F32, h, steps, 1);
         residual_ = ggml_new_tensor_3d(persistent, GGML_TYPE_F32, h, steps, 1);
         shared_ = ggml_new_tensor_2d(persistent, GGML_TYPE_F32, h, steps);
-        modules::StagedMoeConfig staged_config;
-        staged_config.hidden_size = h;
-        staged_config.tokens = steps;
-        staged_config.selected = k;
-        staged_config.experts = config.experts;
-        staged_config.cache_slots = config.expert_cache_size;
-        staged_config.rows_per_expert = {32};
-        staged_config.scatter_index_type = GGML_TYPE_I32;
-        workspace_ = std::make_shared<core::GraphWorkspace>(execution.backend());
-        staged_moe_ = std::make_unique<modules::StagedMoeRuntime>(execution, std::move(staged_config), workspace_);
-        hidden_ = staged_moe_->hidden_input();
+        hidden_ = ggml_new_tensor_2d(persistent, GGML_TYPE_F32, h, steps);
+        ggml_set_input(hidden_);
         positions_ = ggml_new_tensor_1d(persistent, GGML_TYPE_I32, steps);
         mask_ = ggml_new_tensor_4d(persistent, GGML_TYPE_F16, steps, steps, 1, 1);
         for (auto * tensor : {x_, residual_, shared_, positions_, mask_})
@@ -1160,6 +853,7 @@ public:
         auto & ctx = prepared_->build_context();
         const auto shape = core::TensorShape::from_dims({1, steps, h});
         auto x = core::wrap_tensor(x_, shape);
+        std::vector<moe::MoePreparedGraph::Step> sequence;
         size_t full = 0, linear = 0;
         for (const auto & layer : weights.layers) {
             const auto id = attention_graphs_.empty() ? size_t{0}
@@ -1181,11 +875,11 @@ public:
                         core::TensorShape::from_dims({1, values.at(full)->ne[2], config.kv_heads, config.head_dim}), config.kv_cache_type),
                     *layer.full, config);
             } else {
-                auto out = linear_attention_prefill(
+                auto out = weights.delta_net.build(
                     ctx, attention,
                     core::wrap_tensor(states.at(linear),
                                       core::TensorShape::from_dims({1, 1, ggml_nelements(states.at(linear))})),
-                    *layer.linear, config);
+                    *layer.linear);
                 ggml_build_forward_expand(graph, ggml_cpy(ctx.ggml, out.next_conv_tail.tensor, conv_tails.at(linear)));
                 ggml_build_forward_expand(graph,
                                           ggml_cpy(ctx.ggml, out.next_recurrent_state.tensor, states.at(linear)));
@@ -1195,11 +889,14 @@ public:
             auto normalized = modules::RMSNormModule({h, config.rms_norm_eps, true, false})
                                   .build(ctx, residual, layer.post_norm);
             normalized = round_activation(ctx, normalized, config);
-            const auto moe = build_moe_inputs(ctx, normalized, layer, config);
-            staged_moe_->build_inputs(ctx, graph, normalized.tensor, {moe.ids, moe.scales});
+            const auto shared = shared_expert(ctx, normalized, layer, weights.shared_config);
+            const auto call = weights.experts->add_call(layer.expert,
+                {steps, h, h, 32, GGML_TYPE_I32, 32}, workspace_);
+            weights.experts->build_inputs(call, *prepared_, id,
+                ggml_reshape_2d(ctx.ggml, normalized.tensor, h, steps));
             for (const auto & copy : std::vector<std::pair<ggml_tensor *, ggml_tensor *>>{
                      {residual.tensor, residual_},
-                     {moe.shared, shared_}}) {
+                     {shared.tensor, shared_}}) {
                 auto * destination = ggml_reshape_2d(ctx.ggml, copy.second, copy.second->ne[0], steps);
                 auto * source = ggml_reshape_2d(ctx.ggml, copy.first, copy.first->ne[0], steps);
                 ggml_build_forward_expand(graph, ggml_cpy(ctx.ggml, source, destination));
@@ -1210,27 +907,23 @@ public:
             else
                 ++linear;
 
-            staged_moe_->add_layer(modules::MoeModule{},
-                {layer.expert_up.tensor, layer.expert_gate.tensor, layer.expert_down.tensor},
-                *layer.disk_store, layer.disk_group);
+            const auto finish = prepared_->add_graph("finish_" + std::to_string(id), small_nodes);
+            auto * ffn_output = ggml_add(ctx.ggml, weights.experts->build_result(call, *prepared_), shared_);
+            if (config.round_bf16_activations) ffn_output = ggml_round_bf16(ctx.ggml, ffn_output);
+            auto combined = core::wrap_tensor(ggml_reshape_3d(ctx.ggml, ffn_output, h, steps, 1), shape);
+            combined = round_activation(ctx, modules::AddModule{}.build(ctx, core::wrap_tensor(residual_, shape), combined), config);
+            ggml_build_forward_expand(prepared_->graph(finish), ggml_cpy(ctx.ggml, combined.tensor, x_));
+            sequence.emplace_back(id); sequence.emplace_back(call); sequence.emplace_back(finish);
         }
 
-        finish_ = prepared_->add_graph("finish", small_nodes);
-        auto * reduced = modules::MoeModule::combine(ctx, staged_moe_->output(), staged_moe_->routing_weights());
-        auto combined =
-            core::wrap_tensor(ggml_reshape_3d(ctx.ggml, ggml_add(ctx.ggml, reduced, shared_), h, steps, 1), shape);
-        combined = round_activation(ctx, combined, config);
-        combined = round_activation(ctx, modules::AddModule{}.build(ctx, core::wrap_tensor(residual_, shape), combined),
-                                    config);
-        ggml_build_forward_expand(prepared_->graph(finish_), ggml_cpy(ctx.ggml, combined.tensor, x_));
         final_ = prepared_->add_graph("final", small_nodes);
         auto normalized =
             modules::RMSNormModule({h, config.rms_norm_eps, true, false}).build(ctx, x, weights.final_norm);
         normalized = round_activation(ctx, normalized, config);
         ggml_build_forward_expand(prepared_->graph(final_), ggml_cpy(ctx.ggml, normalized.tensor, hidden_));
-        workspace_->add(*prepared_);
-        workspace_->prepare();
-        staged_moe_->prepare();
+        sequence.emplace_back(final_);
+        sequence_ = prepared_->add_sequence(std::move(sequence));
+        prepared_->allocate();
     }
 
     int64_t steps() const noexcept { return steps_; }
@@ -1238,25 +931,11 @@ public:
     Drama3BackboneDecoderForwardResult run(const std::vector<float> & embeddings, int64_t steps) {
         ggml_backend_tensor_set(x_, embeddings.data(), 0, embeddings.size() * sizeof(float));
         const auto k = config_.experts_per_token;
-        double attention_ms = 0, expert_ms = 0;
-        uint64_t expert_work_rows = 0;
-        for (size_t layer = 0; layer < weights_.layers.size(); ++layer) {
-            auto started = std::chrono::steady_clock::now();
-            prepared_->compute(attention_graphs_[layer]);
-            attention_ms += debug::elapsed_ms(started);
-            started = std::chrono::steady_clock::now();
-            expert_work_rows += staged_moe_->run(layer);
-            prepared_->compute(finish_);
-            expert_ms += debug::elapsed_ms(started);
-        }
-        prepared_->compute(final_);
+        prepared_->compute(sequence_);
         Drama3BackboneDecoderForwardResult result;
         result.steps = steps;
         result.hidden.resize(embeddings.size());
         ggml_backend_tensor_get(hidden_, result.hidden.data(), 0, result.hidden.size() * sizeof(float));
-        debug::timing_log_scalar("drama3.offload_prefill_attention_ms", attention_ms);
-        debug::timing_log_scalar("drama3.offload_prefill_experts_ms", expert_ms);
-        debug::timing_log_scalar("drama3.offload_prefill_expert_work_rows", expert_work_rows);
         debug::timing_log_scalar("drama3.offload_prefill_routed_rows", steps * k * config_.layers);
         return result;
     }
@@ -1267,10 +946,10 @@ private:
     Drama3BackboneDecoderConfig config_;
     int64_t steps_;
     std::shared_ptr<core::GraphWorkspace> workspace_;
-    std::vector<core::PreparedGraph::GraphId> attention_graphs_;
-    std::unique_ptr<modules::StagedMoeRuntime> staged_moe_;
-    std::unique_ptr<core::PreparedGraph> prepared_;
-    core::PreparedGraph::GraphId finish_ = 0, final_ = 0;
+    std::vector<moe::MoePreparedGraph::GraphId> attention_graphs_;
+    moe::MoePreparedGraph::SequenceId sequence_{0};
+    std::unique_ptr<moe::MoePreparedGraph> prepared_;
+    moe::MoePreparedGraph::GraphId final_ = 0;
     ggml_tensor * x_ = nullptr;
     ggml_tensor * hidden_ = nullptr;
     ggml_tensor * residual_ = nullptr;
@@ -1297,7 +976,7 @@ public:
         if (cache_steps_ <= 0) {
             throw std::runtime_error("Drama 3 backbone cached decode requires positive cache length");
         }
-        decode_prepared_ = std::make_unique<core::PreparedGraph>(execution_,
+        decode_prepared_ = std::make_unique<moe::MoePreparedGraph>(execution_,
             core::PreparedGraphConfig{"drama3_backbone.cached_decode", graph_arena_bytes, 65536});
         auto & ctx = decode_prepared_->build_context();
         // Preserve Vulkan fusion boundaries; eliding these views changes sampled output there.
@@ -1351,15 +1030,15 @@ public:
         if (buffer_ == nullptr) throw std::runtime_error("failed to allocate Drama 3 backbone cached decode graph");
         if (config_.kv_cache_alignment == 1) {
             graph_ = decode_prepared_->graph();
-            build_decode(ctx, cache_steps_, graph_, output_);
-            configure_expert_scheduler(*decode_prepared_, *weights_);
+            build_decode(*decode_prepared_, ctx, cache_steps_, graph_, output_);
+
             decode_prepared_->allocate();
         }
         attention_mask_values_.assign(static_cast<size_t>(cache_steps_), ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
         reset();
     }
 
-    void build_decode(core::ModuleBuildContext & ctx, int64_t steps, ggml_cgraph *& graph, ggml_tensor *& output) {
+    void build_decode(moe::MoePreparedGraph & owner, core::ModuleBuildContext & ctx, int64_t steps, ggml_cgraph *& graph, ggml_tensor *& output) {
         auto x = core::wrap_tensor(input_, core::TensorShape::from_dims({1, 1, config_.hidden_size}), GGML_TYPE_F32);
         auto positions = core::wrap_tensor(positions_, core::TensorShape::from_dims({1}), GGML_TYPE_I32);
         auto cache_slot = core::wrap_tensor(cache_slot_, core::TensorShape::from_dims({1}), GGML_TYPE_I32);
@@ -1385,7 +1064,7 @@ public:
                     core::TensorShape::from_dims({1, conv_dim, config_.linear_conv_kernel_dim - 1}), GGML_TYPE_F32);
                 auto recurrent_state = core::wrap_tensor(linear_recurrent_states_[linear_index++],
                     core::TensorShape::from_dims({1, 1, state_values}), GGML_TYPE_F32);
-                auto out = linear_attention_cached(ctx, h, conv_tail, recurrent_state, *layer.linear, config_);
+                auto out = weights_->delta_net.build(ctx, h, recurrent_state, *layer.linear, conv_tail);
                 ggml_build_forward_expand(graph, ggml_cpy(ctx.ggml, out.next_conv_tail.tensor, conv_tail.tensor));
                 ggml_build_forward_expand(graph, ggml_cpy(ctx.ggml, out.next_recurrent_state.tensor, recurrent_state.tensor));
                 h = std::move(out.output);
@@ -1395,7 +1074,7 @@ public:
             residual = x;
             h = modules::RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false}).build(ctx, x, layer.post_norm);
             h = round_activation(ctx, h, config_);
-            h = mlp(ctx, h, layer, config_, config_.fused_moe ? graph : nullptr);
+            h = mlp(ctx, h, layer, config_, owner, *weights_, config_.fused_moe);
             x = modules::AddModule{}.build(ctx, residual, h);
             x = round_activation(ctx, x, config_);
         }
@@ -1420,7 +1099,7 @@ public:
 
     void reset(bool invalidate_experts = false) {
         valid_steps_ = 0;
-        if (invalidate_experts && weights_->disk_store) weights_->disk_store->invalidate_cache();
+        if (invalidate_experts) weights_->experts->begin_generation();
         // Masked attention can still multiply a zero probability by a cached
         // value. Initialize KV as well as recurrent state to avoid NaNs from
         // uninitialized storage on the first request.
@@ -1442,9 +1121,9 @@ public:
         if (steps > cache_steps_) {
             throw std::runtime_error("Drama 3 backbone prefill exceeds cache length");
         }
-        if (weights_->disk_store) {
+        if (weights_->experts->staged()) {
             reset();
-            if (!weights_->cpu_execution || config_.cpu_expert_layers == 0) {
+            if (core::is_host_backend(execution_.backend()) || weights_->experts->config().cpu_layers.empty()) {
                 if (!offload_prefill_ || offload_prefill_->steps() != steps) {
                     offload_prefill_.reset();
                     offload_prefill_ = std::make_unique<Drama3OffloadPrefillGraph>(
@@ -1506,13 +1185,13 @@ public:
             if (found == decode_buckets_.end()) {
                 auto bucket = std::make_unique<DecodeBucket>();
                 bucket->steps = steps;
-                bucket->prepared = std::make_unique<core::PreparedGraph>(execution_,
+                bucket->prepared = std::make_unique<moe::MoePreparedGraph>(execution_,
                     core::PreparedGraphConfig{"drama3_backbone.cached_decode", graph_arena_bytes_, 65536});
                 bucket->graph = bucket->prepared->graph();
                 auto & ctx = bucket->prepared->build_context();
                 ctx.elide_identity_reshapes = execution_.backend_type() == core::BackendType::Cuda;
-                build_decode(ctx, steps, bucket->graph, bucket->output);
-                configure_expert_scheduler(*bucket->prepared, *weights_);
+                build_decode(*bucket->prepared, ctx, steps, bucket->graph, bucket->output);
+
                 bucket->prepared->allocate();
                 decode_buckets_.push_back(std::move(bucket));
                 found = std::prev(decode_buckets_.end());
@@ -1529,14 +1208,14 @@ public:
 
 private:
     struct DecodeBucket {
-        std::unique_ptr<core::PreparedGraph> prepared;
+        std::unique_ptr<moe::MoePreparedGraph> prepared;
         ggml_cgraph * graph = nullptr;
         int64_t steps = 0;
         ggml_tensor * output = nullptr;
     };
 
     struct PrefillGraph {
-        std::unique_ptr<core::PreparedGraph> prepared;
+        std::unique_ptr<moe::MoePreparedGraph> prepared;
         ggml_cgraph * graph = nullptr;
         int64_t steps = 0;
         size_t bytes = 0;
@@ -1563,7 +1242,7 @@ private:
         auto built = std::make_unique<PrefillGraph>();
         auto & prefill = *built;
         prefill.steps = steps;
-        prefill.prepared = std::make_unique<core::PreparedGraph>(execution_, core::PreparedGraphConfig{
+        prefill.prepared = std::make_unique<moe::MoePreparedGraph>(execution_, core::PreparedGraphConfig{
             "drama3_backbone.prefill", 128ull * 1024ull * 1024ull, 65536, 32ull * 1024ull * 1024ull});
         auto & ctx = prefill.prepared->build_context();
         auto & input_ctx = prefill.prepared->persistent_build_context();
@@ -1616,7 +1295,7 @@ private:
                     throw std::runtime_error("Drama 3 backbone linear-attention state count mismatch");
                 }
                 auto state = core::wrap_tensor(prefill_zero_state_, core::TensorShape::from_dims({1, 1, state_values}));
-                auto out = linear_attention_prefill(ctx, h, state, *layer.linear, config_);
+                auto out = weights_->delta_net.build(ctx, h, state, *layer.linear);
                 ggml_build_forward_expand(
                     prefill.graph,
                     ggml_cpy(ctx.ggml, out.next_conv_tail.tensor, linear_conv_tails_[static_cast<size_t>(linear_index)]));
@@ -1631,7 +1310,7 @@ private:
             residual = x;
             h = modules::RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false}).build(ctx, x, layer.post_norm);
             h = round_activation(ctx, h, config_);
-            h = mlp(ctx, h, layer, config_);
+            h = mlp(ctx, h, layer, config_, *prefill.prepared, *weights_);
             x = modules::AddModule{}.build(ctx, residual, h);
             x = round_activation(ctx, x, config_);
         }
@@ -1644,7 +1323,7 @@ private:
         ggml_set_output(prefill.output);
         ggml_build_forward_expand(prefill.graph, prefill.output);
         prefill.prepared->allocate_persistent();
-        configure_expert_scheduler(*prefill.prepared, *weights_);
+
         prefill.prepared->allocate();
         const auto pos = position_ids(steps);
         ggml_backend_tensor_set(prefill.positions, pos.data(), 0, pos.size() * sizeof(int32_t));
@@ -1679,7 +1358,7 @@ private:
     // while its graph, tensors, and persistent buffer are still alive.
     std::unique_ptr<std::remove_pointer_t<ggml_backend_buffer_t>, decltype(&ggml_backend_buffer_free)>
         buffer_{nullptr, ggml_backend_buffer_free};
-    std::unique_ptr<core::PreparedGraph> decode_prepared_;
+    std::unique_ptr<moe::MoePreparedGraph> decode_prepared_;
     std::vector<std::unique_ptr<DecodeBucket>> decode_buckets_;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * positions_ = nullptr;
@@ -1721,7 +1400,7 @@ public:
     }
 
     Drama3BackboneDecoderForwardResult forward_embeddings(const std::vector<float> & embeddings, int64_t steps) {
-        if (weights_->disk_store) return decode_graph_.prefill_embeddings(embeddings, steps);
+        if (weights_->experts->staged()) return decode_graph_.prefill_embeddings(embeddings, steps);
         return forward_.run(embeddings, steps);
     }
 

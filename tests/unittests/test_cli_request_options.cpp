@@ -3,11 +3,13 @@
 #include "../../app/common/base64.h"
 
 #include "engine/framework/io/json.h"
+#include "engine/framework/debug/trace.h"
 #include "engine/framework/runtime/errors.h"
 #include "engine/framework/runtime/options.h"
 
 #include "test_assert.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -83,6 +85,42 @@ void test_malformed_seeds_are_invalid_requests() {
     // A JSON null option reaches the parser as "null".
     for (const char * value : {"null", " -1", "18446744073709551616"}) {
         require_seed_rejected(value);
+    }
+}
+
+void test_random_seed_resolution() {
+    using engine::runtime::resolve_random_seed;
+    using engine::test::require;
+    using engine::test::require_eq;
+    std::unordered_map<std::string, std::string> options{{"other", "kept"}};
+    const auto omitted = options;
+    resolve_random_seed(options);
+    require(options == omitted, "omitted seed stays absent");
+    for (const std::string value : {"0", "4294967295", "1000000000000001", "-2", " -1", "-1.0", "null"}) {
+        options["seed"] = value;
+        const auto original = options;
+        resolve_random_seed(options);
+        require(options == original, "non-sentinel options preserved exactly");
+    }
+    options["family.seed"] = "-1";
+    options["seed"] = "-1";
+    resolve_random_seed(options);
+    require(parse_seed(options.at("seed")) <= uint64_t{2147483647}, "random seed fits signed 32-bit");
+    const auto resolved = options;
+    resolve_random_seed(options);
+    require(options == resolved, "resolution is idempotent");
+    require_eq(options.at("family.seed"), std::string("-1"), "model alias not reinterpreted");
+    for (const char * numeric : {"-1", "-1.0"}) {
+        options["seed"] = option_from_json_number(numeric);
+        resolve_random_seed(options);
+        require(parse_seed(options.at("seed")) <= uint64_t{2147483647}, "JSON numeric sentinel resolves");
+    }
+    for (const char * flag : {"--seed", "--request-option"}) {
+        const char * argv[] = {"audiocpp_cli", flag, std::string(flag) == "--seed" ? "-1" : "seed=-1"};
+        auto request = minitts::cli::build_request_from_cli(3, const_cast<char **>(argv));
+        require_eq(request.options.at("seed"), std::string("-1"), "CLI leaves raw sentinel until dispatch");
+        resolve_random_seed(request.options);
+        require(parse_seed(request.options.at("seed")) <= uint64_t{2147483647}, "CLI seed resolves before model parsing");
     }
 }
 
@@ -589,13 +627,251 @@ void test_request_json_voice_ref() {
         "{\"type\":\"base64\",\"data\":\"" + std::string(size_t{8} * 1024 * 1024, 'A') + "\"}", "5 MiB limit");
 }
 
+void test_cli_arguments_can_be_loaded_from_yaml() {
+    const auto config_path = std::filesystem::temp_directory_path() /
+                             ("audiocpp-cli-config-" +
+                              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                              ".yaml");
+    {
+        std::ofstream config(config_path);
+        config << "task: tts\n"
+               << "model: model.gguf\n"
+               << "text: configured text\n"
+               << "metrics: true\n"
+               << "inspect: false\n"
+               << "do-sample: false\n"
+               << "request-option:\n"
+               << "  - temperature=0.7\n"
+               << "  - top_k=10\n";
+    }
+
+    const std::string config_argument = config_path.string();
+    const char * argv[] = {
+        "audiocpp_cli",
+        "--config-file",
+        config_argument.c_str(),
+        "--text",
+        "command line text",
+    };
+    const auto expanded = minitts::cli::expand_cli_args(5, const_cast<char **>(argv));
+
+    engine::test::require_eq(expanded.size(), size_t{16}, "expected expanded argument count");
+    engine::test::require_eq(expanded[0], std::string("audiocpp_cli"), "executable preserved");
+    engine::test::require_eq(expanded[1], std::string("--text"), "CLI option retained first");
+    engine::test::require_eq(expanded[2], std::string("command line text"), "CLI value retained first");
+    engine::test::require_eq(expanded[3], std::string("--do-sample"), "boolean value option");
+    engine::test::require_eq(expanded[4], std::string("false"), "false value option");
+    engine::test::require_eq(expanded[5], std::string("--metrics"), "enabled flag emitted");
+    engine::test::require_eq(expanded[6], std::string("--model"), "scalar option emitted");
+    engine::test::require_eq(expanded[7], std::string("model.gguf"), "scalar option value emitted");
+    engine::test::require_eq(expanded[8], std::string("--request-option"), "sequence option emitted");
+    engine::test::require_eq(expanded[9], std::string("temperature=0.7"), "first sequence value emitted");
+    engine::test::require_eq(expanded[10], std::string("--request-option"), "repeated sequence option emitted");
+    engine::test::require_eq(expanded[11], std::string("top_k=10"), "second sequence value emitted");
+    engine::test::require_eq(expanded[12], std::string("--task"), "task option emitted");
+    engine::test::require_eq(expanded[13], std::string("tts"), "task value emitted");
+    engine::test::require_eq(expanded[14], std::string("--text"), "config text appended after CLI");
+    engine::test::require_eq(expanded[15], std::string("configured text"), "config text value appended");
+    engine::test::require(
+        std::find(expanded.begin(), expanded.end(), "--inspect") == expanded.end(),
+        "disabled boolean flag omitted");
+    engine::test::require(
+        std::find(expanded.begin(), expanded.end(), "--config-file") == expanded.end(),
+        "config-file argument consumed");
+    std::filesystem::remove(config_path);
+}
+
+void test_cli_key_value_options_override_yaml() {
+    const auto config_path = std::filesystem::temp_directory_path() /
+                             ("audiocpp-cli-config-overrides-" +
+                              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                              ".yaml");
+    {
+        std::ofstream config(config_path);
+        config << "session-option:\n"
+               << "  - confucius4_r2t2.unfixed_chunk_num=2\n"
+               << "  - confucius4_r2t2.chunk_size_ms=320\n"
+               << "  - moe_policy=default\n"
+               << "  - moe_cpu_share=0.1\n"
+               << "  - moe_disk_experts=true\n"
+               << "  - moe_pin_experts=false\n"
+               << "  - moe_expert_cache_size=8\n"
+               << "  - moe_disk_expert_read_threads=1\n"
+               << "  - moe_cpu_expert_layers=2\n"
+               << "request-option: temperature=0.7\n";
+    }
+
+    const std::string config_argument = config_path.string();
+    const char * argv[] = {
+        "audiocpp_cli",
+        "--config-file",
+        config_argument.c_str(),
+        "--session-option",
+        "confucius4_r2t2.chunk_size_ms=640",
+        "--request-option",
+        "temperature=0.9",
+        "--request-option",
+        "top_k=10",
+        "--moe-policy",
+        "placement_cpu_share",
+        "--moe-cpu-share",
+        "0.5",
+        "--moe-disk-experts",
+        "false",
+        "--moe-pin-experts",
+        "true",
+        "--moe-expert-cache-size",
+        "16",
+        "--moe-disk-expert-read-threads",
+        "4",
+        "--moe-cpu-expert-layers",
+        "3",
+    };
+    const auto expanded = minitts::cli::expand_cli_args(static_cast<int>(sizeof(argv) / sizeof(argv[0])), const_cast<char **>(argv));
+    std::vector<char *> expanded_argv;
+    expanded_argv.reserve(expanded.size() + 1);
+    for (const auto & arg : expanded) {
+        expanded_argv.push_back(const_cast<char *>(arg.c_str()));
+    }
+    expanded_argv.push_back(nullptr);
+    const int expanded_argc = static_cast<int>(expanded.size());
+
+    const auto session_options =
+        minitts::cli::collect_key_value_args(expanded_argc, expanded_argv.data(), "--session-option");
+    const auto request_options =
+        minitts::cli::collect_key_value_args(expanded_argc, expanded_argv.data(), "--request-option");
+    engine::test::require_eq(
+        session_options.at("confucius4_r2t2.chunk_size_ms"),
+        std::string("640"),
+        "CLI session option overrides YAML");
+    engine::test::require_eq(
+        session_options.at("confucius4_r2t2.unfixed_chunk_num"),
+        std::string("2"),
+        "YAML session option retained");
+    for (const auto & key : {
+             "moe_policy",
+             "moe_cpu_share",
+             "moe_disk_experts",
+             "moe_pin_experts",
+             "moe_expert_cache_size",
+             "moe_disk_expert_read_threads",
+             "moe_cpu_expert_layers"}) {
+        engine::test::require(session_options.count(key) == 0, "CLI MoE option overrides YAML session option");
+    }
+    for (const auto & option : {
+             std::make_pair("--moe-policy", "placement_cpu_share"),
+             std::make_pair("--moe-cpu-share", "0.5"),
+             std::make_pair("--moe-disk-experts", "false"),
+             std::make_pair("--moe-pin-experts", "true"),
+             std::make_pair("--moe-expert-cache-size", "16"),
+             std::make_pair("--moe-disk-expert-read-threads", "4"),
+             std::make_pair("--moe-cpu-expert-layers", "3")}) {
+        engine::test::require_eq(
+            minitts::cli::find_arg(expanded_argc, expanded_argv.data(), option.first).value(),
+            std::string(option.second),
+            "CLI MoE value retained");
+    }
+    engine::test::require_eq(request_options.at("temperature"), std::string("0.9"), "CLI request option overrides YAML");
+    engine::test::require_eq(request_options.at("top_k"), std::string("10"), "CLI-only request option retained");
+    std::filesystem::remove(config_path);
+}
+
+void test_cli_option_aliases_and_load_options_override_yaml() {
+    const auto config_path = std::filesystem::temp_directory_path() /
+                             ("audiocpp-cli-config-alias-overrides-" +
+                              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                              ".yaml");
+    {
+        std::ofstream config(config_path);
+        config << "request-option: temperature=0.7\n"
+               << "temperature: 0.6\n"
+               << "load-option:\n"
+               << "  - engine=fp16\n"
+               << "  - threads=4\n";
+    }
+
+    const std::string config_argument = config_path.string();
+    const char * alias_argv[] = {
+        "audiocpp_cli",
+        "--config-file",
+        config_argument.c_str(),
+        "--temperature",
+        "0.9",
+        "--load-option",
+        "engine=q8",
+    };
+    const auto alias_expanded = minitts::cli::expand_cli_args(7, const_cast<char **>(alias_argv));
+    std::vector<char *> alias_expanded_argv;
+    for (const auto & arg : alias_expanded) {
+        alias_expanded_argv.push_back(const_cast<char *>(arg.c_str()));
+    }
+    alias_expanded_argv.push_back(nullptr);
+    const int alias_expanded_argc = static_cast<int>(alias_expanded.size());
+    const auto alias_request_options =
+        minitts::cli::collect_key_value_args(alias_expanded_argc, alias_expanded_argv.data(), "--request-option");
+    const auto alias_load_options =
+        minitts::cli::collect_key_value_args(alias_expanded_argc, alias_expanded_argv.data(), "--load-option");
+    engine::test::require(alias_request_options.empty(), "CLI request alias overrides YAML request-option");
+    engine::test::require_eq(
+        minitts::cli::find_arg(alias_expanded_argc, alias_expanded_argv.data(), "--temperature").value(),
+        std::string("0.9"),
+        "CLI request alias value retained");
+    const auto alias_request = minitts::cli::build_request_from_cli(alias_expanded_argc, alias_expanded_argv.data());
+    engine::test::require_eq(alias_request.options.at("temperature"), std::string("0.9"), "CLI request alias wins");
+    engine::test::require_eq(alias_load_options.at("engine"), std::string("q8"), "CLI load option overrides YAML");
+    engine::test::require_eq(alias_load_options.at("threads"), std::string("4"), "non-overridden YAML load option retained");
+
+    const char * request_option_argv[] = {
+        "audiocpp_cli",
+        "--config-file",
+        config_argument.c_str(),
+        "--request-option",
+        "temperature=0.9",
+        "--load-option",
+        "engine=q8",
+    };
+    const auto request_option_expanded = minitts::cli::expand_cli_args(7, const_cast<char **>(request_option_argv));
+    std::vector<char *> request_option_expanded_argv;
+    for (const auto & arg : request_option_expanded) {
+        request_option_expanded_argv.push_back(const_cast<char *>(arg.c_str()));
+    }
+    request_option_expanded_argv.push_back(nullptr);
+    const int request_option_expanded_argc = static_cast<int>(request_option_expanded.size());
+    const auto request_options =
+        minitts::cli::collect_key_value_args(request_option_expanded_argc, request_option_expanded_argv.data(), "--request-option");
+    const auto load_options =
+        minitts::cli::collect_key_value_args(request_option_expanded_argc, request_option_expanded_argv.data(), "--load-option");
+    const auto request_option_request =
+        minitts::cli::build_request_from_cli(request_option_expanded_argc, request_option_expanded_argv.data());
+    engine::test::require_eq(request_options.at("temperature"), std::string("0.9"), "CLI request-option overrides YAML alias");
+    engine::test::require_eq(
+        request_option_request.options.at("temperature"),
+        std::string("0.9"),
+        "CLI request-option wins over YAML request alias");
+    engine::test::require(
+        !minitts::cli::find_arg(request_option_expanded_argc, request_option_expanded_argv.data(), "--temperature").has_value(),
+        "overridden YAML request alias omitted");
+    engine::test::require_eq(load_options.at("engine"), std::string("q8"), "CLI load option retained");
+    engine::test::require_eq(load_options.at("threads"), std::string("4"), "non-overridden YAML load option retained");
+    std::filesystem::remove(config_path);
+}
+
+void test_config_file_token_used_as_option_value() {
+    const char * argv[] = {"audiocpp_cli", "--help", "--log", "--text", "--config-file"};
+    const auto expanded = minitts::cli::expand_cli_args(5, const_cast<char **>(argv));
+    engine::test::require_eq(expanded.size(), size_t{5}, "config-file token retained as text value");
+    engine::test::require_eq(expanded.back(), std::string("--config-file"), "config-file token not parsed as option");
+}
+
 }  // namespace
 
 int main() {
+    engine::debug::configure_logging({true});
     test_large_safe_integer_numbers_stay_decimal();
     test_float_numbers_keep_json_formatting();
     test_unsafe_integer_numbers_are_not_silently_rounded();
     test_malformed_seeds_are_invalid_requests();
+    test_random_seed_resolution();
     test_audio_only_language_is_request_option();
     test_audio_chunk_shortcut_uses_canonical_name();
     test_normalized_request_option_aliases();
@@ -604,6 +880,10 @@ int main() {
     test_request_json_voice_ref();
     test_component_exec_plans();
     test_non_negative_int_flag_values();
+    test_cli_arguments_can_be_loaded_from_yaml();
+    test_cli_key_value_options_override_yaml();
+    test_cli_option_aliases_and_load_options_override_yaml();
+    test_config_file_token_used_as_option_value();
     std::cout << "cli_request_options_test passed\n";
     return 0;
 }

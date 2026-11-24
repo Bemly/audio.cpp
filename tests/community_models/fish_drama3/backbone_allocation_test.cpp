@@ -61,25 +61,45 @@ int main(int argc, char ** argv) {
         engine::core::BackendConfig backend;
         backend.threads = 1;
         engine::core::ExecutionContext execution(backend);
+        struct FixtureDirectory {
+            std::filesystem::path path = std::filesystem::temp_directory_path() /
+                ("drama3_prefill_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            FixtureDirectory() { std::filesystem::create_directories(path); }
+            ~FixtureDirectory() { std::error_code error; std::filesystem::remove_all(path, error); }
+        } fixture;
         std::unique_ptr<ggml_context, drama::GgmlContextDeleter> context(
             ggml_init({1024 * 1024, nullptr, false}));
         if (!context) throw std::runtime_error("test weight context allocation failed");
         auto * norm = ggml_new_tensor_1d(context.get(), GGML_TYPE_F32, 16);
         std::fill_n(static_cast<float *>(norm->data), 16, 1.0F);
-        auto weights = std::make_shared<drama::Drama3BackboneWeights>();
-        weights->final_norm.weight = engine::core::wrap_tensor(
-            norm, engine::core::TensorShape::from_dims({16}), GGML_TYPE_F32);
+        const auto norm_safe = fixture.path / "allocation.safetensors";
+        const auto norm_gguf = fixture.path / "allocation.gguf";
+        std::vector<unsigned char> norm_bytes(16 * sizeof(float));
+        std::memcpy(norm_bytes.data(), norm->data, norm_bytes.size());
+        engine::io::write_safetensors_file(norm_safe, {{"norm", "F32", {16}, std::move(norm_bytes)}});
+        engine::assets::convert_tensor_sources_to_gguf({{norm_safe, ""}}, norm_gguf,
+            engine::assets::TensorStorageType::F32, true, false, {}, {}, std::nullopt);
+        auto norm_source = engine::assets::open_tensor_source(norm_gguf);
         drama::Drama3BackboneDecoderConfig config;
         config.hidden_size = 16;
         config.layers = 0;
         config.linear_key_head_dim = config.linear_value_head_dim = 4;
         config.linear_num_key_heads = config.linear_num_value_heads = 1;
+        auto weights = std::make_shared<drama::Drama3BackboneWeights>(config);
+        weights->final_norm.weight = engine::core::wrap_tensor(
+            norm, engine::core::TensorShape::from_dims({16}), GGML_TYPE_F32);
 
         int failures = 0, head_recoveries = 0;
         {
         AllocationFailures injection(execution.backend());
         for (bool split : {false, true}) {
-            weights->cpu_execution = split ? std::make_shared<engine::core::ExecutionContext>(backend) : nullptr;
+            weights->experts.reset();
+            weights->store = std::make_shared<engine::core::BackendWeightStore>(execution.backend(),
+                execution.backend_type(), "test.drama3.primary", 1024 * 1024);
+            engine::moe::EngineConfig policy;
+            policy.residency = split ? engine::moe::Residency::Staged : engine::moe::Residency::Resident;
+            weights->experts = std::make_unique<engine::moe::MoeEngine>(execution, *weights->store, *norm_source,
+                policy, "test.drama3.cpu", 1024 * 1024);
             for (bool buffer_failure : {true, false}) {
                 fail_buffer = buffer_failure;
                 fail_graph = !buffer_failure;
@@ -90,8 +110,7 @@ int main(int argc, char ** argv) {
                         drama::Drama3BackboneCachedDecodeGraph graph(execution, weights, config, 32, 8 * 1024 * 1024);
                     } catch (const std::runtime_error & error) {
                         const std::string expected = buffer_failure ? "failed to allocate Drama 3 backbone cached decode graph"
-                            : split ? "Cannot allocate drama3_backbone.cached_decode scheduled graph"
-                                    : "cannot reserve graph activation workspace";
+                            : "cannot reserve graph activation workspace";
                         if (std::string(error.what()) != expected) throw;
                         rejected = true;
                     }
@@ -149,12 +168,6 @@ int main(int argc, char ** argv) {
         if (argc > 1 && std::string(argv[1]) == "cuda") test_backend.type = engine::core::BackendType::Cuda;
         if (argc > 1 && std::string(argv[1]) == "vulkan") test_backend.type = engine::core::BackendType::Vulkan;
         engine::core::ExecutionContext prefill_execution(test_backend);
-        struct FixtureDirectory {
-            std::filesystem::path path = std::filesystem::temp_directory_path() /
-                ("drama3_prefill_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-            FixtureDirectory() { std::filesystem::create_directories(path); }
-            ~FixtureDirectory() { std::error_code error; std::filesystem::remove_all(path, error); }
-        } fixture;
         auto c = config;
         c.kv_cache_type = GGML_TYPE_F32;
         c.vocab_size = 16;
@@ -162,7 +175,7 @@ int main(int argc, char ** argv) {
         c.layers = 2;
         c.experts = 32;
         c.experts_per_token = 2;
-        c.expert_cache_size = 4;
+        c.moe.cache_slots = 4;
         c.heads = 4;
         c.kv_heads = 2;
         c.head_dim = 64;
@@ -294,16 +307,16 @@ int main(int argc, char ** argv) {
                 if (maximum > 1e-4F) throw std::runtime_error("decode optimization changed fixed-input continuation");
             }
         }
-        c.disk_experts = true;
+        c.moe.residency = engine::moe::Residency::Staged;
         auto disk = drama::load_qwen35_weights(*source, c, prefill_execution, 4 * 1024 * 1024, engine::assets::TensorStorageType::Native);
         for (int64_t steps : {1, 7}) {
             std::unique_ptr<ggml_context, drama::GgmlContextDeleter> routing_context(
                 ggml_init({1024 * 1024, nullptr, true}));
             engine::core::ModuleBuildContext routing_ctx{routing_context.get(), "routing_layout", test_backend.type};
             auto * input = ggml_new_tensor_3d(routing_ctx.ggml, GGML_TYPE_F32, c.hidden_size, steps, 1);
-            const auto routed = drama::build_moe_inputs(routing_ctx,
-                engine::core::wrap_tensor(input, engine::core::TensorShape::from_dims({1, steps, c.hidden_size})),
-                disk->layers.front(), c);
+            const auto & layer = disk->layers.front();
+            const auto routed = disk->experts->route(routing_ctx, layer.expert,
+                ggml_reshape_2d(routing_ctx.ggml, input, c.hidden_size, steps));
             if (!ggml_is_contiguous(routed.ids))
                 throw std::runtime_error("Drama 3 offload routing IDs must remain compact");
             if (steps == 1 && routed.ids->op == GGML_OP_CONT)

@@ -1,5 +1,8 @@
 # MuLaCover
 
+> [!WARNING]
+> If SOXR is unavailable, a built-in resampler is used. Output may differ from the SOXR path.
+
 MuLaCover generates cover songs from reference audio or melody/chord MIDI,
 with new lyrics and musical style. It uses a Llama-derived causal backbone with gated
 symbolic cross attention, a Qwen3 style encoder and HeartCodec.
@@ -69,7 +72,8 @@ For reference-audio conditioning, replace the MIDI options with
 Reference audio and MIDI inputs are mutually exclusive.
 
 Upstream selects the transcribed lead-singing track as melody; audio without
-a detected melody is rejected. Reference-audio preprocessing requires SOXR.
+a detected melody is rejected. Reference-audio preprocessing prefers SOXR and
+uses the built-in sinc resampler with a warning when it is unavailable.
 MIDI inputs use musical ticks, so changing MIDI tempo metadata does not impose
 a target generation tempo.
 
@@ -125,8 +129,12 @@ is limited to eight codebook positions and reset for each audio frame. Cached
 decode graphs attend to the active prefix in 128-position buckets and share one
 scratch allocator. Backbone prefill, symbolic-conditioning, transcription-encoder,
 chord-fold and codec workspaces are released after use. ChordNet retains only
-the current reference-length graph for each fold. Codebook heads use views of
-the stored weights and share one scratch buffer.
+the current reference shape for each fold. Its CNN processes the complete
+reference, preserving instance-normalization statistics. LSTM sequences use
+cached graphs of up to 128 frames with hidden/cell state carried between blocks
+in each direction. This bounds recurrent graph size without truncating song
+context. Codebook heads use views of the stored weights and share one scratch
+buffer.
 
 The prompt and generation budget must fit the 8,192-token context. Symbolic
 conditioning is limited to 5,000 sixteenth notes. Offline generation uses

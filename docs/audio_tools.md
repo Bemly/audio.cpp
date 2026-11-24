@@ -15,7 +15,7 @@
 | Mel-Band RoFormer | `mel_band_roformer` | `sep` | [Mel-Band RoFormer](#mel-band-roformer) |
 | Ming 3.0 Audio Tiny | `ming3_audio` | `s2s` spoken responses (also `asr`, `tts`, `clon`) | [Ming Audio](models/ming3_audio.md#spoken-response) |
 | MioCodec | `miocodec` | `vc`, `s2s` | [MioCodec](#miocodec) |
-| MossFormer2 | `mossformer2` | `sep` | [MossFormer2](models/mossformer2.md) |
+| MossFormer2 | `mossformer2` | `sep` speech separation, `s2s` enhancement/super-resolution | [MossFormer2](models/mossformer2.md) |
 | MuScriptor | `muscriptor` | audio to MIDI/events | [MuScriptor](#muscriptor) |
 | PersonaPlex | `personaplex` | `s2s` | [PersonaPlex](#personaplex) |
 | Real-time RE-USE | `realtime_reuse` | Offline / streaming `s2s` speech restoration | [Real-time RE-USE](models/realtime_reuse.md) |
@@ -30,6 +30,7 @@
 | Tone Color VC | `tone_color_vc` | `vc` | [Tone Color VC](models/tone_color_vc.md) |
 | UniverSR | `universr` | `s2s` audio/speech super-resolution | [UniverSR](models/universr.md) |
 | VeVo2 | `vevo2` | TTS, SVC, VC, editing | [VeVo2](#vevo2) |
+| Voice Isolator | `voice_isolator` | Offline / streaming `s2s` voice isolation | [Voice Isolator](models/voice_isolator.md) |
 
 This page covers voice conversion, codec, audio enhancement, Foley generation,
 audio-to-symbolic, and source-separation families. These models do not share one
@@ -405,11 +406,18 @@ audiocpp_cli --task s2s --family miocodec --model models/MioCodec-25Hz-44.1kHz-v
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
 | `miocodec.weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | `f32` | Weight storage type. |
-| `miocodec.weight_context_mb` | integer >= 1 | `256` | Context or graph arena size in MiB. |
-| `miocodec.constant_context_mb` | integer >= 1 | `256` | Context or graph arena size in MiB. |
-| `miocodec.content_graph_arena_mb` | integer >= 1 | `512` | Context or graph arena size in MiB. |
-| `miocodec.global_graph_arena_mb` | integer >= 1 | `256` | Context or graph arena size in MiB. |
-| `miocodec.wave_graph_arena_mb` | integer >= 1 | `512` | Context or graph arena size in MiB. |
+| `miocodec.weight_context_mb` | integer >= 1 | `8` | Context or graph arena size in MiB. |
+| `miocodec.constant_context_mb` | integer >= 1 | `16` | Context or graph arena size in MiB. |
+| `miocodec.content_graph_arena_mb` | integer >= 1 | `32` | Context or graph arena size in MiB. |
+| `miocodec.global_graph_arena_mb` | integer >= 1 | `32` | Context or graph arena size in MiB. |
+| `miocodec.wave_graph_arena_mb` | integer >= 1 | `32` | Context or graph arena size in MiB. |
+
+## Dettato
+
+[Dettato](models/dettato.md) is an experimental multi-instrument audio-to-MIDI
+transcriber with instrument grouping and drum transcription. Its F16 package
+location is `audio-cpp/audio.cpp-gguf/Dettato-GGUF`. See its model guide for conversion,
+options and numerical-parity limitations.
 
 ## MuScriptor
 

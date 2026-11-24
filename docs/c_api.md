@@ -58,6 +58,17 @@ requests.
 - **Handles are not individually thread-safe.** Separate handles may be used
   concurrently from separate threads.
 
+### Random seeds
+
+For a model supporting `seed`, set `audiocpp_request_set_option(request,
+"seed", "-1")` to request a fresh random seed. The shared request resolver
+chooses an integer in `0..2147483647` before preparation and execution.
+An explicit `audiocpp_session_prepare` followed by execution of the same,
+unchanged request reuses that resolution. Another execution draws again;
+request mutation or stream reset invalidates pending preparation. The caller's
+stored option remains `-1`. Omitted and explicit nonnegative seeds retain
+existing behavior. Enable logging to record `request.seed` for replay.
+
 ### Lifetime
 
 Handles hold their parents alive internally: a session holds its model, and a
@@ -100,6 +111,11 @@ if ((audiocpp_abi_version() & 0xffff) < 0x0200) {
 /* audiocpp_log_set arrived in 0.3. */
 if ((audiocpp_abi_version() & 0xffff) < 0x0300) {
     /* fall back when log interception is not available */
+}
+
+/* audiocpp_result_custom_schema arrived in 0.4. */
+if ((audiocpp_abi_version() & 0xffff) < 0x0400) {
+    /* custom-schema result access is not available */
 }
 ```
 
@@ -172,6 +188,27 @@ fed back into a later request instead of being re-derived. The server's generic
 task routes and the CLI request JSON carry artifacts the same way, as an
 `artifacts` array (see the [server docs](../app/server/README.md#post-v1tasksrun)).
 
+### Custom-schema results
+
+Classification families such as CED and AST-AudioSet return a custom schema
+rather than text or audio. In ABI 0.4 and later, read its schema identifier and
+JSON data with:
+
+```c
+const char * schema = NULL;
+const char * data = NULL;
+audiocpp_status status = audiocpp_result_custom_schema(result, &schema, &data);
+if (status == AUDIOCPP_OK) {
+    /* schema identifies the format; data is a JSON string to parse. */
+}
+```
+
+Both out parameters are optional. Returned strings are non-NULL on success and
+remain valid until `result` is freed. JSON is serialized on the first data read
+and cached in the result. If the task produced no custom-schema output, the
+accessor returns `AUDIOCPP_ERR_NOT_AVAILABLE`; a NULL result returns
+`AUDIOCPP_ERR_INVALID_ARGUMENT`.
+
 ## Discovering what a model accepts
 
 `ModelInspection::cli` is exposed, so a binding can enumerate a family's options
@@ -232,13 +269,12 @@ the queue is empty — that is `AUDIOCPP_OK`, not an error.
 
 ## Symbol surface
 
-`libaudiocpp.so` exports exactly the 55 entry points in `audiocpp.h` and nothing
+`libaudiocpp.so` exports exactly the entry points in `audiocpp.h` and nothing
 else. This needs a linker export list, not just `CXX_VISIBILITY_PRESET hidden`:
 the visibility preset reaches only this target's own sources, while the static
 libraries linked in (ggml, cJSON, sentencepiece, ...) are compiled without
-`-fvisibility=hidden` and would otherwise be re-exported — 2767 dynamic symbols
-instead of 55, any of which could collide with something the host application
-has already loaded.
+`-fvisibility=hidden` and would otherwise be re-exported, potentially colliding
+with symbols the host application has already loaded.
 
 `src/capi/audiocpp.map` (ELF) and `src/capi/audiocpp.symbols` (Mach-O) hold that
 list.
@@ -264,7 +300,7 @@ nm -D --defined-only build/bin/libaudiocpp.so | awk '$2=="T"{print $3}' | grep -
 nm -gU build/bin/libaudiocpp.dylib | awk '{print $NF}' | grep -cv '^_audiocpp_'
 # PE
 dumpbin /EXPORTS build\bin\Release\audiocpp.dll
-# all three: 0 non-matching, 70 total
+# all three: 0 non-matching; total must match the public header
 ```
 
 ## Logging

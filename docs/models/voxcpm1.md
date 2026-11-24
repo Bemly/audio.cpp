@@ -1,5 +1,8 @@
 # VoxCPM1
 
+> [!WARNING]
+> If SOXR is unavailable, a built-in resampler is used. Output may differ from the SOXR path.
+
 VoxCPM1 is a **tokenizer-free TTS model** from [OpenBMB](https://github.com/OpenBMB/VoxCPM) that generates 16 kHz mono speech. The audio.cpp package uses a native GGUF layout with audio.cpp tensor names, embedded config/tokenizer sidecars, folded AudioVAE weights, and materialized SR-conditioning tensors.
 
 ## Model Package
@@ -132,7 +135,7 @@ checkpoint or session setting, or leaves the optional value unset as described.
 | `prompt_text` | `string` | Model/session default | Text prompt for prompt-continuation voice cloning. |
 | `reference_text` | `string` | Model/session default | Alias for prompt_text; text prompt for prompt-continuation voice cloning. |
 | `text_chunk_size` | `int` | `2048` | Maximum characters per offline text chunk; must be positive. Does not control streaming chunk cadence. Declared range: minimum 1. |
-| `language` | `string` | Model/session default | Language hint for Chinese-script normalization; Cantonese/yue preserves Traditional characters. Inherits structured transcript or voice language when provided. |
+| `language` | `string` | Model/session default | Language hint for Chinese-script normalization. Mandarin converts Traditional to Simplified; Cantonese/yue and explicit non-Chinese languages preserve text. Auto preserves text containing kana; kanji-only Japanese requires ja. Inherits structured transcript or voice language when provided. |
 
 ## Session Options (use with `--session-option`)
 
@@ -144,15 +147,15 @@ checkpoint or session setting, or leaves the optional value unset as described.
 | `voxcpm1.prompt_cache_slots` | `int` | `1` | Prompt and prompt-audio embedding cache slots; default 1. |
 | `voxcpm1.weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | `native` | Model weight storage type. |
 | `voxcpm1.audiovae_weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | `native` | AudioVAE weight storage type. |
-| `voxcpm1.weight_context_mb` | `int` | Model/session default | Model weight graph context size in MB. |
-| `voxcpm1.text_embedding_graph_arena_mb` | `int` | Model/session default | Text embedding host graph-metadata arena size in MiB, not device workspace. |
-| `voxcpm1.lm_step_graph_arena_mb` | `int` | Model/session default | LM step host graph-metadata arena size in MiB, not device workspace. |
-| `voxcpm1.projection_graph_arena_mb` | `int` | Model/session default | Projection host graph-metadata arena size in MiB, not device workspace. |
-| `voxcpm1.local_encoder_graph_arena_mb` | `int` | Model/session default | Local encoder host graph-metadata arena size in MiB, not device workspace. |
-| `voxcpm1.dit_graph_arena_mb` | `int` | Model/session default | DiT estimator host graph-metadata arena size in MiB, not device workspace. |
-| `voxcpm1.audiovae_weight_context_mb` | `int` | Model/session default | AudioVAE weight graph context size in MB. |
-| `voxcpm1.audiovae_graph_arena_mb` | `int` | Model/session default | AudioVAE decoder host graph-metadata arena size in MiB, not device workspace. |
-| `voxcpm1.audiovae_encoder_graph_arena_mb` | `int` | Model/session default | AudioVAE encoder host graph-metadata arena size in MiB, not device workspace. |
+| `voxcpm1.weight_context_mb` | `int` | `8` | Model weight graph context size in MB. |
+| `voxcpm1.text_embedding_graph_arena_mb` | `int` | `32` | Text embedding host graph-metadata arena size in MiB, not device workspace. |
+| `voxcpm1.lm_step_graph_arena_mb` | `int` | `32` | LM step host graph-metadata arena size in MiB, not device workspace. |
+| `voxcpm1.projection_graph_arena_mb` | `int` | `32` | Projection host graph-metadata arena size in MiB, not device workspace. |
+| `voxcpm1.local_encoder_graph_arena_mb` | `int` | `32` | Local encoder host graph-metadata arena size in MiB, not device workspace. |
+| `voxcpm1.dit_graph_arena_mb` | `int` | `32` | DiT estimator host graph-metadata arena size in MiB, not device workspace. |
+| `voxcpm1.audiovae_weight_context_mb` | `int` | `8` | AudioVAE weight graph context size in MB. |
+| `voxcpm1.audiovae_graph_arena_mb` | `int` | `32` | AudioVAE decoder host graph-metadata arena size in MiB, not device workspace. |
+| `voxcpm1.audiovae_encoder_graph_arena_mb` | `int` | `32` | AudioVAE encoder host graph-metadata arena size in MiB, not device workspace. |
 | `voxcpm1.audiovae_latent_capacity` | `int` | Model/session default | AudioVAE decoder latent frame capacity. |
 | `voxcpm1.audiovae_encoder_sample_capacity` | `int` | Model/session default | AudioVAE encoder sample capacity. |
 

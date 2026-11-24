@@ -626,6 +626,10 @@ extern "C" {
         GGML_OP_SSM_CONV_CAUSAL_SILU,
         GGML_OP_SSM_SCAN_MAMBA1,
 
+        GGML_OP_GRU_SCAN,
+        GGML_OP_GRU_CELL,
+        GGML_OP_AFFINE,
+        GGML_OP_CONV_2D_DW_SPARSE,
         GGML_OP_COUNT,
     };
 
@@ -655,6 +659,7 @@ extern "C" {
         GGML_UNARY_OP_ROUND_BF16,
 
         GGML_UNARY_OP_RSQRT,
+        GGML_UNARY_OP_GELU_ERF_APPROX,
 
         GGML_UNARY_OP_COUNT,
     };
@@ -1303,6 +1308,16 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // GELU (erf) with a vectorized erf: faster than ggml_gelu_erf on the CPU, with
+    // results that can differ from it in the last bits. CPU backend only.
+    GGML_API struct ggml_tensor * ggml_gelu_erf_approx(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_gelu_erf_approx_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
     GGML_API struct ggml_tensor * ggml_gelu_quick(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -1737,6 +1752,16 @@ extern "C" {
             enum   ggml_type      type);
 
     // make contiguous
+    enum ggml_cont_lowering {
+        GGML_CONT_LOWERING_DEFAULT = 0,
+        GGML_CONT_LOWERING_CUDA_TILED = 1,
+    };
+
+    // Explicit F32 CUDA copy lowering. Equivalent matrix transposes reuse the
+    // tiled kernel; contiguous rows use coalesced row copies. Other layouts
+    // and backends retain their ordinary copy implementation.
+    GGML_API void ggml_cont_set_lowering(struct ggml_tensor * a, enum ggml_cont_lowering lowering);
+
     GGML_API struct ggml_tensor * ggml_cont(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -2375,6 +2400,23 @@ extern "C" {
             int                   dilation0,
             int                   dilation1);
 
+    // F32 depthwise correlation with zero padding and unit stride. Input/output
+    // are contiguous [W,H,C,B], weights [K,C], I32 offsets [2,K] contain (dx,dy).
+    // Each output sums weight[k,c] * input[x+dx[k], y+dy[k], c,b], in tap order.
+    GGML_API struct ggml_tensor * ggml_conv_2d_dw_sparse(
+        struct ggml_context * ctx, struct ggml_tensor * weights,
+        struct ggml_tensor * input, struct ggml_tensor * offsets);
+
+    enum ggml_conv_2d_dw_lowering {
+        GGML_CONV_2D_DW_LOWERING_DEFAULT = 0,
+        GGML_CONV_2D_DW_LOWERING_CUDA_ROWS = 1,
+    };
+
+    // Explicit F32 temporal depthwise lowering: contiguous WHCN, KW=1,
+    // stride0=1, pad0=0. Other operations retain their default implementation.
+    GGML_API void ggml_conv_2d_dw_set_lowering(
+        struct ggml_tensor * tensor, enum ggml_conv_2d_dw_lowering lowering);
+
     GGML_API struct ggml_tensor * ggml_conv_transpose_2d_p0(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2860,6 +2902,26 @@ extern "C" {
             struct ggml_tensor * w,
             struct ggml_tensor * bias);
 
+    // F32 inference: x * scale[channel] + bias[channel], with separate rounding.
+    // x and the 1D vectors are contiguous; axis indexes physical GGML dimensions.
+    GGML_API struct ggml_tensor * ggml_affine(struct ggml_context * ctx,
+        struct ggml_tensor * x, struct ggml_tensor * scale,
+        struct ggml_tensor * bias, int axis);
+
+    // F32 reset-after cell, with reset/update/new gate order. Projected and
+    // recurrent gates are [3H,B,D], bias [3H,1,D], previous state [H,B,D].
+    // Write directly into frame of a contiguous [H,B,D,T] sequence bank and
+    // return the updated bank, preserving dependencies for all earlier frames.
+    GGML_API struct ggml_tensor * ggml_gru_cell_store(
+            struct ggml_context * ctx, struct ggml_tensor * projected,
+            struct ggml_tensor * recurrent, struct ggml_tensor * bias,
+            struct ggml_tensor * previous, struct ggml_tensor * sequence, int64_t frame);
+
+    GGML_API struct ggml_tensor * ggml_gru_scan(
+            struct ggml_context * ctx, struct ggml_tensor * projected,
+            struct ggml_tensor * recurrent, struct ggml_tensor * bias,
+            struct ggml_tensor * initial);
+
     // Opt-in Mamba-1 scan with inline DT projection, D skip and SiLU gate. F32.
     // Metal specializes the DT rank internally; ordinary SSM_SCAN is unchanged.
     // state: [state_size, 1, channels, slots], x: [1, channels, tokens, sequences],
@@ -3154,6 +3216,9 @@ extern "C" {
     // graph allocation in a context
     GGML_API struct ggml_cgraph * ggml_new_graph       (struct ggml_context * ctx); // size = GGML_DEFAULT_GRAPH_SIZE, grads = false
     GGML_API struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t size, bool grads);
+    // Execution-only node slice. Borrows the source graph's node array and tensor
+    // storage; do not expand or allocate the slice. The source must outlive it.
+    GGML_API struct ggml_cgraph * ggml_graph_slice(struct ggml_context * ctx, struct ggml_cgraph * graph, int begin, int end);
     GGML_API struct ggml_cgraph * ggml_graph_dup       (struct ggml_context * ctx, struct ggml_cgraph * cgraph, bool force_grads);
     GGML_API void                 ggml_graph_cpy       (struct ggml_cgraph * src, struct ggml_cgraph * dst);
     GGML_API void                 ggml_graph_reset     (struct ggml_cgraph * cgraph); // set regular grads + optimizer momenta to 0, set loss grad to 1
